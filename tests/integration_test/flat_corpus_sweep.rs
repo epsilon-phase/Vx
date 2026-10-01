@@ -129,6 +129,10 @@ const KNOWN_DECLINES: &[&str] = &[
     // `total_cmp` takes a reference to a number, which the flat path declines as "a borrow of
     // something that is not a tensor". The answers come from the AST path.
     "backend/pass/core_num_float_total_cmp.vx",
+    // `map_inplace` calls the closure it is given, reading the function and its environment
+    // out of the closure value, which the flat path does not load. The answers come from the
+    // AST path.
+    "backend/pass/std_tensor_map_inplace.vx",
     "frontend/pass/closure_fat_ptr.vx",
     "frontend/pass/control_flow_rigorous.vx",
     // The `vxc -j` fallback fixture: a program the flat path declines, chosen so the parallel
