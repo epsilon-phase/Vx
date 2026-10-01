@@ -1,0 +1,22 @@
+//===- comptime_match_binding_value.vx - Vx Compiler ----------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+// A concrete identifier-pattern arm binds the scrutinee's value, not only its provenance.
+
+fn main() -> i32 {
+  let value = comptime {
+    match 2i32 {
+      number => number + 1i32
+    }
+  };
+  return value;
+}
+
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 3 : i32

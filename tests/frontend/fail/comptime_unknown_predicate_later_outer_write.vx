@@ -1,0 +1,24 @@
+//===- comptime_unknown_predicate_later_outer_write.vx - Vx ---*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 0i32;
+}
+
+fn main(n : i32) -> i32 {
+  let mut predicate_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'predicate_outer'
+  let value = comptime {
+    // The unknown first topology index must not hide the later operand's write.
+    let _ignored = Reachable<Topology::NPU[n], Topology::NPU[touch(&mut predicate_outer)]>;
+    7i32
+  };
+  return value;
+}

@@ -1,0 +1,29 @@
+//===- comptime_direct_outer_reference_write.vx - Vx -----------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 1i32;
+}
+
+// `p` crosses the comptime boundary as an outer mutable-reference binding and is passed directly
+// to `touch`. It has no intermediate local alias, but the write still escapes and must not vanish.
+fn fold(p : &mut i32) -> i32 {
+  // CHECK: Error[E3033]{{.*}}writes to 'p'
+  let value = comptime {
+    let _result = touch(p);
+    7i32
+  };
+  return value;
+}
+
+fn main() -> i32 {
+  let mut value = 0i32;
+  return fold(&mut value);
+}

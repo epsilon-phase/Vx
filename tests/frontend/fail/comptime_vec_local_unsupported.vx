@@ -1,0 +1,21 @@
+//===- comptime_vec_local_unsupported.vx - Vx Compiler ---------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// `vec!` lowers to allocation and mutable push calls. It is not a comptime value and must not
+// disappear simply because the block has a foldable tail.
+import std::vec;
+
+fn main() -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    let _items = vec![ 1i32, 2i32 ];
+    0i32
+  };
+  return value;
+}

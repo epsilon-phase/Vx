@@ -1,0 +1,26 @@
+//===- comptime_value_parameter_copy.vx - Vx -------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+fn square(value : i32) -> i32 {
+  return value * value;
+}
+
+// `n` is an ordinary copy, not an alias to the outer `size`. Passing it to a by-value parameter
+// must neither report an escaping write nor copy a callee frame back into `size`.
+fn main() -> i32 {
+  let size = 5i32;
+  let value = comptime {
+    let n = size;
+    square(n)
+  };
+  return value;
+}
+
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 25 : i32

@@ -1,0 +1,21 @@
+//===- comptime_bounded_for_recurrence.vx - Vx ---------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 6 : i32
+
+fn main() -> i32 {
+  let value = comptime {
+    let mut total : i32 = 0i32;
+    for i in 0i32..4i32 {
+      total += i;
+    }
+    total
+  };
+  return value;
+}

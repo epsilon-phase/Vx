@@ -1,0 +1,22 @@
+//===- comptime_current_predicate.vx - Vx Compiler ------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+// `Current` is the checker's active topology, so this predicate is just as concrete as one
+// written with that topology explicitly.
+
+fn main() -> i32 {
+  let value = comptime {
+    let _reachable = Reachable<Topology::Current, Topology::CPU>;
+    7i32
+  };
+  return value;
+}
+
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 7 : i32

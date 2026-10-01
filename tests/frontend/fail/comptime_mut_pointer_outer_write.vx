@@ -1,0 +1,23 @@
+//===- comptime_mut_pointer_outer_write.vx - Vx ----------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn poke(p : *mut i32) -> i32 {
+  unsafe { *p = 9i32; }
+  return 0i32;
+}
+
+fn main() -> i32 {
+  let mut outside = 1i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let value = comptime {
+    let _ignored = poke(&mut outside);
+    7i32
+  };
+  return value;
+}

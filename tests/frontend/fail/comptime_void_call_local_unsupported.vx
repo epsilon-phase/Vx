@@ -1,0 +1,24 @@
+//===- comptime_void_call_local_unsupported.vx - Vx Compiler ------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// A fall-through function call must retain its body's refusal state. Otherwise the print can
+// disappear and the trailing literal can be folded by itself.
+
+fn log() -> void {
+  print(5i32);
+}
+
+fn main() -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    log();
+    7i32
+  };
+  return value;
+}

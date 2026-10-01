@@ -1,0 +1,24 @@
+//===- comptime_nested_scope_shadow_restores_value.vx - Vx -----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 7 : i32
+
+fn main() -> i32 {
+  let value = comptime {
+    let selected : i32 = 7i32;
+    let _ignored = if true {
+      let selected : i32 = 9i32;
+      selected
+    } else {
+      0i32
+    };
+    selected
+  };
+  return value;
+}

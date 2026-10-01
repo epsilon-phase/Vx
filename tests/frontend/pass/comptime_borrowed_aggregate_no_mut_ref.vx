@@ -1,0 +1,50 @@
+//===- comptime_borrowed_aggregate_no_mut_ref.vx - Vx ---------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+struct Cell {
+  value : i32,
+}
+
+fn read(cell : &Cell) -> i32 {
+  return cell.value;
+}
+
+fn main(n : i32) -> i32 {
+  let outer = Cell {
+    value : 0i32
+  };
+  let value = comptime {
+    let _ignored = if n > 0i32 {
+      read(&outer)
+    } else {
+      1i32
+    };
+    7i32
+  };
+  return value;
+}
+
+// CHECK: module {
+// CHECK:   func.func private @vx_init_signals()
+// CHECK:   func.func @main(%arg0: i32) -> i32 {
+// CHECK:     call @vx_init_signals() : () -> ()
+// CHECK:     %0 = llvm.mlir.constant(1 : i32) : i32
+// CHECK:     %1 = llvm.alloca %0 x !llvm.struct<(i32)> : (i32) -> !llvm.ptr
+// CHECK:     %c0_i32 = arith.constant 0 : i32
+// CHECK:     %2 = llvm.getelementptr %1[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i32)>
+// CHECK:     llvm.store %c0_i32, %2 : i32, !llvm.ptr
+// CHECK:     %c7_i32 = arith.constant 7 : i32
+// CHECK:     return %c7_i32 : i32
+// CHECK:   }
+// CHECK:   func.func @read(%arg0: !llvm.ptr {llvm.readonly}) -> i32 {
+// CHECK:     %0 = llvm.getelementptr %arg0[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i32)>
+// CHECK:     %1 = llvm.load %0 : !llvm.ptr -> i32
+// CHECK:     return %1 : i32
+// CHECK:   }
+// CHECK: }

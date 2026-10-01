@@ -1,0 +1,26 @@
+//===- comptime_closure_capture_assignment_outer_write.vx - Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn main(n : i32) -> i32 {
+  let mut captured_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'captured_outer'
+  let value = comptime {
+    let _ignored = if n > 0i32 {
+      let callback = || comptime {
+        captured_outer = 9i32;
+        0i32
+      };
+      callback()
+    } else {
+      1i32
+    };
+    7i32
+  };
+  return value;
+}

@@ -1,0 +1,35 @@
+//===- comptime_unknown_struct_result_outer_write.vx - Vx ------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// Every viable aggregate-result arm contributes its field effects.
+struct Cell {
+  value : i32,
+}
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 1i32;
+}
+
+fn main(n : i32) -> i32 {
+  let mut outside : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let _value = comptime {
+    if n > 0i32 {
+      Cell {
+        value : touch(&mut outside)
+      }
+    } else {
+      Cell {
+        value : 0i32
+      }
+    }
+  };
+  return 0i32;
+}

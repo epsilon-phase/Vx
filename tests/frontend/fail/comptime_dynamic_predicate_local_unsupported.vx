@@ -1,0 +1,19 @@
+//===- comptime_dynamic_predicate_local_unsupported.vx - Vx ---*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// The transfer graph has no comptime value for a topology selected by a runtime index. The
+// predicate must not disappear merely because its result is bound locally before a foldable tail.
+fn main(n : i32) -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    let _ignored = Reachable<Topology::NPU[n], Topology::CPU>;
+    7i32
+  };
+  return value;
+}

@@ -1,0 +1,23 @@
+//===- comptime_transfer_outer_write.vx - Vx -----------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn touch(value : &mut i32) -> Tensor<i32, [1]> {
+  *value = 9i32;
+  return Tensor<i32, [1]>::new();
+}
+
+fn main() -> i32 {
+  let mut transfer_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'transfer_outer'
+  let value = comptime {
+    let _ignored = transfer(touch(&mut transfer_outer), Memory::NPU_HBM);
+    7i32
+  };
+  return value;
+}

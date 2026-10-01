@@ -1,0 +1,18 @@
+//===- comptime_print_local_unsupported.vx - Vx ----------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// Output is observable and must not vanish before the later literal is folded.
+fn main() -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    print(1i32);
+    7i32
+  };
+  return value;
+}

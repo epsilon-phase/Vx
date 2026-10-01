@@ -1,0 +1,25 @@
+//===- comptime_unknown_else_outer_write.vx - Vx ---------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// Both paths of an unknown predicate remain viable. This specifically covers a write in the
+// `else` branch, which must not be lost while merging the two outcomes.
+fn main(n : i32) -> i32 {
+  let mut outside : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let value = comptime {
+    if n > 0i32 {
+      0i32
+    } else {
+      outside = 9i32;
+      0i32
+    };
+    1i32
+  };
+  return value;
+}

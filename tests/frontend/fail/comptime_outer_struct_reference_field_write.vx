@@ -1,0 +1,30 @@
+//===- comptime_outer_struct_reference_field_write.vx - Vx -----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+struct Wrapper {
+  reference : &mut i32,
+}
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 0i32;
+}
+
+fn main() -> i32 {
+  let mut outside = 1i32;
+  let wrapper = Wrapper {
+    reference : &mut outside
+  };
+  // CHECK: Error[E3033]{{.*}}writes to 'wrapper'
+  let value = comptime {
+    let _ignored = touch(wrapper.reference);
+    7i32
+  };
+  return value;
+}

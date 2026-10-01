@@ -5,14 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-// A `comptime` block the evaluator cannot finish is refused.
+// A `comptime` block that writes outside itself is refused.
 //
 // The block runs while compiling and leaves nothing behind, so there is no such thing as
 // one that half-ran. Until this was an error such a block was emitted as ordinary
 // run-time code, which is precisely what let a skipped loop or call go unnoticed.
 //
-// `held` calls a function through a bare call statement, which the evaluator does not
-// run, so the block has no value for it.
+// `held` calls a function through a bare call statement. The unified interpreter executes
+// that known call, so the first block folds successfully; the outer write below remains the
+// refusal this fixture checks.
 //
 // RUN: not vxc %s 2>&1 | FileCheck %s
 
@@ -28,7 +29,6 @@ fn held() -> i64 {
 }
 
 fn main() -> i32 {
-  // CHECK: Error[E3033]{{.*}}cannot be evaluated
   let n = comptime {
     let v : i64 = held();
     v

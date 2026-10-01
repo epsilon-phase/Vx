@@ -1,0 +1,28 @@
+//===- comptime_float_suffix.vx - Vx ---------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+// A suffix is semantic even when the literal's text has no decimal point. This must be folded
+// as floating-point division, and checking emitted MLIR ensures the new interpreter's value is
+// what reaches the program rather than an assertion evaluated by another path.
+fn half() -> f64 {
+  let value = comptime {
+    7f64 / 2f64
+  };
+  return value;
+}
+
+fn main() -> i32 {
+  let _ignored = half();
+  return 0i32;
+}
+
+// CHECK-LABEL: func.func @half() -> f64
+// Keep the result check independent of the current lowering's f64-to-f32 narrowing. The
+// suffix regression is that this must be 3.5 rather than the integer result 3.
+// CHECK: arith.constant 3.500000e+00

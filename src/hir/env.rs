@@ -549,6 +549,26 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub fn extract_uses_expr(expr: &Expr, uses: &mut std::collections::HashSet<String>) {
+        fn topology(value: &Topology, uses: &mut std::collections::HashSet<String>) {
+            match value {
+                Topology::NPU(index) | Topology::AccCore(index) | Topology::GPU(index) => {
+                    TypeChecker::extract_uses_expr(index, uses);
+                }
+                Topology::Slice(base, start, end) => {
+                    topology(base, uses);
+                    TypeChecker::extract_uses_expr(start, uses);
+                    TypeChecker::extract_uses_expr(end, uses);
+                }
+                Topology::CPU
+                | Topology::AMX
+                | Topology::ANE
+                | Topology::CpuAvx512
+                | Topology::CpuNeon
+                | Topology::Current
+                | Topology::Custom(_) => {}
+            }
+        }
+
         match expr {
             Expr::Identifier(id) => {
                 uses.insert(id.name.to_string());
@@ -588,10 +608,15 @@ impl<'a> TypeChecker<'a> {
             // entry for a value whose only reader is a transfer, which makes a live tile look
             // dead -- and the same map is what the dead-borrow sweep consults.
             Expr::Transfer(t) => Self::extract_uses_expr(&t.expr, uses),
+            Expr::TransferPredicate(predicate) => {
+                topology(&predicate.from, uses);
+                topology(&predicate.to, uses);
+            }
             // A `spawn` region is where a placed tensor can legally be read, so the reads
             // that matter most for residency are inside one. Missing them made two tiles
             // held across a region look like one, which the space then had room for.
             Expr::SpawnOn(s) => {
+                topology(&s.top, uses);
                 for stmt in &s.stmts {
                     Self::extract_uses_stmt(stmt, uses);
                 }
@@ -621,6 +646,7 @@ impl<'a> TypeChecker<'a> {
                 Self::extract_uses_expr(&r.start, uses);
                 Self::extract_uses_expr(&r.end, uses);
             }
+            Expr::Topology(topology_expr) => topology(&topology_expr.top, uses),
             Expr::Dereference(d) => Self::extract_uses_expr(&d.expr, uses),
             Expr::StructInit(s) => {
                 for f in &s.fields {

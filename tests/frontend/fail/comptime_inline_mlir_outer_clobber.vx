@@ -1,0 +1,19 @@
+//===- comptime_inline_mlir_outer_clobber.vx - Vx ------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn main() -> i32 {
+  let mut mlir_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'mlir_outer'
+  let value = comptime {
+    let _ignored = mlir!(inputs : (), clobbers : [mlir_outer], returns : void, dialects : []) {
+    };
+    7i32
+  };
+  return value;
+}

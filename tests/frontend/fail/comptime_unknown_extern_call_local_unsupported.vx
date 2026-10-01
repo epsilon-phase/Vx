@@ -1,0 +1,29 @@
+//===- comptime_unknown_extern_call_local_unsupported.vx - Vx --*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+extern {
+  fn c_abs(value : i32) -> i32;
+}
+
+// An abstract branch can execute the bodyless FFI call, so that possibility cannot disappear
+// merely because the other path reaches a foldable tail.
+fn choose(run_ffi : bool) -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    if run_ffi {
+      unsafe { c_abs(1i32) };
+    }
+    7i32
+  };
+  return value;
+}
+
+fn main() -> i32 {
+  return choose(false);
+}

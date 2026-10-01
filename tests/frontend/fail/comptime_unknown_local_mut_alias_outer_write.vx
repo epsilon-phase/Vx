@@ -1,0 +1,29 @@
+//===- comptime_unknown_local_mut_alias_outer_write.vx - Vx ----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 1i32;
+}
+
+fn main(n : i32) -> i32 {
+  let mut alias_outer : i32 = 0i32;
+  let _callback = touch;
+  // CHECK: Error[E3033]{{.*}}writes to 'alias_outer'
+  let value = comptime {
+    let alias = &mut alias_outer;
+    let _ignored = if n > 0i32 {
+      _callback(alias)
+    } else {
+      1i32
+    };
+    7i32
+  };
+  return value;
+}

@@ -1,0 +1,25 @@
+//===- comptime_shadowed_binding_assignment.vx - Vx ------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+// A block saves a shadowed binding when its declaration executes, not when the block starts.
+// The inner `let x` must not undo the preceding write to the outer `x`.
+fn main() -> i32 {
+  let value = comptime {
+    let mut x = 1i32;
+    if true {
+      x = 5i32;
+      let x = 0i32;
+    };
+    x
+  };
+  return value;
+}
+
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 5 : i32

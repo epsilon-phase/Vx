@@ -1,0 +1,30 @@
+//===- comptime_struct_result_outer_write.vx - Vx Compiler -----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// A struct may carry precise field facts locally, but it cannot yet be the folded result. Its
+// field expressions still execute first, so an outer write wins over the generic result refusal.
+struct Cell {
+  value : i32,
+}
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 1i32;
+}
+
+fn main() -> i32 {
+  let mut outside : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let _value = comptime {
+    Cell {
+      value : touch(&mut outside)
+    }
+  };
+  return 0i32;
+}

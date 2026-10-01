@@ -1,0 +1,22 @@
+//===- comptime_autodiff_grad_local_unsupported.vx - Vx -------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn identity(x : f32) -> f32 {
+  return x;
+}
+
+// An autodiff result is not a comptime Value and must not vanish before the literal tail.
+fn main() -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    let _derivative = grad(identity, 1.0);
+    7i32
+  };
+  return value;
+}

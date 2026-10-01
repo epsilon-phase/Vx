@@ -6,7 +6,8 @@
 // CHECK: call @Closure_3_call(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr, i32, i32, i32) -> i32
 // CHECK: call @Closure_4_call(%{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr, i32, i32) -> i32
 // CHECK: call @Closure_5_call(%{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr, i32, i32) -> i32
-// CHECK: call @Closure_6_call(%{{.*}}) : (!llvm.ptr) -> i32
+// CHECK: arith.constant 100 : i32
+// CHECK-NOT: call @Closure_7_call
 // CHECK: call @Closure_8_call(%{{.*}}) : (!llvm.ptr) -> i32
 // CHECK: call @apply_lambda$Closure_9(%{{.*}}, %{{.*}}) : (!llvm.struct<(struct<(i32)>, i32)>, i32) -> i32
 // CHECK: call @print_i32(%{{.*}}) : (i32) -> i32
@@ -31,11 +32,9 @@
 // CHECK: %[[V0:.*]] = llvm.getelementptr %{{.*}}, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i32)>
 // CHECK: %[[V1:.*]] = llvm.load %[[V0]] : !llvm.ptr -> i32
 // CHECK: return %[[V1]] : i32
-// The same, one level out: this body calls the closure above and adds 40, and both are
-// worked out while compiling, so no call to it survives.
-// CHECK-LABEL: func.func @Closure_6_call(%arg0: !llvm.ptr) -> i32
-// CHECK: arith.constant 100 : i32
-// CHECK-NOT: call @Closure_7_call
+// The nested outer closure is fully folded at its only call site, so its generated body is dead
+// and omitted. The `100` checked in `main` above proves the same compile-time result without
+// coupling this fixture to a transient closure number or dead-function retention policy.
 // CHECK-LABEL: func.func @Closure_5_call(%arg0: !llvm.ptr, %arg1: i32, %arg2: i32) -> i32
 // CHECK: %[[V0:.*]] = llvm.getelementptr %{{.*}}, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i32)>
 // CHECK: %[[V1:.*]] = llvm.load %[[V0]] : !llvm.ptr -> i32

@@ -1,0 +1,26 @@
+//===- comptime_opaque_closure_local_unsupported.vx - Vx -------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// A fat-pointer closure parameter has no inspectable body at this comptime boundary. Calling it
+// is unsupported, but the callback value is not storage that the call can write.
+fn fold_with(callback : || -> i32) -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  // CHECK-NOT: writes to 'callback'
+  let value = comptime {
+    let _ignored = callback();
+    7i32
+  };
+  return value;
+}
+
+fn main() -> i32 {
+  let callback = || 1i32;
+  let opaque = callback as || -> i32;
+  return fold_with(opaque);
+}

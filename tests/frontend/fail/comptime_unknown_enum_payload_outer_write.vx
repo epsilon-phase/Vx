@@ -1,0 +1,32 @@
+//===- comptime_unknown_enum_payload_outer_write.vx - Vx -------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+enum Maybe {
+  Value(i32),
+  Empty,
+}
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 1i32;
+}
+
+fn main(n : i32) -> i32 {
+  let mut enum_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'enum_outer'
+  let value = comptime {
+    let _ignored = if n > 0i32 {
+      Maybe::Value(touch(&mut enum_outer))
+    } else {
+      Maybe::Empty
+    };
+    7i32
+  };
+  return value;
+}

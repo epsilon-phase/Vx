@@ -1,0 +1,22 @@
+//===- comptime_loop_local_write.vx - Vx ---------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 7 : i32
+
+fn main() -> i32 {
+  let value = comptime {
+    let mut loop_local : i32 = 0i32;
+    loop {
+      loop_local = 9i32;
+      break;
+    }
+    7i32
+  };
+  return value;
+}

@@ -10,11 +10,15 @@
 //
 //===----------------------------------------------------------------------===//
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
 use crate::hir;
+use crate::hir::check_state::ComptimeEvalContext;
+use crate::hir::comptime_interpreter::{
+    ComptimeFunctionBodies, ComptimeInterpreter, ComptimeObservation,
+};
 use crate::syntax;
 
 /// What running a statement did to the block it sits in.
@@ -35,6 +39,127 @@ pub(crate) enum EvalFlow {
 }
 
 impl<'a> TypeChecker<'a> {
+    /// Run the comptime interpreter and return the observation that decides folding.
+    ///
+    /// The control checker uses its concrete result when it is supported and has no escaping
+    /// effects; otherwise it reports the refusal reason instead of retaining run-time code.
+    pub(crate) fn observe_comptime_block(
+        &self,
+        stmts: &[Statement],
+        tail: Option<&Expr>,
+        before: &HashMap<crate::symbol::Symbol, Value>,
+    ) -> ComptimeObservation {
+        let mut outer_bindings = HashSet::new();
+        let mut outer_reference_bindings = HashSet::new();
+        let mut outer_callable_bindings = HashSet::new();
+        for scope in &self.scopes {
+            for (name, (ty, _)) in scope {
+                outer_bindings.insert(name.clone());
+                if self.type_can_carry_mut_reference(ty) {
+                    outer_reference_bindings.insert(name.clone());
+                }
+                if matches!(ty, Type::Closure(..)) {
+                    outer_callable_bindings.insert(name.clone());
+                }
+            }
+        }
+        // The interpreter mutates its value environment, but function bodies are immutable.
+        // Borrow the three existing registries instead of rebuilding and cloning their complete
+        // union for every comptime block (and for every speculative branch it explores).
+        let function_bodies = ComptimeFunctionBodies::new(
+            &self.env.comptime_bodies,
+            &self.env.syntax_functions,
+            &self.mono.functions,
+            |ty| self.type_can_carry_mut_reference(ty),
+        );
+        let mut interpreter = ComptimeInterpreter::new(
+            before,
+            function_bodies,
+            self.transfer_cost_graph,
+            self.active_topology.clone(),
+            ComptimeEvalContext::new(
+                outer_bindings,
+                outer_reference_bindings,
+                outer_callable_bindings,
+            ),
+        );
+        interpreter.observe_block(stmts, tail)
+    }
+
+    /// Whether a type can transport a mutable reference to an outer place through a value.
+    ///
+    /// The shared comptime interpreter uses this only to seed facts at the block boundary; once a
+    /// value is inside the interpreter, provenance moves with that value rather than with its
+    /// spelling or declared type.
+    pub(crate) fn type_can_carry_mut_reference(&self, ty: &Type) -> bool {
+        fn visit(
+            checker: &TypeChecker<'_>,
+            ty: &Type,
+            seen: &mut HashSet<crate::symbol::Symbol>,
+        ) -> bool {
+            match ty {
+                Type::Borrow { inner, is_mut, .. } => *is_mut || visit(checker, inner, seen),
+                Type::Pointer(inner, _, is_mut) => *is_mut || visit(checker, inner, seen),
+                Type::Ref(inner, _) | Type::Verified(inner) | Type::Pinned(inner, _) => {
+                    visit(checker, inner, seen)
+                }
+                Type::GenericInstance(base, args) => {
+                    visit(checker, base, seen) || args.iter().any(|arg| visit(checker, arg, seen))
+                }
+                Type::Struct(name, _) | Type::Enum(name, _) => {
+                    if !seen.insert(name.clone()) {
+                        return false;
+                    }
+                    let result = checker
+                        .env
+                        .structs
+                        .get(name)
+                        .map(|decl| {
+                            decl.fields
+                                .iter()
+                                .any(|(_, field)| visit(checker, field, seen))
+                        })
+                        .or_else(|| {
+                            checker
+                                .mono
+                                .generated_structs
+                                .iter()
+                                .find(|decl| decl.name == *name)
+                                .map(|decl| {
+                                    decl.fields
+                                        .iter()
+                                        .any(|(_, field)| visit(checker, field, seen))
+                                })
+                        })
+                        .or_else(|| {
+                            checker.env.enums.get(name).map(|decl| {
+                                decl.variants.iter().any(|(_, payload)| {
+                                    payload.as_ref().is_some_and(|fields| {
+                                        fields.iter().any(|field| visit(checker, field, seen))
+                                    })
+                                })
+                            })
+                        })
+                        .unwrap_or(false);
+                    seen.remove(name);
+                    result
+                }
+                Type::Unknown => true,
+                Type::Tensor(..)
+                | Type::Matrix
+                | Type::Scalar(..)
+                | Type::Generic(..)
+                | Type::Module(..)
+                | Type::Simd(..)
+                | Type::Function(..)
+                | Type::Closure(..)
+                | Type::Const(..) => false,
+            }
+        }
+
+        visit(self, ty, &mut HashSet::new())
+    }
+
     /// Performs semantic analysis on a block of statements.
     ///
     /// A **block** is a sequence of statements enclosed in `{ ... }` that defines a new lexical scope.
@@ -1237,8 +1362,22 @@ impl<'a> TypeChecker<'a> {
             // `Reachable<A, B>`: true iff a transfer path exists in the cost graph. Topology
             // variables have already been substituted during monomorphization.
             Expr::TransferPredicate(e) => {
-                let mfrom = self.transfer_cost_graph.default_memory_for(&e.from);
-                let mto = self.transfer_cost_graph.default_memory_for(&e.to);
+                // `Current` is concrete at this checking site. Passing the surface spelling on
+                // to the graph is a compiler bug: the graph deliberately requires a real
+                // device topology because a default memory for an unresolved `Current` would
+                // be meaningless.
+                let from = if matches!(e.from, Topology::Current) {
+                    &self.active_topology
+                } else {
+                    &e.from
+                };
+                let to = if matches!(e.to, Topology::Current) {
+                    &self.active_topology
+                } else {
+                    &e.to
+                };
+                let mfrom = self.transfer_cost_graph.default_memory_for(from);
+                let mto = self.transfer_cost_graph.default_memory_for(to);
                 Some(Value::Bool(
                     self.transfer_cost_graph
                         .transfer_path(&mfrom, &mto)

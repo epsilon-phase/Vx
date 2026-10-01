@@ -1,0 +1,108 @@
+//===- comptime_mutation_values.vx - Vx Compiler -----------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+// These checks observe the constants that replace the comptime blocks. An assert inside the
+// block is not enough: ordinary assertion checking uses eval_expr, while these values must come
+// from ComptimeInterpreter.
+
+struct Holder {
+  field : i32,
+}
+
+struct Nested {
+  field : i32,
+}
+
+struct Outer {
+  nested : Nested,
+}
+
+fn increment(value : &mut Tensor<i32, [1]>) -> void {
+  value[0i32] = value[0i32] + 1i32;
+}
+
+fn increment_scalar(value : &mut i32) -> void {
+  *value = *value + 1i32;
+}
+
+fn forward_increment(value : &mut i32) -> void {
+  increment_scalar(value);
+}
+
+fn main() -> i32 {
+  let array_value = comptime {
+    let mut values : Tensor<i32, [1]> = [ 1i32 ];
+    values[0i32] = 10i32;
+    values[0i32]
+  };
+
+  let field_value = comptime {
+    let mut holder = Holder {
+      field : 1i32
+    };
+    holder.field = 10i32;
+    holder.field
+  };
+
+  let parameter_value = comptime {
+    let mut values : Tensor<i32, [1]> = [ 1i32 ];
+    increment(&mut values);
+    values[0i32]
+  };
+
+  let scalar_parameter_value = comptime {
+    let mut value = 1i32;
+    increment_scalar(&mut value);
+    value
+  };
+
+  let field_parameter_value = comptime {
+    let mut holder = Holder {
+      field : 1i32
+    };
+    increment_scalar(&mut holder.field);
+    holder.field
+  };
+
+  let forwarded_parameter_value = comptime {
+    let mut value = 1i32;
+    forward_increment(&mut value);
+    value
+  };
+
+  let nested_field_value = comptime {
+    let mut outer = Outer {
+      nested : Nested {
+        field : 1i32
+      }
+    };
+    outer.nested.field = 10i32;
+    outer.nested.field
+  };
+
+  let alias_value = comptime {
+    let mut value = 1i32;
+    let pointer = &mut value;
+    *pointer = 10i32;
+    *pointer
+  };
+
+  return array_value + field_value + parameter_value + scalar_parameter_value
+  + field_parameter_value + forwarded_parameter_value + nested_field_value + alias_value;
+}
+
+// CHECK-LABEL: func.func @main
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 2 : i32
+// CHECK-DAG: arith.constant 10 : i32
+// CHECK-DAG: arith.constant 10 : i32
+// CHECK-DAG: arith.constant 10 : i32
+// CHECK-DAG: arith.constant 10 : i32

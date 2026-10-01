@@ -1,0 +1,21 @@
+//===- comptime_unknown_outer_reference_index_write.vx - Vx ----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// An outer mutable-reference alias still reaches outer storage. An unknown index must therefore
+// retain the possible write rather than allowing the final constant to fold.
+fn main(n : i32) -> i32 {
+  let mut values : Tensor<i32, [2]> = [ 1i32, 2i32 ];
+  let p = &mut values;
+  // CHECK: Error[E3033]{{.*}}writes to 'p'
+  let value = comptime {
+    p[n] = 9i32;
+    1i32
+  };
+  return value;
+}

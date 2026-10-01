@@ -1,0 +1,21 @@
+//===- comptime_unknown_if_without_outer_write.vx - Vx Compiler -*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK: module
+
+fn main(n : i32) -> i32 {
+  let value = comptime {
+    let _unused = if n > 0i32 {
+      1i32
+    } else {
+      2i32
+    };
+    7i32
+  };
+  return value;
+}

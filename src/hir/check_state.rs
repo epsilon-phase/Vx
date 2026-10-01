@@ -69,6 +69,465 @@ pub struct ConstEvalState {
     pub comptime_depth: u32,
 }
 
+/// Provenance carried by a value while a `comptime` block is interpreted.
+///
+/// These facts deliberately live beside, rather than inside, [`Value`]. `Value` is the compact
+/// representation of a concrete constant used throughout the checker; it cannot represent every
+/// reference, aggregate, or callable that can transport an outer mutable reference.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct ComptimeValueFacts {
+    /// Outer bindings a mutable reference in this value may reach.
+    pub reference_origins: HashSet<Symbol>,
+    /// Outer storage represented by a generated closure-environment field. Unlike
+    /// `reference_origins`, this makes assigning the local binding created from `_env.field` an
+    /// escaping write; ordinary local reference aliases do not populate it.
+    pub captured_place_origins: HashSet<Symbol>,
+    /// Concrete functions this value may invoke when used as a callable.
+    pub callable_targets: HashSet<Symbol>,
+    /// Captured-environment facts for generated closure call targets. The target's generated
+    /// `Closure_N_call` body receives this as its synthetic first `_env` parameter when invoked.
+    pub callable_environments: HashMap<Symbol, ComptimeValueFacts>,
+    /// Outer bindings a closure held by this value may write when invoked.
+    pub captured_writes: HashSet<Symbol>,
+    /// The callable's body is unavailable, so a call through it must be conservative.
+    pub unknown_callable: bool,
+}
+
+impl ComptimeValueFacts {
+    /// Join facts from alternative values or paths. Every field is a may-fact, so union is the
+    /// sound merge and an unknown callable stays unknown.
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        self.reference_origins
+            .extend(other.reference_origins.iter().cloned());
+        self.captured_place_origins
+            .extend(other.captured_place_origins.iter().cloned());
+        self.callable_targets
+            .extend(other.callable_targets.iter().cloned());
+        for (target, facts) in &other.callable_environments {
+            self.callable_environments
+                .entry(target.clone())
+                .or_default()
+                .merge_from(facts);
+        }
+        self.captured_writes
+            .extend(other.captured_writes.iter().cloned());
+        self.unknown_callable |= other.unknown_callable;
+    }
+}
+
+/// The value part of a comptime interpretation result.
+///
+/// `concrete == None` means the expression was modelled but did not yield a constant. It says
+/// nothing about support or effects; those are independent parts of [`ComptimeEvalOutcome`] and
+/// [`ComptimeEvalContext`].
+/// Component values retained beside the legacy scalar/array [`Value`]. They let the transition
+/// interpreter model structs and partially-known arrays without assigning every field or element
+/// the union of its siblings' mutable-reference and callable facts.
+#[derive(Clone, PartialEq)]
+pub(crate) enum ComptimeAggregateValue {
+    Array(Vec<ComptimeEvalValue>),
+    Struct(HashMap<Symbol, ComptimeEvalValue>),
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct ComptimeEvalValue {
+    pub concrete: Option<Value>,
+    pub facts: ComptimeValueFacts,
+    pub aggregate: Option<ComptimeAggregateValue>,
+}
+
+impl ComptimeEvalValue {
+    pub(crate) fn known(value: Value) -> Self {
+        Self {
+            concrete: Some(value),
+            facts: ComptimeValueFacts::default(),
+            aggregate: None,
+        }
+    }
+
+    /// Join values from alternative control-flow paths. A concrete result survives only when both
+    /// paths proved the same concrete value; facts always merge as may-facts.
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        if self.concrete != other.concrete {
+            self.concrete = None;
+        }
+        let aggregates_match = match (&mut self.aggregate, &other.aggregate) {
+            (
+                Some(ComptimeAggregateValue::Array(left)),
+                Some(ComptimeAggregateValue::Array(right)),
+            ) if left.len() == right.len() => {
+                for (left, right) in left.iter_mut().zip(right) {
+                    left.merge_from(right);
+                }
+                true
+            }
+            (
+                Some(ComptimeAggregateValue::Struct(left)),
+                Some(ComptimeAggregateValue::Struct(right)),
+            ) if left.len() == right.len()
+                && left.keys().all(|field| right.contains_key(field)) =>
+            {
+                for (field, left) in left {
+                    // The key-set equality above makes this lookup infallible.
+                    left.merge_from(right.get(field).expect("matching aggregate field"));
+                }
+                true
+            }
+            _ => false,
+        };
+        if !aggregates_match {
+            self.aggregate = None;
+        }
+        self.facts.merge_from(&other.facts);
+    }
+}
+
+/// Whether the interpreter has a sound rule for every operation it reached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ComptimeEvalSupport {
+    #[default]
+    Supported,
+    Unsupported,
+}
+
+/// Why an otherwise unsupported shadow interpretation is known to differ from the legacy
+/// evaluator. The transition comparator may allow only reasons explicitly backed by fixtures;
+/// every other unsupported result remains an unclassified disagreement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ComptimeEvalUnsupportedReason {
+    #[default]
+    None,
+    /// An owner without a recorded transition allowance.
+    Unclassified,
+}
+
+impl ComptimeEvalUnsupportedReason {
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        use ComptimeEvalUnsupportedReason::*;
+        *self = match (*self, other) {
+            (None, reason) => reason,
+            (reason, None) => reason,
+            _ => Unclassified,
+        };
+    }
+}
+
+impl ComptimeEvalSupport {
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        if matches!(other, Self::Unsupported) {
+            *self = Self::Unsupported;
+        }
+    }
+
+    pub(crate) fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+/// Control flow produced while interpreting a comptime statement or block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ComptimeEvalFlow {
+    #[default]
+    Normal,
+    Return,
+    Break,
+    Continue,
+    /// Viable abstract paths leave the construct differently. The caller must not continue as
+    /// though it had proved any one of the concrete flows.
+    Indeterminate,
+}
+
+/// One expression, statement, or block result from the unified comptime interpreter.
+///
+/// This keeps concrete-value knowledge, support, and control flow separate. Possible escaping
+/// writes belong to the context because branches must be able to clone and merge that state.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct ComptimeEvalOutcome {
+    pub value: ComptimeEvalValue,
+    pub support: ComptimeEvalSupport,
+    pub unsupported_reason: ComptimeEvalUnsupportedReason,
+    pub flow: ComptimeEvalFlow,
+    /// A deliberately promoted fail-closed owner. During the transition, most unsupported
+    /// results remain observations so they can be compared with the legacy evaluator. This bit
+    /// is reserved for the small, fixture-backed set whose effect cannot disappear even when it
+    /// only touches comptime-local storage.
+    pub requires_refusal: bool,
+}
+
+impl ComptimeEvalOutcome {
+    pub(crate) fn known(value: Value) -> Self {
+        Self {
+            value: ComptimeEvalValue::known(value),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn unknown() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn unsupported() -> Self {
+        Self {
+            support: ComptimeEvalSupport::Unsupported,
+            unsupported_reason: ComptimeEvalUnsupportedReason::Unclassified,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn mark_unsupported(&mut self) {
+        self.support = ComptimeEvalSupport::Unsupported;
+        self.unsupported_reason = ComptimeEvalUnsupportedReason::Unclassified;
+    }
+
+    pub(crate) fn refusal() -> Self {
+        Self {
+            support: ComptimeEvalSupport::Unsupported,
+            unsupported_reason: ComptimeEvalUnsupportedReason::Unclassified,
+            requires_refusal: true,
+            ..Self::default()
+        }
+    }
+
+    /// Join results from viable abstract paths. Differing flow cannot produce a definite normal
+    /// result, so the caller receives `Indeterminate` rather than continuing after the branch.
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        self.value.merge_from(&other.value);
+        self.support.merge_from(other.support);
+        self.unsupported_reason.merge_from(other.unsupported_reason);
+        self.requires_refusal |= other.requires_refusal;
+        if self.flow != other.flow {
+            self.flow = ComptimeEvalFlow::Indeterminate;
+            self.value.concrete = None;
+        }
+    }
+}
+
+/// Per-`comptime`-block state for the unified concrete/abstract interpreter.
+///
+/// It replaces the old pattern of an evaluator plus a separately invoked effect walk. Its lexical
+/// scopes carry value facts, while its immutable outer-boundary sets make it possible to identify
+/// writes that would disappear when the comptime block is removed.
+#[derive(Clone)]
+pub(crate) struct ComptimeEvalContext {
+    outer_bindings: HashSet<Symbol>,
+    outer_reference_bindings: HashSet<Symbol>,
+    outer_callable_bindings: HashSet<Symbol>,
+    local_scopes: Vec<HashMap<Symbol, ComptimeValueFacts>>,
+    analysis_call_depth: u32,
+    call_depth_exceeded: bool,
+    escaping_writes: HashSet<Symbol>,
+}
+
+impl ComptimeEvalContext {
+    pub(crate) fn new(
+        outer_bindings: HashSet<Symbol>,
+        outer_reference_bindings: HashSet<Symbol>,
+        outer_callable_bindings: HashSet<Symbol>,
+    ) -> Self {
+        Self {
+            outer_bindings,
+            outer_reference_bindings,
+            outer_callable_bindings,
+            local_scopes: vec![HashMap::new()],
+            analysis_call_depth: 0,
+            call_depth_exceeded: false,
+            escaping_writes: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn push_scope(&mut self) {
+        self.local_scopes.push(HashMap::new());
+    }
+
+    pub(crate) fn pop_scope(&mut self) {
+        assert!(
+            self.local_scopes.len() > 1,
+            "the comptime root scope must remain open"
+        );
+        self.local_scopes.pop();
+    }
+
+    pub(crate) fn binding_facts(&self, name: &Symbol) -> Option<&ComptimeValueFacts> {
+        self.local_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+    }
+
+    pub(crate) fn declare(&mut self, name: Symbol, facts: ComptimeValueFacts) {
+        self.local_scopes
+            .last_mut()
+            .expect("comptime context has a root scope")
+            .insert(name, facts);
+    }
+
+    /// Replace the nearest lexical binding's facts. A missing binding is outer, and therefore is
+    /// intentionally not installed as a local shadow.
+    pub(crate) fn reassign(&mut self, name: &Symbol, facts: ComptimeValueFacts) {
+        if let Some(scope) = self
+            .local_scopes
+            .iter_mut()
+            .rev()
+            .find(|scope| scope.contains_key(name))
+        {
+            scope.insert(name.clone(), facts);
+        }
+    }
+
+    pub(crate) fn is_outer_binding(&self, name: &Symbol) -> bool {
+        self.outer_bindings.contains(name) && self.binding_facts(name).is_none()
+    }
+
+    pub(crate) fn outer_reference_binding(&self, name: &Symbol) -> bool {
+        self.outer_reference_bindings.contains(name)
+    }
+
+    pub(crate) fn outer_callable_binding(&self, name: &Symbol) -> bool {
+        self.outer_callable_bindings.contains(name)
+    }
+
+    pub(crate) fn note_escaping_write(&mut self, roots: impl IntoIterator<Item = Symbol>) {
+        self.escaping_writes.extend(
+            roots
+                .into_iter()
+                .filter(|root| self.outer_bindings.contains(root)),
+        );
+    }
+
+    pub(crate) fn escaping_write(&self) -> Option<&Symbol> {
+        self.escaping_writes
+            .iter()
+            .min_by(|left, right| left.as_ref().cmp(right.as_ref()))
+    }
+
+    /// Enter one concrete call frame. Recursion is allowed: every frame owns a fresh value
+    /// environment and lexical fact scope, while the shared depth limit stops nontermination.
+    pub(crate) fn push_call(&mut self) -> bool {
+        if self.analysis_call_depth >= MAX_CALL_DEPTH {
+            self.call_depth_exceeded = true;
+            return false;
+        }
+        self.analysis_call_depth += 1;
+        true
+    }
+
+    pub(crate) fn call_depth_exceeded(&self) -> bool {
+        self.call_depth_exceeded
+    }
+
+    pub(crate) fn pop_call(&mut self) {
+        self.analysis_call_depth = self.analysis_call_depth.saturating_sub(1);
+    }
+
+    /// Merge an alternative branch into this one. Branch-local declarations must have been popped
+    /// before the merge. A binding present on only one path is not available afterwards; a binding
+    /// present on both paths keeps the union of its may-facts. Escaping writes always union.
+    pub(crate) fn merge_branch(&mut self, branch: &Self) {
+        debug_assert_eq!(self.local_scopes.len(), branch.local_scopes.len());
+        for (scope, other_scope) in self.local_scopes.iter_mut().zip(&branch.local_scopes) {
+            scope.retain(|name, _| other_scope.contains_key(name));
+            for (name, facts) in scope.iter_mut() {
+                facts.merge_from(
+                    other_scope
+                        .get(name)
+                        .expect("retained comptime binding exists in both branches"),
+                );
+            }
+        }
+        self.escaping_writes
+            .extend(branch.escaping_writes.iter().cloned());
+        self.call_depth_exceeded |= branch.call_depth_exceeded;
+        debug_assert_eq!(self.analysis_call_depth, branch.analysis_call_depth);
+    }
+}
+
+impl Default for ComptimeEvalContext {
+    fn default() -> Self {
+        Self::new(HashSet::new(), HashSet::new(), HashSet::new())
+    }
+}
+
+#[cfg(test)]
+mod comptime_eval_tests {
+    use super::*;
+
+    fn symbol(name: &str) -> Symbol {
+        name.into()
+    }
+
+    #[test]
+    fn alternative_values_keep_only_an_agreed_constant_and_union_facts() {
+        let outside = symbol("outside");
+        let mut left = ComptimeEvalValue::known(Value::Int(7));
+        left.facts.reference_origins.insert(outside.clone());
+        let mut right = ComptimeEvalValue::known(Value::Int(9));
+        right.facts.callable_targets.insert(symbol("touch"));
+
+        left.merge_from(&right);
+
+        assert!(left.concrete.is_none());
+        assert!(left.facts.reference_origins.contains(&outside));
+        assert!(left.facts.callable_targets.contains("touch"));
+    }
+
+    #[test]
+    fn branch_merge_keeps_may_facts_and_a_deterministic_outer_write() {
+        let outside = symbol("outside");
+        let mut left = ComptimeEvalContext::new(
+            HashSet::from([outside.clone()]),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        left.declare(symbol("alias"), ComptimeValueFacts::default());
+        let mut right = left.clone();
+        let mut right_facts = ComptimeValueFacts::default();
+        right_facts.reference_origins.insert(outside.clone());
+        right.reassign(&symbol("alias"), right_facts);
+        right.note_escaping_write([outside.clone()]);
+
+        left.merge_branch(&right);
+
+        assert!(left
+            .binding_facts(&symbol("alias"))
+            .is_some_and(|facts| facts.reference_origins.contains(&outside)));
+        assert_eq!(left.escaping_write(), Some(&outside));
+    }
+
+    #[test]
+    fn incompatible_branch_flow_is_never_treated_as_normal() {
+        let mut normal = ComptimeEvalOutcome::known(Value::Int(7));
+        let returned = ComptimeEvalOutcome {
+            value: ComptimeEvalValue::known(Value::Int(7)),
+            flow: ComptimeEvalFlow::Return,
+            ..ComptimeEvalOutcome::default()
+        };
+
+        normal.merge_from(&returned);
+
+        assert_eq!(normal.flow, ComptimeEvalFlow::Indeterminate);
+        assert!(normal.value.concrete.is_none());
+    }
+
+    #[test]
+    fn call_guard_allows_recursion_and_rejects_the_depth_limit() {
+        let mut context = ComptimeEvalContext::default();
+        assert!(context.push_call());
+        assert!(context.push_call());
+        context.pop_call();
+        context.pop_call();
+
+        for _ in 0..MAX_CALL_DEPTH {
+            assert!(context.push_call());
+        }
+        assert!(!context.push_call());
+        assert!(context.call_depth_exceeded());
+        for _ in 0..MAX_CALL_DEPTH {
+            context.pop_call();
+        }
+        assert!(context.push_call());
+    }
+}
+
 /// How many nested calls compile-time evaluation will follow. A recursion that does not
 /// terminate used to take the compiler's stack down with it; this turns that into a
 /// diagnostic. High enough that ordinary compile-time work never reaches it.

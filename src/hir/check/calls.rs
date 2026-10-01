@@ -928,6 +928,11 @@ impl<'a> TypeChecker<'a> {
         {
             return;
         }
+        // The enclosing comptime interpreter must observe the call before it is replaced with a
+        // constant. Folding it here erases a captured write from that outer observation.
+        if self.consteval.comptime_depth > 0 {
+            return;
+        }
         let env = self.consteval_snapshot();
         let folded = self
             .eval_expr(expr, &env)

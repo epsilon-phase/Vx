@@ -1,0 +1,19 @@
+//===- comptime_range_local_unsupported.vx - Vx Compiler -------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// Ranges are concrete loop syntax, not comptime values yet. A local range statement must not be
+// dropped merely because a later tail is foldable.
+fn main() -> i32 {
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    let _range = 0i32..2i32;
+    0i32
+  };
+  return value;
+}

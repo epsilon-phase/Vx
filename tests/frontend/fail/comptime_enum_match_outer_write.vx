@@ -1,0 +1,30 @@
+//===- comptime_enum_match_outer_write.vx - Vx ---------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+enum Choice {
+  First,
+  Second
+}
+
+fn main() -> i32 {
+  let mut enum_match_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'enum_match_outer'
+  let value = comptime {
+    let choice = Choice::First;
+    let _ignored = match choice {
+      Choice::First => {
+        enum_match_outer = 9i32;
+        1i32
+      },
+      Choice::Second => 2i32
+    };
+    7i32
+  };
+  return value;
+}

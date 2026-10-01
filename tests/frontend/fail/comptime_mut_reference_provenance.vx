@@ -1,0 +1,143 @@
+//===- comptime_mut_reference_provenance.vx - Vx Compiler -----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+struct Holder {
+  value : &mut i32,
+}
+
+struct Cell {
+  value : i32,
+}
+
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 1i32;
+}
+
+fn through_holder(holder : Holder) -> i32 {
+  return touch(holder.value);
+}
+
+fn branch_alias(n : i32) -> i32 {
+  let mut branch_outer : i32 = 0i32;
+  let _callback = touch;
+  // CHECK: Error[E3033]{{.*}}writes to 'branch_outer'
+  let value = comptime {
+    let _ignored = if n > 0i32 {
+      let alias = &mut branch_outer;
+      _callback(alias)
+    } else {
+      1i32
+    };
+    7i32
+  };
+  return value;
+}
+
+fn copied_reference(n : i32, copy_outer : &mut i32) -> i32 {
+  // CHECK: Error[E3033]{{.*}}writes to 'copy_outer'
+  let value = comptime {
+    let alias = copy_outer;
+    let _ignored = if n > 0i32 {
+      touch(alias)
+    } else {
+      1i32
+    };
+    7i32
+  };
+  return value;
+}
+
+fn branch_assignment(n : i32) -> i32 {
+  let mut assignment_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'assignment_outer'
+  let value = comptime {
+    let _ignored = if n > 0i32 {
+      let alias = &mut assignment_outer;
+      *alias = 9i32;
+      1i32
+    } else {
+      2i32
+    };
+    7i32
+  };
+  return value;
+}
+
+fn aggregate_field() -> i32 {
+  let mut aggregate_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'aggregate_outer'
+  let value = comptime {
+    let holder = Holder {
+      value : &mut aggregate_outer
+    };
+    let _ignored = touch(holder.value);
+    7i32
+  };
+  return value;
+}
+
+fn aggregate_callback() -> i32 {
+  let mut callback_outer : i32 = 0i32;
+  let _callback = through_holder;
+  // CHECK: Error[E3033]{{.*}}writes to 'callback_outer'
+  let value = comptime {
+    let _ignored = _callback(Holder {
+      value : &mut callback_outer
+    });
+    7i32
+  };
+  return value;
+}
+
+fn captured_closure(n : i32) -> i32 {
+  let mut closure_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'closure_outer'
+  let value = comptime {
+    let _ignored = if n > 0i32 {
+      let _callback = || touch(&mut closure_outer);
+      _callback()
+    } else {
+      1i32
+    };
+    7i32
+  };
+  return value;
+}
+
+fn member_place() -> i32 {
+  let mut holder = Cell {
+    value : 0i32
+  };
+  // CHECK: Error[E3033]{{.*}}writes to 'holder'
+  let value = comptime {
+    let _ignored = touch(&mut holder.value);
+    7i32
+  };
+  return value;
+}
+
+fn dereference_place(outside : &mut i32) -> i32 {
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let value = comptime {
+    let _ignored = touch(&mut *outside);
+    7i32
+  };
+  return value;
+}
+
+fn assertion_condition() -> i32 {
+  let mut asserted_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'asserted_outer'
+  let value = comptime {
+    assert(touch(&mut asserted_outer) == 1i32);
+    7i32
+  };
+  return value;
+}

@@ -1,0 +1,24 @@
+//===- comptime_struct_result_unsupported.vx - Vx Compiler -----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// A local struct can be interpreted for provenance, but no source-level constant spelling exists
+// for an ordinary struct result yet.
+struct Cell {
+  value : i32,
+}
+
+fn main() -> i32 {
+  // CHECK: Error[E3033]{{.*}}its value cannot be worked out
+  let _value = comptime {
+    Cell {
+      value : 0i32
+    }
+  };
+  return 0i32;
+}

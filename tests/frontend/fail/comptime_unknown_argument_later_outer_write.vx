@@ -1,0 +1,24 @@
+//===- comptime_unknown_argument_later_outer_write.vx - Vx ----*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+fn write_after_unknown(_unknown : i32, value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 0i32;
+}
+
+fn main(n : i32) -> i32 {
+  let mut call_outer : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'call_outer'
+  let value = comptime {
+    // The unknown first argument must not stop evaluation before the mutable second argument.
+    let _ignored = write_after_unknown(n, &mut call_outer);
+    7i32
+  };
+  return value;
+}

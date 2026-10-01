@@ -1,0 +1,25 @@
+//===- comptime_range_outer_write.vx - Vx Compiler -------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// A range value is not foldable yet, but its later bound still runs. A write there must win over
+// the range refusal.
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 2i32;
+}
+
+fn main() -> i32 {
+  let mut outside : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let value = comptime {
+    let _range = 0i32..touch(&mut outside);
+    7i32
+  };
+  return value;
+}

@@ -1,0 +1,23 @@
+//===- comptime_closure_local_capture_write.vx - Vx ------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 7 : i32
+
+fn main() -> i32 {
+  let value = comptime {
+    let mut local : i32 = 0i32;
+    let callback = || comptime {
+      local = 9i32;
+      0i32
+    };
+    let _ignored = callback();
+    7i32
+  };
+  return value;
+}

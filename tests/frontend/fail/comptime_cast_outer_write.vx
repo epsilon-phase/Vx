@@ -1,0 +1,25 @@
+//===- comptime_cast_outer_write.vx - Vx Compiler --------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// A cast is not foldable yet, but its operand still runs through the shared interpreter. An
+// outer write nested there must therefore be diagnosed before the cast's refusal.
+fn touch(value : &mut i32) -> i32 {
+  *value = 9i32;
+  return 1i32;
+}
+
+fn main() -> i32 {
+  let mut outside : i32 = 0i32;
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let value = comptime {
+    let _ignored = touch(&mut outside) as i64;
+    7i32
+  };
+  return value;
+}

@@ -14,7 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 use super::super::*;
-use crate::hir::stmt::EvalFlow;
+use crate::hir::check_state::ComptimeEvalFlow;
 use std::collections::HashMap;
 
 /// What running a `comptime` block produced.
@@ -52,26 +52,27 @@ impl<'a> TypeChecker<'a> {
         ret: Option<&Expr>,
         before: &HashMap<crate::symbol::Symbol, Value>,
     ) -> ComptimeFold {
+        let interpretation = self.observe_comptime_block(stmts, ret, before);
+        let span = ret.map(|r| r.span()).unwrap_or_default();
+
         // Anything it writes that outlives it would have to survive, and the block does not.
-        if let Some(name) = Self::escaping_write(stmts) {
+        if let Some(name) = interpretation.escaping_write {
             self.report_comptime_block_failure(
                 &format!(
                     "it writes to '{}', which is declared outside it -- the block disappears, \
                      so the write would have to disappear with it",
                     name
                 ),
-                &ret.map(|r| r.span()).unwrap_or_default(),
+                &span,
             );
             return ComptimeFold::Refused;
         }
-        let mut env = before.clone();
-        let outer_unsupported = self.consteval.unsupported_stmt.replace(false);
-        let flow = self.eval_block(stmts, &mut env);
-        let ran = !self.consteval.unsupported_stmt.get();
-        self.consteval.unsupported_stmt.set(outer_unsupported);
-
-        let span = ret.map(|r| r.span()).unwrap_or_default();
-        if !ran {
+        if interpretation.call_depth_exceeded {
+            self.report_comptime_depth_exceeded(&span);
+            return ComptimeFold::Refused;
+        }
+        if interpretation.outcome.requires_refusal || !interpretation.outcome.support.is_supported()
+        {
             self.report_comptime_block_failure(
                 "it holds a statement the evaluator cannot run",
                 &span,
@@ -81,14 +82,40 @@ impl<'a> TypeChecker<'a> {
         // A `return` inside the block, where the block is a closure or function body, is
         // that body's value -- `|| comptime { ..; return x; }` is how the closure fixtures
         // are written. Answer with it, the same as a trailing expression.
-        if let EvalFlow::Return(returned) = flow {
-            return self.fold_value(returned, &span);
+        if interpretation.outcome.flow == ComptimeEvalFlow::Return {
+            return self.fold_value(interpretation.outcome.value.concrete, &span);
         }
-        let Some(ret) = ret else {
+        if interpretation.outcome.flow != ComptimeEvalFlow::Normal {
+            self.report_comptime_block_failure(
+                "its control flow does not complete normally",
+                &span,
+            );
+            return ComptimeFold::Refused;
+        }
+        if ret.is_none() {
             return ComptimeFold::NoValue;
-        };
-        let value = self.eval_expr(ret, &env);
-        self.fold_value(value, &span)
+        }
+        self.fold_value(interpretation.outcome.value.concrete, &span)
+    }
+
+    fn report_comptime_depth_exceeded(&mut self, span: &Span) {
+        if self.speculating
+            || self.consteval.closure_body_depth > 0
+            || self
+                .errors
+                .has_error(crate::diagnostic::DiagnosticCode::E8004)
+        {
+            return;
+        }
+        self.errors.error_with_code(
+            crate::diagnostic::DiagnosticCode::E8004,
+            format!(
+                "compile-time evaluation went more than {} calls deep and was stopped. A \
+                 recursive function whose base case is never reached is the usual cause.",
+                crate::hir::check_state::MAX_CALL_DEPTH
+            ),
+            Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+        );
     }
 
     fn fold_value(&mut self, value: Option<Value>, span: &Span) -> ComptimeFold {
@@ -106,58 +133,6 @@ impl<'a> TypeChecker<'a> {
                 ComptimeFold::Refused
             }
         }
-    }
-
-    /// A name the block writes that was declared outside it.
-    ///
-    /// The block disappears, so anything it did has to disappear with it. Writing to a
-    /// variable that outlives the block is an effect that cannot: the write would simply
-    /// stop happening, which is how this turned a program that printed 4 into one that
-    /// printed 0.
-    fn escaping_write(stmts: &[Statement]) -> Option<crate::symbol::Symbol> {
-        fn walk(
-            stmts: &[Statement],
-            declared: &mut std::collections::HashSet<String>,
-            written: &mut Vec<crate::symbol::Symbol>,
-        ) {
-            for stmt in stmts {
-                match stmt {
-                    Statement::LetDecl(d) => {
-                        declared.insert(d.name.to_string());
-                    }
-                    Statement::Assign(a) => {
-                        if let Some(root) = TypeChecker::place_root(&a.lhs) {
-                            written.push(root.clone());
-                        }
-                    }
-                    Statement::CompoundAssign(c) => {
-                        if let Some(root) = TypeChecker::place_root(&c.lhs) {
-                            written.push(root.clone());
-                        }
-                    }
-                    Statement::ForLoop(f) => {
-                        declared.insert(f.iter.to_string());
-                        walk(&f.body, declared, written);
-                    }
-                    Statement::Loop(l) => walk(&l.body, declared, written),
-                    Statement::ExprStmt(e) => {
-                        if let Expr::If(i) = &e.expr {
-                            walk(&i.then_block, declared, written);
-                            if let Some(otherwise) = &i.else_block {
-                                walk(otherwise, declared, written);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let mut declared = std::collections::HashSet::new();
-        let mut written = Vec::new();
-        walk(stmts, &mut declared, &mut written);
-        written
-            .into_iter()
-            .find(|name| !declared.contains(name.as_ref()))
     }
 
     fn report_comptime_block_failure(&mut self, why: &str, span: &Span) {

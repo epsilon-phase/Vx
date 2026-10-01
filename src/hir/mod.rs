@@ -15,6 +15,7 @@ use crate::syntax::*;
 pub mod borrow_cx;
 pub mod check;
 pub mod check_state;
+mod comptime_interpreter;
 pub mod decl_check;
 pub mod env;
 pub mod expr;

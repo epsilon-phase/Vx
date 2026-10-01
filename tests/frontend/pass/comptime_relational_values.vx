@@ -1,0 +1,40 @@
+//===- comptime_relational_values.vx - Vx Compiler ------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+
+fn main() -> i32 {
+  let float_value = comptime {
+    if 1.5 < 2.0 {
+      7i32
+    } else {
+      0i32
+    }
+  };
+  let bool_value = comptime {
+    if true != false {
+      1i32
+    } else {
+      0i32
+    }
+  };
+  // Dispatch ids are routing keys, so two different slices must compare by their complete
+  // topology identity rather than by a potentially colliding id.
+  let distinct_slices = comptime {
+    if Topology::NPU[0..49] == Topology::NPU[0..52] {
+      0i32
+    } else {
+      2i32
+    }
+  };
+  return float_value + bool_value + distinct_slices;
+}
+
+// CHECK-LABEL: func.func @main() -> i32
+// CHECK: arith.constant 7 : i32
+// CHECK: arith.constant 1 : i32
+// CHECK: arith.constant 2 : i32

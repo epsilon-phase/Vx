@@ -1,0 +1,23 @@
+//===- comptime_opaque_closure_outer_write.vx - Vx -------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+// The body of a fat-pointer closure parameter is unavailable. A mutable-reference argument is
+// nevertheless a concrete possible escaping write and must retain its actual outer origin.
+fn fold_with(callback : |&mut i32| -> i32, outside : &mut i32) -> i32 {
+  // CHECK: Error[E3033]{{.*}}writes to 'outside'
+  let value = comptime {
+    let _ignored = callback(&mut *outside);
+    7i32
+  };
+  return value;
+}
+
+fn main() -> i32 {
+  return 0i32;
+}

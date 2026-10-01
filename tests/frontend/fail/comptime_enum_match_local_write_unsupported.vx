@@ -1,0 +1,31 @@
+//===- comptime_enum_match_local_write_unsupported.vx - Vx ---*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for the Apache License 2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// RUN: not vxc %s 2>&1 | FileCheck %s
+
+enum Choice {
+  First,
+  Second
+}
+
+fn main() -> i32 {
+  // Enum-pattern values have no comptime value model yet; local writes must not make them vanish.
+  // CHECK: Error[E3033]{{.*}}holds a statement the evaluator cannot run
+  let value = comptime {
+    let mut enum_match_local : i32 = 0i32;
+    let choice = Choice::First;
+    let _ignored = match choice {
+      Choice::First => {
+        enum_match_local = 9i32;
+        1i32
+      },
+      Choice::Second => 2i32
+    };
+    7i32
+  };
+  return value;
+}
