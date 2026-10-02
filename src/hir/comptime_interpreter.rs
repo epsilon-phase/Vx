@@ -619,6 +619,25 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
         }
     }
 
+    /// Whether two places share storage: the same root, and one's path a prefix of the other's.
+    fn places_overlap(a: &ComptimeWritePlace, b: &ComptimeWritePlace) -> bool {
+        fn path(place: &ComptimeWritePlace) -> Option<(&Symbol, &[ComptimePlaceProjection])> {
+            match place {
+                ComptimeWritePlace::Binding(root) => Some((root, &[])),
+                ComptimeWritePlace::Projection { root, projections } => {
+                    Some((root, projections.as_slice()))
+                }
+                ComptimeWritePlace::Unknown => None,
+            }
+        }
+        match (path(a), path(b)) {
+            (Some((root_a, path_a)), Some((root_b, path_b))) => {
+                root_a == root_b && (path_a.starts_with(path_b) || path_b.starts_with(path_a))
+            }
+            _ => true,
+        }
+    }
+
     fn place_root(place: &ComptimeWritePlace) -> Option<&Symbol> {
         match place {
             ComptimeWritePlace::Binding(root) | ComptimeWritePlace::Projection { root, .. } => {
@@ -1334,6 +1353,17 @@ impl<'graph, 'bodies> ComptimeInterpreter<'graph, 'bodies> {
                 .any(|place| matches!(place, ComptimeWritePlace::Unknown))
             {
                 return self.refusal_after(args);
+            }
+            // Each parameter gets its own copy of what it points to, so two arguments reaching
+            // the same variable, as in `f(p, p)` or `f(&mut h, &mut h.n)`, would not see each
+            // other's writes. Such a call is not folded.
+            let places = writebacks.iter().flatten().collect::<Vec<_>>();
+            let overlapping = places
+                .iter()
+                .enumerate()
+                .any(|(i, a)| places[i + 1..].iter().any(|b| Self::places_overlap(a, b)));
+            if overlapping {
+                return self.unsupported_after(args);
             }
             // The borrow outcome deliberately has no scalar `Value`: `comptime { &mut x }`
             // cannot replace itself with `x`. A known direct callee, however, needs the current
