@@ -2541,6 +2541,9 @@ impl<'c> LowerToMelior<'c> for FunctionCallExpr {
                 )])
                 .add_results(&[tensor_ty])
                 .build()?;
+            // A size can end the block it started in (`[if c { 3 } else { 2 }]` lands in the
+            // `if`'s merge block), so what follows goes where the sizes left off.
+            let block = current_b;
             let alloc_ref = block.append_operation(alloc_op);
             let alloc_val: Value = alloc_ref.result(0)?.into();
             // `::new()` zeroes what `::uninit()` leaves as it was found. The same fill a matmul
@@ -3547,6 +3550,17 @@ pub(crate) fn fit_payload_to_slot<'c>(
     // that a copy may flush to zero, which is the hazard
     // `tests/optimizations/pass/enum_payload_per_variant.vx` records.
     let int_bits = |t: &str| t.strip_prefix('i').and_then(|r| r.parse::<u32>().ok());
+    // A loop variable is an `index` in MLIR and an integer in Vx, and `index` is not a type a
+    // struct can hold, so it is cast to the slot's integer type.
+    if *payload_ty == Type::index(gen.context) && int_bits(&slot_text).is_some() {
+        let slot_ty = Type::parse(gen.context, &slot_text)
+            .ok_or_else(|| LowerError::ParseType("Type::parse failed".to_string()))?;
+        let cast = OperationBuilder::new("arith.index_cast", gen.loc())
+            .add_operands(&[payload_val])
+            .add_results(&[slot_ty])
+            .build()?;
+        return Ok(block.append_operation(cast).result(0)?.into());
+    }
     let (Some(have), Some(want)) = (int_bits(&payload_ty.to_string()), int_bits(&slot_text)) else {
         return Ok(payload_val);
     };
