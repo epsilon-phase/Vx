@@ -63,7 +63,7 @@ an image containing a NUL byte is rejected. The reader is `vx_payload_field` at
 the key it is asked for — that property is what lets new entries land without
 breaking existing consumers (`runtime/cuda_dispatch.cpp:699` reads `image=` this
 way).
-*Not started.* Planned shape: `abi=1` as a version key, plus an
+*Landed as 99f49eb6.* The shape: `abi=1` as a version key, plus an
 `imagebin=` entry carrying a base64-encoded image for formats that are not text.
 No producer emits `imagebin=` until the device-image slice has a binary format
 to put there.
@@ -168,7 +168,7 @@ names `nvptx64` the gate's answer is what it was.
 *Deferred.* The `spirv64` entry, which arrives with slice 4 when there is a
 pipeline behind it.
 
-### Slice 2 — payload version key and binary image entry (not started; shared item 2)
+### Slice 2 — payload version key and binary image entry (landed as 99f49eb6; shared item 2)
 
 *Change.* The payload builder at `src/dialect/VxLowering.cpp:2157` gains an
 `abi=1` entry and, for an image that is not text, an `imagebin=` entry carrying
@@ -305,7 +305,7 @@ obligation rather than a test.
 
 ### Order
 
-Slices 0, 1 and 3 have landed (5087a2ea and ddbd9183 for the machine file, 45c9b7d6, 70e98faf
+Slices 0–3 have landed (5087a2ea and ddbd9183 for the machine file, 45c9b7d6, 70e98faf, 99f49eb6
 for the address-space table, which the emitted-MLIR diff over all 1094 fixtures
 cleared). Slice 4 needs 1 and 2 (a gate entry and somewhere to put a binary
 image); slice 5 is independent of everything; slice 6 needs 2 and 4 (the image
@@ -313,11 +313,10 @@ in the payload, and an image worth launching); slice 7 needs 6. Slices 4 and 5
 can both merge before any runtime exists, which is the roadmap's
 CI-testable-half-first rule.
 
-\*\*Slice 2 and the slice-4 investigation were written once and lost when
-the development machine's terminal was killed under memory pressure.** None of
-that work is in the tree -- `git status` on this branch is clean apart from it --
-so each is marked not started above rather than partly done, and the shapes
-recorded for them are plans, not descriptions of code that exists.
+**The slice-4 investigation was written once and lost when the development
+machine's terminal was killed under memory pressure.** None of that work is in
+the tree, so slice 4 is marked not started above rather than partly done, and
+the shape recorded for it is a plan, not a description of code that exists.
 
 ______________________________________________________________________
 
@@ -464,10 +463,9 @@ ______________________________________________________________________
 
 ## What lands next
 
-Slices 0, 1 and 3 have landed, with the machine file's dtype rows in CI beside them.
-Next is slice 2 (the payload version key and
-binary image entry) — both vendor-neutral and both missed by every backend —
-then slice 4, the device image, which merges on FileCheck evidence alone. Slice 5
-is independent of all of them. After that come the runtime (slice 6) and the
-parity runs on the card (slice 7). A reviewer of each PR checks exactly the
-"proves" line written against it above.
+Slices 0–3 have landed, with the machine file's dtype rows in CI beside them.
+Next is slice 4, the device image, which merges on FileCheck evidence alone
+starting from the investigation the lost work had begun. Slice 5 is independent
+of all of them. After that come the runtime (slice 6) and the parity runs on the
+card (slice 7). A reviewer of each PR checks exactly the "proves" line written
+against it above.
