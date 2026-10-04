@@ -212,7 +212,7 @@ conversion together with the pipeline); the three integer-3 literals in
 `VxLowering.cpp` (`:977`, `:1492`, `:1572`), which stay NVVM's until the
 SPIR-V pipeline installs its own conversion.
 
-### Slice 4 — the SPIR-V device image (investigation not started; implementation next)
+### Slice 4 — the SPIR-V device image (investigation done, LLVM route; implementation next)
 
 *Investigation first.* No repo files — a reproducible command sequence proving
 the route `gpu.module` → SPIR-V with the in-tree MLIR (convert-gpu-to-spirv,
@@ -237,6 +237,60 @@ Producing SPIR-V is in-tree MLIR work: no GPU, no Level Zero, no oneMKL.
 
 *Deferred.* Running the image (slice 6); matmul; the choice between
 convert-gpu-to-spirv and the XeVM target (open until the investigation reports).
+
+**Investigation result — 2026-10-04, MLIR 22.1.8.** Run end to end on this
+machine, from a real kernel. It answers the pipeline choice in this section: take
+the LLVM route, not the SPIR-V-dialect one.
+
+*The device twin as it exists.* `vx-opt --convert-vx-to-standard` turns a
+`vx.spawn` into `vx.kernel` + `vx.launch`, and materializes
+`gpu.module @vx_kernels { gpu.func @vx_npu_kernel_0(memref<8x4xf32>, ...) }` --
+static shapes, no address-space annotations, and a **CFG** (`cf.br`,
+`cf.cond_br`) that comes from the frontend, not from a device pass.
+
+*The route that works.* For a kernel from
+`tests/backend/pass/placed_kernel_four_operands.vx`: watch out, five steps.
+
+1. `mlir-opt --convert-gpu-to-llvm-spv=use-64bit-index` -- LLVM dialect inside
+   the `gpu.module`, the CFG kept, and the memref **descriptor preserved** as a
+   first-class value: `!llvm.struct<(ptr<1>, ptr<1>, i64, array<2 x i64>, array<2 x i64>)>`.
+   That is Vx's kernel ABI, which is why this route is the one.
+2. Hoist the `gpu.module` body to module scope and set
+   `module attributes {llvm.target_triple = "spirv64-unknown-unknown"}`.
+3. `mlir-opt --convert-to-llvm --reconcile-unrealized-casts` (the same
+   reconcile the NVVM pipeline runs; without it the translation dies on a
+   `builtin.unrealized_conversion_cast` from descriptor struct to memref).
+4. `mlir-translate --mlir-to-llvmir`.
+5. `llvm-spirv` -- **a 5224-byte SPIR-V module, magic `0x07230203`**. A real
+   binary image, produced with no GPU and no vendor SDK.
+
+*Why not the SPIR-V dialect route.* `--convert-gpu-to-spirv` gets three
+blockers and loses the ABI: it requires `spirv.entry_point_abi` on the kernel
+(the spelling is `#spirv.entry_point_abi<workgroup_size = [8, 1, 1]>`); it maps
+*un-annotated* memrefs to `#spirv.storage_class<CrossWorkgroup>`; it needs SCF
+where Vx's kernel is a CFG (`--lift-cf-to-scf` does not lift these loops); and it
+replaces the memref with an `rtarray`, dropping shape and stride -- the ABI
+problem `docs/gpu_backends.md` does not mention and the LLVM route avoids.
+
+*The one blocker left, and it is the same root cause in both routes.* Vx types a
+kernel's private stack allocations in the **enclosing placement's** space. In the
+LLVM route that becomes `%88 = OpVariable %_ptr_CrossWorkgroup_uint Function` --
+a `Function`-class variable pointing into `CrossWorkgroup` -- and `spirv-val`
+refuses the module with exactly one error: `Storage class must match result type
+storage class`. In the SPIR-V-dialect route the same thing is
+`failed to legalize operation 'memref.alloca'`. So the fix is one change, in the
+place `materializeGpuKernels` already rewrites workgroup allocas for NVVM:
+private allocas need the private/thread space for the SPIR-V target.
+
+*Already known, and it matters for the ABI:* the descriptor keeps `i64` sizes and
+strides only with `use-64bit-index`. Without it they come out `i32`, and
+`vx_launch_param_width` counts a rank-2 memref as two pointers plus an `i64`
+offset, two `i64` sizes and two `i64` strides. Set the flag.
+
+*Reproduce:* the five commands above, with `vxc --action emit-mlir` and `vx-opt`
+supplying the kernel, and `spirv-val` checking the result. A script under
+`scripts/tools/` that runs all of it from a `.vx` file is the next artifact, so
+the recipe is reproducible without this note.
 
 ### Slice 5 — spawn bodies checked against `dtypes:` (not started; shared item 4)
 
@@ -314,9 +368,9 @@ can both merge before any runtime exists, which is the roadmap's
 CI-testable-half-first rule.
 
 **The slice-4 investigation was written once and lost when the development
-machine's terminal was killed under memory pressure.** None of that work is in
-the tree, so slice 4 is marked not started above rather than partly done, and
-the shape recorded for it is a plan, not a description of code that exists.
+machine's terminal was killed under memory pressure.** It has since been rerun
+from scratch and its result is recorded under slice 4, so nothing is outstanding
+from that loss; the shape described there is measured, not planned.
 
 ______________________________________________________________________
 
@@ -438,9 +492,15 @@ ______________________________________________________________________
    envelopes — 64 KiB vs 48 KiB shared memory is the measured difference — or
    Vulkan could be declined the way SYCL-as-a-compile-target was declined. This
    plan does not pre-answer it.
-3. **Which SPIR-V pipeline.** MLIR's convert-gpu-to-spirv (what the
-   investigation is proving) or the XeVM target — the roadmap names both.
-   Blocked on question 1's evidence.
+3. **Which SPIR-V pipeline.** *Answered by the investigation: neither of the two
+   the roadmap names.* `convert-gpu-to-spirv` fights three things Vx has (a CFG,
+   private allocas typed in the placement's space, and a descriptor ABI it
+   replaces with an `rtarray`), so the route is
+   `--convert-gpu-to-llvm-spv=use-64bit-index` → `--convert-to-llvm` →
+   `mlir-translate --mlir-to-llvmir` → `llvm-spirv`, which keeps all three and
+   already produces a SPIR-V binary of the right shape (5224 bytes, magic
+   `0x07230203`), whose single remaining validation error is the private-storage
+   bug above. Recorded under slice 4.
 4. **How launch geometry is checked.** 1024 max invocations and a preferred
    multiple of 64 are API-visible facts the machine model has no field for. The
    enforcement mechanism — clamped at launch, a new declaration on `Topology`,
