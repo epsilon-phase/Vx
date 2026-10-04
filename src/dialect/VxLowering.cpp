@@ -1,6 +1,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include "VxDialect.h"
+#include "vx_hardware_runtime.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Pass.h"
@@ -2656,6 +2657,14 @@ struct LaunchOpLowering : public OpRewritePattern<vx::LaunchOp> {
     //    extra entries is unaffected -- which is why the name leads rather than
     //    a header. See vx_payload_field() in include/vx_hardware_runtime.h.
     std::string payload = callee.str();
+    payload.push_back('\0');
+    // The format version, first among the entries so a dispatch library reads
+    // it before anything it might misread. `VX_PAYLOAD_ABI` lives in the header
+    // the dispatch libraries include, so the number has one source; a library
+    // that meets a version it does not know refuses rather than guessing, and
+    // an older payload with no `abi=` at all stays readable.
+    payload += "abi=";
+    payload += std::to_string(VX_PAYLOAD_ABI);
     payload.push_back('\0');
     if (auto kindAttr = op->getAttrOfType<StringAttr>("vx.kernel_kind")) {
       payload += "kind=";
