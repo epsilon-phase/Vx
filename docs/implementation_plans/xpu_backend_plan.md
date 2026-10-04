@@ -272,15 +272,44 @@ where Vx's kernel is a CFG (`--lift-cf-to-scf` does not lift these loops); and i
 replaces the memref with an `rtarray`, dropping shape and stride -- the ABI
 problem `docs/gpu_backends.md` does not mention and the LLVM route avoids.
 
-*The one blocker left, and it is the same root cause in both routes.* Vx types a
-kernel's private stack allocations in the **enclosing placement's** space. In the
-LLVM route that becomes `%88 = OpVariable %_ptr_CrossWorkgroup_uint Function` --
-a `Function`-class variable pointing into `CrossWorkgroup` -- and `spirv-val`
-refuses the module with exactly one error: `Storage class must match result type
-storage class`. In the SPIR-V-dialect route the same thing is
-`failed to legalize operation 'memref.alloca'`. So the fix is one change, in the
-place `materializeGpuKernels` already rewrites workgroup allocas for NVVM:
-private allocas need the private/thread space for the SPIR-V target.
+*The one blocker left, and it is not where this note first said it was.*
+`spirv-val` rejects the module with exactly one error -- `Storage class must
+match result type storage class` -- and the rejected instructions are four
+`OpVariable`s at the top of the kernel, one per rank-2 memref parameter, each a
+`Function`-class variable whose type is `OpTypePointer CrossWorkgroup
+%descriptor`. That is Vx's **kernel ABI** meeting SPIR-V's rules: a memref
+argument is a descriptor passed by value, the LLVM-SPV lowering spills a copy of
+it on the stack, and SPIR-V cannot express a `Function`-class variable pointing
+into `CrossWorkgroup`.
+
+Three things that do *not* fix it, all measured, and recorded because each one
+looks like the fix:
+
+- `--use-64bit-index` keeps the descriptor's `i64` sizes and changes nothing
+  about the error (it is still needed: without it the sizes come out `i32` and
+  `vx_launch_param_width` counts `i64`).
+- Retagging the kernel's private allocas with `AddressSpace::Private`'s number,
+  `5`. The retag does reach the IR -- `alloca i32, i64 1, align 4, addrspace(5)`
+  where the untagged module has `addrspace(1)` -- and the error is unchanged,
+  because the rejected variables are the descriptor slots, not the scalar cells.
+  An earlier reading of this experiment said the retag fixed it; that reading
+  came from a module whose kernel had been dropped before serialization, so
+  `spirv-val` was passing an almost empty module. It was wrong, and the
+  serialized artifact's size is what exposed it.
+- Either tool: `llc -mtriple=spirv64-unknown-unknown -filetype=obj` and
+  `llvm-spirv` produce the same module to within four bytes and the same error.
+  (`llc` is the better dependency: it is the LLVM already linked, and its default
+  output is SPIR-V *assembly*, which a test can FileCheck.)
+
+So the next step is not a pass or a flag but an **ABI decision**. A kernel's
+buffer operands have to arrive the way SPIR-V passes buffers -- a bare
+`CrossWorkgroup` pointer, with shape and stride supplied some other way (extra
+scalar parameters, or a descriptor the kernel loads from global memory) -- rather
+than as a by-value descriptor struct. That is the real content of §6's question
+3 and it belongs on #1137 before an image compiler is written, because it decides
+the device twin's signature and therefore both backends' marshalling:
+`vx_launch_param_width` counts seven parameters per rank-2 memref today, and
+`tests/backend/pass/placed_kernel_four_operands.vx` pins 28 for four.
 
 *Already known, and it matters for the ABI:* the descriptor keeps `i64` sizes and
 strides only with `use-64bit-index`. Without it they come out `i32`, and
@@ -494,13 +523,13 @@ ______________________________________________________________________
    plan does not pre-answer it.
 3. **Which SPIR-V pipeline.** *Answered by the investigation: neither of the two
    the roadmap names.* `convert-gpu-to-spirv` fights three things Vx has (a CFG,
-   private allocas typed in the placement's space, and a descriptor ABI it
-   replaces with an `rtarray`), so the route is
-   `--convert-gpu-to-llvm-spv=use-64bit-index` → `--convert-to-llvm` →
-   `mlir-translate --mlir-to-llvmir` → `llvm-spirv`, which keeps all three and
-   already produces a SPIR-V binary of the right shape (5224 bytes, magic
-   `0x07230203`), whose single remaining validation error is the private-storage
-   bug above. Recorded under slice 4.
+   private allocas, and a descriptor ABI it replaces with an `rtarray`), so the
+   route is `--convert-gpu-to-llvm-spv=use-64bit-index` → hoist with
+   `llvm.target_triple = "spirv64-unknown-unknown"` → `--convert-to-llvm
+   --reconcile-unrealized-casts` → `mlir-translate --mlir-to-llvmir` → `llc
+   -mtriple=spirv64-unknown-unknown -filetype=obj`. It produces a 5.5 KB SPIR-V
+   module with the right magic on the first try. Recorded under slice 4, with the
+   one validation error that is left and the ABI question it raises.
 4. **How launch geometry is checked.** 1024 max invocations and a preferred
    multiple of 64 are API-visible facts the machine model has no field for. The
    enforcement mechanism — clamped at launch, a new declaration on `Topology`,
@@ -518,6 +547,16 @@ ______________________________________________________________________
    a design-review item on slice 6 (§4).
 8. **bf16 in `dtypes:`.** Deliberately omitted pending a citable source
    (`fleet/arc-a770.vx:82-85`); adding it is one token once a source exists.
+9. **The kernel ABI for SPIR-V device code — the top item now.** Measured, not
+   suspected: with Vx's by-value memref descriptors, the serialized module has
+   one `Function`-class variable per rank-2 parameter whose type is a
+   `CrossWorkgroup` pointer, and `spirv-val` refuses it. So the device twin's
+   signature has to change for this target — a bare `CrossWorkgroup` pointer per
+   buffer with shape and stride supplied separately — and that decision comes
+   before the image compiler, because it moves `vx_launch_param_width`, the
+   marshalling both backends share, and the 28-parameter fixture that pins them.
+   Whoever answers this should answer it for the NVPTX backend too, or say why
+   the two may differ.
 
 ______________________________________________________________________
 
