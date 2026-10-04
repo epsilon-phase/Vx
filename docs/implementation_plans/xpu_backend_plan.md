@@ -50,9 +50,8 @@ kernels get cloned into the `gpu.module`. The single-arch test is
 `src/dialect/VxLowering.cpp:1436-1438` — `if (arch.getValue() != "nvptx64")
 return;` — with the dispatch-id band as the fallback at `:1439` for kernels
 that carry no `arch` attribute.
-*Not started.* Planned shape: the test becomes a table keyed on the
-declared arch, with `nvptx64` as its only entry for now and the band fallback
-kept.
+*Landed as 70e98faf*: `DevicePipeline` with `pipelineForArch` as the table, keyed
+on the declared arch, `nvptx64` as its only row and the band fallback kept.
 
 **2. The dispatch payload cannot carry a binary image.**
 The payload is built at `src/dialect/VxLowering.cpp:2157-2265`: kernel name
@@ -154,7 +153,7 @@ added the INT4 matrix format to `dtypes:`, which the file's provenance row in
 unit a workgroup's scratchpad belongs to on Xe is unsettled and a wrong value
 moves every on-die cost); the UNVERIFIED bandwidth figures.
 
-### Slice 1 — eligibility gate keyed on arch (not started; shared item 1)
+### Slice 1 — eligibility gate keyed on arch (landed as 70e98faf; shared item 1)
 
 *Change.* `src/dialect/VxLowering.cpp:1436-1438` becomes a table keyed on the
 declared arch: `nvptx64` as its only entry, band fallback kept for kernels with
@@ -306,7 +305,7 @@ obligation rather than a test.
 
 ### Order
 
-Slices 0 and 3 have landed (5087a2ea and ddbd9183 for the machine file, 45c9b7d6
+Slices 0, 1 and 3 have landed (5087a2ea and ddbd9183 for the machine file, 45c9b7d6, 70e98faf
 for the address-space table, which the emitted-MLIR diff over all 1094 fixtures
 cleared). Slice 4 needs 1 and 2 (a gate entry and somewhere to put a binary
 image); slice 5 is independent of everything; slice 6 needs 2 and 4 (the image
@@ -314,7 +313,7 @@ in the payload, and an image worth launching); slice 7 needs 6. Slices 4 and 5
 can both merge before any runtime exists, which is the roadmap's
 CI-testable-half-first rule.
 
-**Slices 1 and 2 and the slice-4 investigation were written once and lost when
+\*\*Slice 2 and the slice-4 investigation were written once and lost when
 the development machine's terminal was killed under memory pressure.** None of
 that work is in the tree -- `git status` on this branch is clean apart from it --
 so each is marked not started above rather than partly done, and the shapes
@@ -465,8 +464,8 @@ ______________________________________________________________________
 
 ## What lands next
 
-Slices 0 and 3 have landed, with the machine file's dtype rows in CI beside them.
-Next is slice 1 (the eligibility gate), then slice 2 (the payload version key and
+Slices 0, 1 and 3 have landed, with the machine file's dtype rows in CI beside them.
+Next is slice 2 (the payload version key and
 binary image entry) — both vendor-neutral and both missed by every backend —
 then slice 4, the device image, which merges on FileCheck evidence alone. Slice 5
 is independent of all of them. After that come the runtime (slice 6) and the
