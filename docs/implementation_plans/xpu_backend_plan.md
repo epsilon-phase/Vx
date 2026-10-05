@@ -97,8 +97,8 @@ A `spawn` body goes through `check_spawnon_expr` at
 compares the body's element types against that topology's `dtypes:` list — so
 an f64 scalar inside a `spawn` body passes the checker and would only fail on
 the device.
-*Not covered by any in-flight slice.* This plan schedules it as its own small
-PR (slice 5).
+*Landed as e2c9bf, at the binding rather than over the whole body. A value that
+appears solely as the region's result is still open.*
 
 **5. One dispatch library per build.**
 `build.rs:449-454` picks exactly one dispatch source — the CUDA library where a
@@ -321,24 +321,28 @@ supplying the kernel, and `spirv-val` checking the result. A script under
 `scripts/tools/` that runs all of it from a `.vx` file is the next artifact, so
 the recipe is reproducible without this note.
 
-### Slice 5 — spawn bodies checked against `dtypes:` (not started; shared item 4)
+### Slice 5 — spawn bodies checked against `dtypes:` (landed as e2c9bf; shared item 4)
 
-*Change.* In `check_spawnon_expr`
-(`src/hir/check/transfer.rs:1875`), once the target topology resolves, walk
-the body's element types — tensor element types built in the body, scalar
-literals — and report E6026 through the existing `check_element_type` path
-(`:389`) when the topology declares a `dtypes:` list that lacks one. Same
-diagnostic the placement check already produces, now with the spawn's span.
+*Change.* Landed as e2c9bf, at the `let` rather than as the body walk this note
+planned. `check_element_type` gained the span of what it is reporting on, so the
+error points at the binding; `check_element_type_in_active_region` asks the
+region's own device through the region's default space; and each binding checks
+every element type its type names — scalars, tensors and vectors, through the
+wrappers. A body walk would have re-reported an arithmetic tree once per
+subexpression; a binding is one mistake. A value that appears only as the
+region's result is still unchecked, which the commit records.
 
-*Proves.* Frontend fail fixtures: an f64 scalar or tensor used inside a
-`spawn on` against `fleet/arc-a770.vx` reports E6026 naming the declared list —
-the A770's missing f64 is the roadmap's compile-error policy meeting its first
-discrete-GPU case; and a spawn on a topology that declares no `dtypes:` still
-compiles, because undeclared is permissive by construction
-(`src/hir/check/transfer.rs:387-388`). Existing NVIDIA fixtures are unchanged:
-their topologies declare f64. No GPU, no SDK.
+*Proves.* `tests/frontend/fail/f64_scalar_inside_a_device_region.vx` — an f64
+scratch value in a region on a topology whose `dtypes:` is the Arc's list, with
+the machine declared inline so the fixture needs no flag — reports E6026 naming
+the binding and the declared list. The same fixture with f32 compiles and runs,
+f64 on the host is untouched, a topology declaring no `dtypes:` still constrains
+nothing (`src/hir/check/transfer.rs:387-388`), and with the hook disabled the
+fixture compiles, which is what shows the expectation is what fails. No GPU, no
+SDK; `compile_test` 16 of 16 and the corpus sweep unchanged.
 
-*Deferred.* Nothing — the item is vendor-neutral and this is its whole fix.
+*Deferred.* A value that appears only as the region's result — never bound to a
+name — is still unchecked. That is its own small change.
 
 ### Slice 6 — the runtime dispatch library (not started; roadmap step 4)
 
@@ -388,7 +392,7 @@ obligation rather than a test.
 
 ### Order
 
-Slices 0–3 have landed (5087a2ea and ddbd9183 for the machine file, 45c9b7d6, 70e98faf, 99f49eb6
+Slices 0–3 and 5 have landed (5087a2ea and ddbd9183 for the machine file, 45c9b7d6, 70e98faf, 99f49eb6, e2c9bf
 for the address-space table, which the emitted-MLIR diff over all 1094 fixtures
 cleared). Slice 4 needs 1 and 2 (a gate entry and somewhere to put a binary
 image); slice 5 is independent of everything; slice 6 needs 2 and 4 (the image
@@ -562,9 +566,8 @@ ______________________________________________________________________
 
 ## What lands next
 
-Slices 0–3 have landed, with the machine file's dtype rows in CI beside them.
+Slices 0–3 and 5 have landed, with the machine file's dtype rows in CI beside them.
 Next is slice 4, the device image, which merges on FileCheck evidence alone
-starting from the investigation the lost work had begun. Slice 5 is independent
-of all of them. After that come the runtime (slice 6) and the parity runs on the
+starting from the investigation the lost work had begun. After that come the runtime (slice 6) and the parity runs on the
 card (slice 7). A reviewer of each PR checks exactly the "proves" line written
 against it above.
