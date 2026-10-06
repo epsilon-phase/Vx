@@ -977,8 +977,11 @@ impl<'c> MeliorGenerator<'c> {
             self.functions.insert(ext.name.clone(), (ret_ty, arg_tys));
         }
 
-        // Declare printMemref functions
-        for ty_str in &["f32", "f64", "i32", "i64", "bf16"] {
+        // Declare printMemref functions. The name is the element type's, uppercased, so
+        // a type listed here needs a matching helper: `printMemrefI8` and
+        // `printMemrefI16` come from `runtime/vx_mlir_shims.c`, the same place the
+        // half-precision ones come from.
+        for ty_str in &["f32", "f64", "i32", "i64", "bf16", "i8", "i16"] {
             let func_name = format!("printMemref{}", ty_str.to_uppercase());
             let unranked_memref_ty =
                 Type::parse(self.context, &format!("memref<*x{}>", ty_str)).unwrap();

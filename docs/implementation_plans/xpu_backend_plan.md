@@ -166,22 +166,40 @@ added the INT4 matrix format to `dtypes:`, which the file's provenance row in
 unit a workgroup's scratchpad belongs to on Xe is unsettled and a wrong value
 moves every on-die cost); the UNVERIFIED bandwidth figures.
 
-*A gap the probing found, narrower than it first looked.* A tensor of every
-element type this machine file declares compiles: f32, f16, bf16, bool, i1, i8,
-u8, i16, u16, i32, u32, i64, u64, i4 and u4 all pass `vxc --emit-mlir` in a
-program that writes the tensor and reads it back. What fails is a program that
-does something the flat emitter cannot emit yet, because that sends it to the
-AST path, and there `extract_mlir_element_type`
-(`src/codegen/lower/mod.rs:188`) knows bf16, f16, f32, f64, i32, i64 and i1 —
-so i8, u8, i16, u16, i4 and u4 are refused with `Codegen Error: ParseType(
-"Unsupported MLIR element type in: memref<?x?xi8>")`. `print` of such a tensor
-is the instance measured here, and the AST path's printer already handles i8 and
-i16 as widened integers (`src/codegen/lower/mod.rs:1233-1236`): the missing piece
-is the string-to-type mapping in front of a printer that works. What that costs
-a reader is two things — an internal message where a diagnostic belongs, and a
-byte or 4-bit tensor that passes E6026 and then cannot be printed. This is a Vx
-issue rather than an Arc one; the `dtypes:` list stays the hardware's, which is
-the rule `fleet/README.md` sets.
+*A gap the probing found, and closed.* Printing a tensor whose elements are
+`i8`, `u8`, `i16` or `u16` stopped with `ParseType("Unsupported MLIR element
+type in: memref<?x?xi8>")` -- an internal message from the element-type mapping
+in codegen, which knew seven types and not these six. Four small pieces were
+missing, and one of them was a decision rather than a gap:
+
+- the mapping (`src/codegen/lower/mod.rs:188`), which the print path reads
+  before it can choose a printer;
+- the printer choice on both code paths (`src/codegen/lower/mod.rs:1152`,
+  `src/codegen/flat/emit/io.rs:30`);
+- the AST path's declaration list (`src/codegen/generator.rs:984`), whose names
+  are built by uppercasing the element type -- so a type listed there needs a
+  matching helper to exist;
+- the helpers themselves (`runtime/vx_mlir_shims.c`). `printMemrefI16` is a
+  wrapper: MLIR exports it packed-only, like the half-precision printers.
+  `printMemrefI8` could not be. MLIR's I8 printer prints each element as a
+  CHARACTER -- a tensor holding 100 prints as `d` -- so the byte printer is Vx's
+  own, printing signed decimals, and
+  `tests/backend/pass/tensor_print_narrow.vx` fails if it goes back to MLIR's
+  (verified by sabotage: the mismatch names the expected line).
+
+Two things remain, recorded rather than fixed. A tensor of `i4` or `u4` still
+cannot be printed: MLIR has no 4-bit printer, so the request now fails with
+`UnsupportedElementType("i4")` rather than the parse message -- it names the
+element type, in the Debug form every other unsupported-element-type failure
+uses, and no fixture pins that wording because none pins any `Codegen Error`
+message. And an unsigned tensor prints signed: `u8` 200 prints as -56, the way
+`u32` tensors already print through `printMemrefI32`. Making one of them honest
+would be a change to all of them.
+
+Printing a *half-precision* tensor is measured but untested: `vx_mlir_shims.c`
+supplies `printMemrefBF16`, and a bf16 tensor prints correctly. The fixture for
+the narrow integers covers the same mechanism for two of the four helpers; the
+half-precision pair is a one-line addition when someone wants it.
 
 ### Slice 1 — eligibility gate keyed on arch (landed as a7b44472; shared item 1)
 
