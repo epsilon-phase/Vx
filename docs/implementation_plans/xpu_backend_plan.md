@@ -212,7 +212,7 @@ conversion together with the pipeline); the three integer-3 literals in
 `VxLowering.cpp` (`:977`, `:1492`, `:1572`), which stay NVVM's until the
 SPIR-V pipeline installs its own conversion.
 
-### Slice 4 — the SPIR-V device image (investigation done, LLVM route; implementation next)
+### Slice 4 — the SPIR-V device image (blocked: no route yields a valid module yet)
 
 *Investigation first.* No repo files — a reproducible command sequence proving
 the route `gpu.module` → SPIR-V with the in-tree MLIR (convert-gpu-to-spirv,
@@ -233,14 +233,15 @@ entry — binary formats never touch the `image=`/NUL path.
 `tests/integration_test/device_image_test.rs` that the decoded bytes carry the
 SPIR-V magic number, because an empty or truncated image would satisfy a
 presence check and then fail at the runtime, a machine away from the cause.
-Producing SPIR-V is in-tree MLIR work: no GPU, no Level Zero, no oneMKL.
 
-*Deferred.* Running the image (slice 6); matmul; the choice between
-convert-gpu-to-spirv and the XeVM target (open until the investigation reports).
+*Deferred.* Running the image (slice 6); matmul; which route is used, reopened by
+the 2026-10-06 measurement below.
 
-**Investigation result — 2026-10-04, MLIR 22.1.8.** Run end to end on this
-machine, from a real kernel. It answers the pipeline choice in this section: take
-the LLVM route, not the SPIR-V-dialect one.
+**Investigation result — 2026-10-04, corrected 2026-10-06, MLIR 22.1.8.** Run end
+to end on this machine, from a real kernel. The LLVM route produces a module; it
+does not yet produce a module `spirv-val` accepts, for every kernel tried. That
+is a different blocker from the one this note first named, and it is not in the
+kernel's parameter list.
 
 *The device twin as it exists.* `vx-opt --convert-vx-to-standard` turns a
 `vx.spawn` into `vx.kernel` + `vx.launch`, and materializes
@@ -248,78 +249,119 @@ the LLVM route, not the SPIR-V-dialect one.
 static shapes, no address-space annotations, and a **CFG** (`cf.br`,
 `cf.cond_br`) that comes from the frontend, not from a device pass.
 
-*The route that works.* For a kernel from
-`tests/backend/pass/placed_kernel_four_operands.vx`: watch out, five steps.
+*The route, five steps, and a script now runs it.* `scripts/tools/spirv_module_check.sh`
+takes a `.vx` file and prints the validator's verdict for each variant.
 
-1. `mlir-opt --convert-gpu-to-llvm-spv=use-64bit-index` -- LLVM dialect inside
-   the `gpu.module`, the CFG kept, and the memref **descriptor preserved** as a
-   first-class value: `!llvm.struct<(ptr<1>, ptr<1>, i64, array<2 x i64>, array<2 x i64>)>`.
-   That is Vx's kernel ABI, which is why this route is the one.
-2. Hoist the `gpu.module` body to module scope and set
+1. `vxc --emit-mlir -X mlir=--pass-pipeline="builtin.module(convert-vx-to-standard)"`,
+   then keep only the `gpu.module @vx_kernels` block: the host half of the same
+   file still has `vx.` ops, which a plain `mlir-opt` cannot parse, and it is not
+   part of the device image.
+2. `mlir-opt --pass-pipeline='builtin.module(gpu.module(convert-scf-to-cf,convert-gpu-to-llvm-spv{use-64bit-index=true}))'`.
+3. Hoist the `gpu.module` body to module scope and set
    `module attributes {llvm.target_triple = "spirv64-unknown-unknown"}`.
-3. `mlir-opt --convert-to-llvm --reconcile-unrealized-casts` (the same
-   reconcile the NVVM pipeline runs; without it the translation dies on a
-   `builtin.unrealized_conversion_cast` from descriptor struct to memref).
-4. `mlir-translate --mlir-to-llvmir`.
-5. `llvm-spirv` -- **a 5224-byte SPIR-V module, magic `0x07230203`**. A real
-   binary image, produced with no GPU and no vendor SDK.
+4. `mlir-opt --convert-to-llvm --reconcile-unrealized-casts` (the same reconcile
+   the NVVM pipeline runs; without it the translation dies on a
+   `builtin.unrealized_conversion_cast` from descriptor struct to memref), then
+   `mlir-translate --mlir-to-llvmir`.
+5. `llc -mtriple=spirv64-unknown-unknown -filetype=obj` (5480 bytes for the
+   four-operand kernel) or `llvm-spirv` (5224 bytes) -- a real binary module,
+   magic `0x07230203`, produced with no GPU and no vendor SDK. `llc` is the
+   better dependency: it is the LLVM already linked, and its default output is
+   SPIR-V *assembly*, which a test can FileCheck.
 
-*Why not the SPIR-V dialect route.* `--convert-gpu-to-spirv` gets three
-blockers and loses the ABI: it requires `spirv.entry_point_abi` on the kernel
-(the spelling is `#spirv.entry_point_abi<workgroup_size = [8, 1, 1]>`); it maps
+*The parameters are not the problem -- measured, not argued.* The kernel has 28
+`OpFunctionParameter`s: per tensor, two `_ptr_CrossWorkgroup_uchar` and five
+`ulong`, each its own parameter. No aggregate, no descriptor passed by value.
+`runtime/vx_kernel_launch.h` and the 28-parameter fixture in
+`tests/runtime/kernel_launch_test.cpp` therefore need no change, and the earlier
+reading of this note -- that the four invalid `OpVariable`s were "the descriptor
+slots, one per rank-2 parameter" -- was an inference from the number four, not a
+measurement. `docs/gpu_backends.md` is right that the parameter shape carries
+over.
+
+*The four invalid variables are the kernel's own loop counters.* Two loops, each
+with a `{vx.parallel_init}` / `{vx.parallel_bound}` store pair (outer 0..8, inner
+0..4), give four `memref<i32>` slots; each becomes an `OpVariable
+%_ptr_CrossWorkgroup_uint Function`, and SPIR-V refuses a `Function`-class
+variable whose type points into `CrossWorkgroup`:
+
+```
+error: line 92: Storage class must match result type storage class
+  %88 = OpVariable %_ptr_CrossWorkgroup_uint Function
+```
+
+Marking those four slots `#gpu.address_space<private>` before step 2 and removing
+the attribute after it (the recipe upstream reports) turns them into
+`%_ptr_Function_uint Function`: that error goes, and the 28 parameters are
+unchanged. Confirmed here on the four-operand kernel.
+
+*What is left, and it is wider than the slots.* The module still does not
+validate. Both serializers agree on the next error:
+
+```
+error: line 127: The Object type (OpTypePointer) does not match the type that results from indexing into the Composite (OpTypePointer).
+  %96 = OpCompositeInsert %_struct_18 %64 %29 0
+```
+
+`_struct_18 = OpTypeStruct %_ptr_Function_uchar %_ptr_Function_uchar %ulong`,
+`%29 = OpUndef %_struct_18`, and `%64` is one of the four slot variables: a
+pointer to `uint` inserted into a field typed as a pointer to `uchar`. The
+unmarked module has the same shape at `%_struct_17`, with `%63`
+(`_ptr_CrossWorkgroup_uint`) inserted where `_ptr_CrossWorkgroup_uchar` is
+expected, after the variable error -- so the stable-looking marking swaps the
+first error for the second rather than removing both.
+
+Two kernels with no `parallel_init` at all fail as well, which is what makes this
+a general blocker rather than a slot bug:
+
+- `tests/backend/pass/spliced_block_tails.vx` -- one 1x1 tensor, 7 parameters, a
+  body of two row views -- gives `%44 = OpCompositeExtract
+  %_ptr_CrossWorkgroup_float %43 1`, the same message in the other direction.
+- `tests/backend/pass/custom_topology_device_image.vx` -- 14 parameters -- gives
+  an `OpConstantComposite` member type mismatch through `llc`, and the
+  storage-class error again through `llvm-spirv`.
+
+The pattern: every kernel that forms a memref **view** of a parameter, or keeps a
+memref **value** in a slot. On this route a memref value is a five-field
+descriptor struct whose pointer fields are opaque in the LLVM dialect and are
+reconstructed as `i8` by the SPIR-V backend, while the pointers stored in them
+are `float*` and `i32*`. Opaque pointers let that through; typed SPIR-V pointers
+do not. The toolchain is not at fault: `clang -target
+spirv64-unknown-unknown` on `__kernel void k(__global int *p) { p[0] = 1; }`
+produces a 440-byte module `spirv-val` accepts.
+
+*Why not the SPIR-V dialect route.* `--convert-gpu-to-spirv` gets three blockers
+and loses the descriptor: it requires `spirv.entry_point_abi` on the kernel (the
+spelling is `#spirv.entry_point_abi<workgroup_size = [8, 1, 1]>`); it maps
 *un-annotated* memrefs to `#spirv.storage_class<CrossWorkgroup>`; it needs SCF
 where Vx's kernel is a CFG (`--lift-cf-to-scf` does not lift these loops); and it
-replaces the memref with an `rtarray`, dropping shape and stride -- the ABI
-problem `docs/gpu_backends.md` does not mention and the LLVM route avoids.
+replaces the memref with an `rtarray`, dropping shape and stride.
 
-*The one blocker left, and it is not where this note first said it was.*
-`spirv-val` rejects the module with exactly one error -- `Storage class must
-match result type storage class` -- and the rejected instructions are four
-`OpVariable`s at the top of the kernel, one per rank-2 memref parameter, each a
-`Function`-class variable whose type is `OpTypePointer CrossWorkgroup
-%descriptor`. That is Vx's **kernel ABI** meeting SPIR-V's rules: a memref
-argument is a descriptor passed by value, the LLVM-SPV lowering spills a copy of
-it on the stack, and SPIR-V cannot express a `Function`-class variable pointing
-into `CrossWorkgroup`.
+*The XeVM route, now measured.* `mlir-opt --gpu-lower-to-xevm-pipeline` exists in
+this toolchain and does run against a Vx kernel. It wraps the kernel body in
+`gpu.warp_execute_on_lane_0` and then fails with `expects region #0 to have 0 or
+1 blocks`: Vx's kernel body is a CFG, and the pipeline wants a body it can put in
+a warp-execute region. The smallest kernel fails earlier and differently: `LLVM
+Translation failed for operation: builtin.unrealized_conversion_cast` on
+`!llvm.struct<(ptr<1>, ptr<1>, i64, array<2 x i64>, array<2 x i64>)> ->
+memref<1x1xf32, 1>`. So both routes stop on one precondition -- a device kernel
+whose body is neither CFG-shaped nor memref-shaped -- for different reasons, and
+neither reaches a module the validator accepts today.
 
-Three things that do *not* fix it, all measured, and recorded because each one
-looks like the fix:
-
-- `--use-64bit-index` keeps the descriptor's `i64` sizes and changes nothing
-  about the error (it is still needed: without it the sizes come out `i32` and
-  `vx_launch_param_width` counts `i64`).
-- Retagging the kernel's private allocas with `AddressSpace::Private`'s number,
-  `5`. The retag does reach the IR -- `alloca i32, i64 1, align 4, addrspace(5)`
-  where the untagged module has `addrspace(1)` -- and the error is unchanged,
-  because the rejected variables are the descriptor slots, not the scalar cells.
-  An earlier reading of this experiment said the retag fixed it; that reading
-  came from a module whose kernel had been dropped before serialization, so
-  `spirv-val` was passing an almost empty module. It was wrong, and the
-  serialized artifact's size is what exposed it.
-- Either tool: `llc -mtriple=spirv64-unknown-unknown -filetype=obj` and
-  `llvm-spirv` produce the same module to within four bytes and the same error.
-  (`llc` is the better dependency: it is the LLVM already linked, and its default
-  output is SPIR-V *assembly*, which a test can FileCheck.)
-
-So the next step is not a pass or a flag but an **ABI decision**. A kernel's
-buffer operands have to arrive the way SPIR-V passes buffers -- a bare
-`CrossWorkgroup` pointer, with shape and stride supplied some other way (extra
-scalar parameters, or a descriptor the kernel loads from global memory) -- rather
-than as a by-value descriptor struct. That is the real content of §6's question
-3 and it belongs on #1137 before an image compiler is written, because it decides
-the device twin's signature and therefore both backends' marshalling:
-`vx_launch_param_width` counts seven parameters per rank-2 memref today, and
-`tests/backend/pass/placed_kernel_four_operands.vx` pins 28 for four.
-
-*Already known, and it matters for the ABI:* the descriptor keeps `i64` sizes and
-strides only with `use-64bit-index`. Without it they come out `i32`, and
+*Already known, and it still holds:* the descriptor keeps `i64` sizes and strides
+only with `use-64bit-index`. Without the flag they come out `i32`, and
 `vx_launch_param_width` counts a rank-2 memref as two pointers plus an `i64`
 offset, two `i64` sizes and two `i64` strides. Set the flag.
 
-*Reproduce:* the five commands above, with `vxc --action emit-mlir` and `vx-opt`
-supplying the kernel, and `spirv-val` checking the result. A script under
-`scripts/tools/` that runs all of it from a `.vx` file is the next artifact, so
-the recipe is reproducible without this note.
+*The next step, and what it costs.* Not a parameter-ABI change. The device side
+has to stop using memref values: either the parallel-loop counters stay in SSA
+values instead of `memref<i32>` slots (removes the four variables and both errors
+together), or views of a parameter are expressed without
+`memref.reinterpret_cast` (which is what builds the descriptor that does not
+survive). Both are Vx-side lowering questions. If neither works, the work moves
+to the LLVM/SPIR-V side, where a descriptor's pointer fields must agree with the
+pointers that fill them; no pass mixture or flag found so far does that, and
+neither does `--use-64bit-index`.
 
 ### Slice 5 — spawn bodies checked against `dtypes:` (landed as e2c9bf; shared item 4)
 
@@ -346,7 +388,14 @@ name — is still unchecked. That is its own small change.
 
 ### Slice 6 — the runtime dispatch library (not started; roadmap step 4)
 
-*Change.* A Level Zero dispatch file beside `runtime/cuda_dispatch.cpp`
+*Change.* A SYCL dispatch file beside `runtime/cuda_dispatch.cpp` -- the
+runtime upstream settled on for this backend (docs/gpu_backends.md, "SYCL
+first", decided 2026-10-05; SYCL as a *runtime*, not as a compile target). The
+kernel bundle loads the SPIR-V image this plan produces, oneMKL takes the same
+queue, and Level Zero is what SYCL runs on underneath. One consequence the
+plan has to carry: the library is built with oneAPI's compiler, so unlike the
+CUDA and Vulkan heads it cannot be a plain C++ file that builds everywhere, and
+the no-SDK rule below applies to the *rest* of the tree, not to this file.
 implementing the `vx_plugin_*` entry points — alloc-and-transfer
 (`include/vx_hardware_runtime.h:42`), dispatch (`:342`), await, read-back,
 free, control — reusing the vendor-free argument marshalling in
@@ -356,7 +405,7 @@ backend as-is; `vx_launch_entry_param_count` (`:162`) is the one piece that is
 not, because it counts a signature in PTX text and SPIR-V is binary — this
 slice gives that check a SPIR-V answer or drops it for this route, and says
 which in the PR. An arm in `build.rs:449-454` in the shape the file already
-uses: the new library is built only when the Level Zero SDK is present, and the
+uses: the new library is built only when the oneAPI toolchain is present, and the
 host shim answers otherwise — so a build with neither SDK is exactly today's
 build (`build.rs:429-433` states the rule for CUDA; the same rule applies).
 `kind=matmul` routes to oneMKL (settled, §6); everything else launches the
@@ -371,7 +420,7 @@ execution happen only where the SDK exists, which is exactly CUDA's situation
 in a CUDA-less CI.
 
 *Deferred.* Running two device kinds from one program (shared item 5);
-precedence when both a CUDA toolkit and a Level Zero SDK are installed (§6
+precedence when both a CUDA toolkit and a oneAPI install are present (§6
 question 6); oneMKL performance work beyond correct routing.
 
 ### Slice 7 — parity and conformance (not started; shared item 6 + Tier 3 §5)
@@ -424,7 +473,8 @@ their provenance in `fleet/arc-a770.vx`.
   `maxComputeSharedMemorySize` 49152 (`fleet/arc-a770.vx:55-60`). The machine
   file declares the hardware's 64 KiB, and the API's smaller number is a
   backend detail: whichever runtime the backend uses, a kernel's static scratch
-  must be checked against *that API's* ceiling — 64 KiB on the Level Zero
+  must be checked against *that API's* ceiling — 64 KiB through Level Zero,
+  which the SYCL runtime sits on,
   route, 48 KiB on a Vulkan route — and a tile that exceeds it must be a
   compile error, never silently shrunk. This is one concrete reason the
   roadmap's compile-error rule exists.
@@ -504,8 +554,11 @@ ______________________________________________________________________
 - **"SYCL as a compile target is declined: Vx's checker already does the job
   SYCL's C++ layer does. What the SYCL stack offers Vx is its runtime (Level
   Zero) and its libraries (oneMKL), and those are used directly."** The route
-  is therefore SPIR-V image + Level Zero runtime + oneMKL as a library, which
-  is what `arch: spirv64` in `fleet/arc-a770.vx:74` already names.
+  is therefore SPIR-V image + SYCL runtime + oneMKL as a library — upstream
+  settled on the SYCL *runtime* on 2026-10-05 rather than calling Level Zero
+  itself, because oneMKL takes a `sycl::queue` (docs/gpu_backends.md, "SYCL
+  first") — which is what `arch: spirv64` in `fleet/arc-a770.vx:74` already
+  names.
 - **"A device limitation is a compile error, never a silent change."** The
   A770's missing f64 is the first discrete-GPU case: no `cl_khr_fp64`,
   `shaderFloat64` false, `dtypes:` without f64, E6026 before anything runs —
@@ -551,16 +604,19 @@ ______________________________________________________________________
    a design-review item on slice 6 (§4).
 8. **bf16 in `dtypes:`.** Deliberately omitted pending a citable source
    (`fleet/arc-a770.vx:82-85`); adding it is one token once a source exists.
-9. **The kernel ABI for SPIR-V device code — the top item now.** Measured, not
-   suspected: with Vx's by-value memref descriptors, the serialized module has
-   one `Function`-class variable per rank-2 parameter whose type is a
-   `CrossWorkgroup` pointer, and `spirv-val` refuses it. So the device twin's
-   signature has to change for this target — a bare `CrossWorkgroup` pointer per
-   buffer with shape and stride supplied separately — and that decision comes
-   before the image compiler, because it moves `vx_launch_param_width`, the
-   marshalling both backends share, and the 28-parameter fixture that pins them.
-   Whoever answers this should answer it for the NVPTX backend too, or say why
-   the two may differ.
+9. **How a device kernel avoids memref values — the top item now.** Measured, and
+   the opposite way round from the first reading: the parameters are fine (28
+   separate `OpFunctionParameter`s, two pointers and five scalars per rank-2
+   tensor, so `vx_launch_param_width` and the 28-parameter fixture do not move).
+   What SPIR-V refuses is a memref *value* on the device side — a row view of a
+   parameter, or a loop counter kept in a `memref<i32>` slot. The slot case has a
+   fix (mark the slots private before `convert-gpu-to-llvm-spv`, and the
+   storage-class error goes), but the next error is a descriptor whose pointer
+   fields are typed `i8` while the pointers filling them are `float*`/`i32*`, and
+   that one appears in kernels with no slots at all. So the question is where the
+   device side stops using memref values, and which route (the LLVM one, or the
+   XeVM one, blocked on Vx's CFG body) can carry it. Details and the failing
+   instructions are in slice 4 above and on #1138.
 
 ______________________________________________________________________
 
