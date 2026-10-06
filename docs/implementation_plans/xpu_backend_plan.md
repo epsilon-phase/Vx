@@ -166,6 +166,23 @@ added the INT4 matrix format to `dtypes:`, which the file's provenance row in
 unit a workgroup's scratchpad belongs to on Xe is unsettled and a wrong value
 moves every on-die cost); the UNVERIFIED bandwidth figures.
 
+*A gap the probing found, narrower than it first looked.* A tensor of every
+element type this machine file declares compiles: f32, f16, bf16, bool, i1, i8,
+u8, i16, u16, i32, u32, i64, u64, i4 and u4 all pass `vxc --emit-mlir` in a
+program that writes the tensor and reads it back. What fails is a program that
+does something the flat emitter cannot emit yet, because that sends it to the
+AST path, and there `extract_mlir_element_type`
+(`src/codegen/lower/mod.rs:188`) knows bf16, f16, f32, f64, i32, i64 and i1 —
+so i8, u8, i16, u16, i4 and u4 are refused with `Codegen Error: ParseType(
+"Unsupported MLIR element type in: memref<?x?xi8>")`. `print` of such a tensor
+is the instance measured here, and the AST path's printer already handles i8 and
+i16 as widened integers (`src/codegen/lower/mod.rs:1233-1236`): the missing piece
+is the string-to-type mapping in front of a printer that works. What that costs
+a reader is two things — an internal message where a diagnostic belongs, and a
+byte or 4-bit tensor that passes E6026 and then cannot be printed. This is a Vx
+issue rather than an Arc one; the `dtypes:` list stays the hardware's, which is
+the rule `fleet/README.md` sets.
+
 ### Slice 1 — eligibility gate keyed on arch (landed as a7b44472; shared item 1)
 
 *Change.* `src/dialect/VxLowering.cpp:1436-1438` becomes a table keyed on the
