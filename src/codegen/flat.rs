@@ -952,7 +952,7 @@ pub struct SubspaceInfo {
 /// `func.func private` declaration prepended. Order is load-bearing — the emit records which of
 /// these a function called as a bitmask over this array's indices, so inserting in the middle
 /// renumbers existing entries.
-const RUNTIME_HELPERS: [(&str, &str); 18] = [
+const RUNTIME_HELPERS: [(&str, &str); 20] = [
     ("printMemrefF32", "(memref<*xf32>)"),
     ("printMemrefF64", "(memref<*xf64>)"),
     ("printMemrefI32", "(memref<*xi32>)"),
@@ -971,6 +971,11 @@ const RUNTIME_HELPERS: [(&str, &str); 18] = [
     ("print_bool", "(i32) -> i32"),
     ("printMemrefU32", "(memref<*xi32>)"),
     ("printMemrefU64", "(memref<*xi64>)"),
+    // Appended rather than put beside the other `printMemref` entries: the index
+    // into this array is part of an emitted record, so inserting in the middle
+    // renumbers the entries after it.
+    ("printMemrefI8", "(memref<*xi8>)"),
+    ("printMemrefI16", "(memref<*xi16>)"),
 ];
 
 /// Recover the declared memory sub-spaces from a compilation's env, in the shape
