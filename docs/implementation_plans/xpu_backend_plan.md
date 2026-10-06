@@ -53,6 +53,17 @@ that carry no `arch` attribute.
 *Landed as 70e98faf*: `DevicePipeline` with `pipelineForArch` as the table, keyed
 on the declared arch, `nvptx64` as its only row and the band fallback kept.
 
+*What one module per arch drags in, raised in upstream's review of this work:*
+the pass does not only clone the kernels into the `gpu.module`; it also copies
+what they use. Verified at the pull-request head, not in this tree (this branch's
+base predates #1151, so the code is not here): the copies are built at
+`src/dialect/VxLowering.cpp:1519` onward, and a static shared-memory alloca
+becomes a module-level `memref.global` at `:1593`. With one module per
+architecture, a helper or a table that two architectures' kernels both use has to
+be copied into each module — and deduplicated per module, once each. Today's
+single-arch code hides the question: there is one module to deduplicate within.
+The exact `copied`-set spelling in that revision is not checkable from here.
+
 **2. The dispatch payload cannot carry a binary image.**
 The payload is built at `src/dialect/VxLowering.cpp:2157-2265`: kernel name
 first, then NUL-separated `key=value` entries (`kind=` at `:2166`, `topo=` at
