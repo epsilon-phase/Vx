@@ -40,9 +40,11 @@ ______________________________________________________________________
 Each item from the roadmap's "Shared work before a second backend", with the
 code site it names, read from this branch. The last line of each entry says
 whether this plan's first slices cover it. Line numbers were read from this
-branch while the §3 slices were landing (commit 5087a2ea plus the working
+branch while the §3 slices were landing (commit 886a27ec plus the working
 tree); once an in-flight slice has landed, match its sites by the symbol names
-given here.
+given here. These commits were rebased from ea86415c onto 3d59497a after main
+was force-pushed, so a hash quoted in an older note or a chat session is a
+pre-rebase hash -- the reflog keeps those until it is pruned.
 
 **1. The kernel eligibility gate accepts one arch.**
 `materializeGpuKernels` at `src/dialect/VxLowering.cpp:1419` decides which
@@ -50,7 +52,7 @@ kernels get cloned into the `gpu.module`. The single-arch test is
 `src/dialect/VxLowering.cpp:1436-1438` — `if (arch.getValue() != "nvptx64")
 return;` — with the dispatch-id band as the fallback at `:1439` for kernels
 that carry no `arch` attribute.
-*Landed as 70e98faf*: `DevicePipeline` with `pipelineForArch` as the table, keyed
+*Landed as a7b44472*: `DevicePipeline` with `pipelineForArch` as the table, keyed
 on the declared arch, `nvptx64` as its only row and the band fallback kept.
 
 *What one module per arch drags in, raised in upstream's review of this work:*
@@ -74,7 +76,7 @@ an image containing a NUL byte is rejected. The reader is `vx_payload_field` at
 the key it is asked for — that property is what lets new entries land without
 breaking existing consumers (`runtime/cuda_dispatch.cpp:699` reads `image=` this
 way).
-*Landed as 99f49eb6.* The shape: `abi=1` as a version key, plus an
+*Landed as c57fe069.* The shape: `abi=1` as a version key, plus an
 `imagebin=` entry carrying a base64-encoded image for formats that are not text.
 No producer emits `imagebin=` until the device-image slice has a binary format
 to put there.
@@ -89,7 +91,7 @@ out, and `tensor.rs` hardcoded four `, 3` shared-memory suffixes. On the C++ sid
 `src/dialect/VxLowering.cpp` still hardcodes NVVM's 3 in three places — the
 integer written into the device memref type at `:977`, and the two
 `space.getInt() == 3` checks at `:1492` and `:1572`.
-*Landed as 45c9b7d6, Rust half*: a `DeviceTarget` table at `src/arch.rs:500-543` keyed
+*Landed as abd6eedf, Rust half*: a `DeviceTarget` table at `src/arch.rs:500-543` keyed
 on the declared arch — `from_arch` at `:518` recognizes
 `x86_64`/`aarch64`/`nvptx64`/`amdgcn`/`spirv64` — answered through
 `address_space_for_arch` (`:549-553`), routed through `generator.rs:1702` and
@@ -108,7 +110,7 @@ A `spawn` body goes through `check_spawnon_expr` at
 compares the body's element types against that topology's `dtypes:` list — so
 an f64 scalar inside a `spawn` body passes the checker and would only fail on
 the device.
-*Landed as e2c9bf, at the binding rather than over the whole body. A value that
+*Landed as e9fbd3b3, at the binding rather than over the whole body. A value that
 appears solely as the region's result is still open.*
 
 **5. One dispatch library per build.**
@@ -144,7 +146,7 @@ CI is — except slice 7, whose whole point is the card.
 *Change.* `fleet/arc-a770.vx` declares the part: 16 GiB HBM, 16 MiB L2, 64 KiB
 SMEM, `arch: spirv64` (`:74`), `dtypes:` without f64 (`:86`), both PCIe
 directions. Provenance rows added to `fleet/README.md`. Landed on this branch as
-commit 5087a2ea; no compiler change, which is the roadmap's point about step 1.
+commit 886a27ec; no compiler change, which is the roadmap's point about step 1.
 A region spawned on this topology takes the host fallback today, or the honest
 refusal when its operands sit in memory the host cannot read.
 
@@ -152,7 +154,7 @@ refusal when its operands sit in memory the host cannot read.
 the capacity check refuses a working set above 16 GiB (E6009, the shape of
 `tests/frontend/fail/a_device_spelled_placement_is_admitted.vx`), and an f64
 tensor placed there reports E6026 naming the declared list (the shape of
-`tests/frontend/fail/dtype_not_on_this_machine.vx`). **Landed as ddbd9183:** the two
+`tests/frontend/fail/dtype_not_on_this_machine.vx`). **Landed as d9822b2b:** the two
 `MATRIX` rows in `tests/integration_test/fleet_dtype_test.rs` are now in CI
 (`("arc-a770", "f64", false)`, `("arc-a770", "i4", true)`,
 `("arc-a770", "f32", true)`, `("arc-a770", "f16", true)`), each checked by
@@ -164,7 +166,7 @@ added the INT4 matrix format to `dtypes:`, which the file's provenance row in
 unit a workgroup's scratchpad belongs to on Xe is unsettled and a wrong value
 moves every on-die cost); the UNVERIFIED bandwidth figures.
 
-### Slice 1 — eligibility gate keyed on arch (landed as 70e98faf; shared item 1)
+### Slice 1 — eligibility gate keyed on arch (landed as a7b44472; shared item 1)
 
 *Change.* `src/dialect/VxLowering.cpp:1436-1438` becomes a table keyed on the
 declared arch: `nvptx64` as its only entry, band fallback kept for kernels with
@@ -179,7 +181,7 @@ names `nvptx64` the gate's answer is what it was.
 *Deferred.* The `spirv64` entry, which arrives with slice 4 when there is a
 pipeline behind it.
 
-### Slice 2 — payload version key and binary image entry (landed as 99f49eb6; shared item 2)
+### Slice 2 — payload version key and binary image entry (landed as c57fe069; shared item 2)
 
 *Change.* The payload builder at `src/dialect/VxLowering.cpp:2157` gains an
 `abi=1` entry and, for an image that is not text, an `imagebin=` entry carrying
@@ -199,9 +201,9 @@ them. No GPU, no SDK.
 *Deferred.* Freezing the `vx_plugin_*` interface — the roadmap says it is not
 frozen, and the version key is precisely what makes changing it safe later.
 
-### Slice 3 — address-space table, Rust half (landed as 45c9b7d6; shared item 3)
+### Slice 3 — address-space table, Rust half (landed as abd6eedf; shared item 3)
 
-*Change.* Landed as 45c9b7d6: one `DeviceTarget`
+*Change.* Landed as abd6eedf: one `DeviceTarget`
 address-space table in `src/arch.rs:500-543`, keyed on the declared arch from
 `EmitCtx.topo_archs`. It replaces `generator.rs`'s two direct `nvptx_addrspace()`
 calls (now `address_space_for_arch` at `src/codegen/generator.rs:1702` and
@@ -374,9 +376,9 @@ to the LLVM/SPIR-V side, where a descriptor's pointer fields must agree with the
 pointers that fill them; no pass mixture or flag found so far does that, and
 neither does `--use-64bit-index`.
 
-### Slice 5 — spawn bodies checked against `dtypes:` (landed as e2c9bf; shared item 4)
+### Slice 5 — spawn bodies checked against `dtypes:` (landed as e9fbd3b3; shared item 4)
 
-*Change.* Landed as e2c9bf, at the `let` rather than as the body walk this note
+*Change.* Landed as e9fbd3b3, at the `let` rather than as the body walk this note
 planned. `check_element_type` gained the span of what it is reporting on, so the
 error points at the binding; `check_element_type_in_active_region` asks the
 region's own device through the region's default space; and each binding checks
@@ -452,9 +454,10 @@ obligation rather than a test.
 
 ### Order
 
-Slices 0–3 and 5 have landed (5087a2ea and ddbd9183 for the machine file, 45c9b7d6, 70e98faf, 99f49eb6, e2c9bf
-for the address-space table, which the emitted-MLIR diff over all 1094 fixtures
-cleared). Slice 4 needs 1 and 2 (a gate entry and somewhere to put a binary
+Slices 0–3 and 5 have landed: the machine file as 886a27ec with its dtype rows as
+d9822b2b, the address-space table as abd6eedf (whose emitted-MLIR diff over all
+1094 fixtures cleared), the pipeline table as a7b44472, the payload version key
+as c57fe069, and the dtypes check as e9fbd3b3. Slice 4 needs 1 and 2 (a gate entry and somewhere to put a binary
 image); slice 5 is independent of everything; slice 6 needs 2 and 4 (the image
 in the payload, and an image worth launching); slice 7 needs 6. Slices 4 and 5
 can both merge before any runtime exists, which is the roadmap's
