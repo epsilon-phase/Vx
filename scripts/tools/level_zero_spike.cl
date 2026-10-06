@@ -14,6 +14,10 @@ __kernel void add_one(__global float *allocated, __global float *aligned,
                       unsigned long offset, unsigned long n0, unsigned long n1,
                       unsigned long s0, unsigned long s1) {
   unsigned long gid = get_global_id(0);
+  // A work-group is launched whole, so the last one usually has work-items past
+  // the tensor's end. They must do nothing.
+  if (gid >= n0 * n1)
+    return;
   unsigned long row = gid / n1;
   unsigned long col = gid % n1;
   unsigned long idx = offset + row * s0 + col * s1;

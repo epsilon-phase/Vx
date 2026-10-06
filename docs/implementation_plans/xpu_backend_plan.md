@@ -484,12 +484,15 @@ compiler, so unlike the CUDA and Vulkan heads it is not a plain C++ file that
 builds everywhere, and the no-SDK rule below covers the *rest* of the tree
 rather than this file.
 
-*The launch path is proven, separately from the image.*
+*The launch path is proven, separately from the image, including the view cases.*
 `scripts/tools/level_zero_spike.sh` takes a hand-written kernel whose image
 validates, allocates device memory, copies in, loads the module, launches,
 synchronizes, copies back, and compares with the host's values. Observed on this
 machine: device `Intel(R) Arc(TM) A770 Graphics` with 512 compute units, and
-`kernel add_one on 32 elements: correct`. What that settles on hardware, rather
+`case whole/row/column: correct` -- a whole tensor, a row (non-zero offset) and
+a column (non-unit stride), each reaching exactly the elements it should and no
+others, which is the part of the ABI a `spawn` body's views depend on. What that
+settles on hardware, rather
 than by reading SPIR-V: the image loads, the seven-value argument list (two
 pointers, an offset, two sizes, two strides, no aggregate) is what a kernel
 launched this way wants, and the values come back. So this slice's remaining
@@ -554,6 +557,15 @@ their provenance in `fleet/arc-a770.vx`.
   16 GiB is admitted here and would fail on the card. That is the open check
   shared with #285, recorded rather than folded in; it does not change any
   backend design.
+
+- **12 GiB of the card's 16 GiB is the working ceiling, and it is a machine
+  fact rather than a card spec.** Above roughly 12 GiB of VRAM in use this
+  system becomes unstable (measured by the machine's owner). So the backend's
+  allocation policy has two ceilings, not one: the driver's 4 GiB per single
+  allocation, below, and this 12 GiB total, which `scripts/tools/level_zero_spike.sh`
+  enforces on its own footprint (`VX_VRAM_CEILING`, and it prints what it takes).
+  A dispatch library that only respected the driver's limit could still make the
+  machine fall over.
 
 - **4 GiB is the largest single allocation** the driver advertises
   (`ze_device_properties_t.maxMemAllocSize`, read by

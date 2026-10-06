@@ -24,13 +24,24 @@
 #
 #   - the toolchain's SPIR-V loads through `zeModuleCreate` on this driver;
 #   - the seven-value argument list is what a kernel launched this way wants;
+#   - that list still describes the right elements when the tensor is a VIEW: a
+#     row (a non-zero offset) and a column (a non-unit stride) each reach exactly
+#     the elements they should and no others;
 #   - allocate, copy in, launch, synchronize, copy back, and the values agree
 #     with the host's.
 #
 # Observed on this machine (Arc A770, driver 12.55.8):
 #
-#   device: Intel(R) Arc(TM) A770 Graphics  (512 compute units, 4.0 GiB max allocation)
-#   kernel add_one on 32 elements: correct
+#   device: Intel(R) Arc(TM) A770 Graphics  (512 compute units)
+#   memory module DDR: 15.11 GiB total
+#   allocating 128 bytes of device memory (ceiling 12.0 GiB)
+#   case whole   offset 0 sizes [8, 4] strides [4, 1]: correct
+#   case row     offset 8 sizes [1, 4] strides [4, 1]: correct
+#   case column  offset 1 sizes [8, 1] strides [4, 1]: correct
+#
+# The memory module's 15.11 GiB is the same figure the Arc's machine file records
+# as usable, which is the cross-check that this is the card and not something
+# behind it.
 #
 # The two API spellings that moved between Level Zero header versions are worth
 # knowing before editing the C++: `ze_module_desc_t` wants `pInputModule` and
