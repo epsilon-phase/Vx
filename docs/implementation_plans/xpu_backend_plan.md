@@ -401,15 +401,8 @@ name — is still unchecked. That is its own small change.
 
 ### Slice 6 — the runtime dispatch library (not started; roadmap step 4)
 
-*Change.* A SYCL dispatch file beside `runtime/cuda_dispatch.cpp` -- the
-runtime upstream settled on for this backend (docs/gpu_backends.md, "SYCL
-first", decided 2026-10-05; SYCL as a *runtime*, not as a compile target). The
-kernel bundle loads the SPIR-V image this plan produces, oneMKL takes the same
-queue, and Level Zero is what SYCL runs on underneath. One consequence the
-plan has to carry: the library is built with oneAPI's compiler, so unlike the
-CUDA and Vulkan heads it cannot be a plain C++ file that builds everywhere, and
-the no-SDK rule below applies to the *rest* of the tree, not to this file.
-implementing the `vx_plugin_*` entry points — alloc-and-transfer
+*Change.* A dispatch library beside `runtime/cuda_dispatch.cpp` implementing the
+`vx_plugin_*` entry points — alloc-and-transfer
 (`include/vx_hardware_runtime.h:42`), dispatch (`:342`), await, read-back,
 free, control — reusing the vendor-free argument marshalling in
 `runtime/vx_kernel_launch.h`. `vx_launch_build_params` (`:86`) is a pure
@@ -423,6 +416,28 @@ host shim answers otherwise — so a build with neither SDK is exactly today's
 build (`build.rs:429-433` states the rule for CUDA; the same rule applies).
 `kind=matmul` routes to oneMKL (settled, §6); everything else launches the
 image. The allocation side consults `vx_space_access` as §4 describes.
+
+*Which runtime, and why the choice is small.* Upstream settled on SYCL for this
+backend (docs/gpu_backends.md, "SYCL first", decided 2026-10-05): the SYCL
+*runtime*, not SYCL as a compile target. The kernel bundle loads the image this
+plan produces, oneMKL takes the same queue, and Level Zero is what SYCL runs on
+underneath. One consequence to carry: the library is built with oneAPI's
+compiler, so unlike the CUDA and Vulkan heads it is not a plain C++ file that
+builds everywhere, and the no-SDK rule below covers the *rest* of the tree
+rather than this file.
+
+*The launch path is proven, separately from the image.*
+`scripts/tools/level_zero_spike.sh` takes a hand-written kernel whose image
+validates, allocates device memory, copies in, loads the module, launches,
+synchronizes, copies back, and compares with the host's values. Observed on this
+machine: device `Intel(R) Arc(TM) A770 Graphics` with 512 compute units, and
+`kernel add_one on 32 elements: correct`. What that settles on hardware, rather
+than by reading SPIR-V: the image loads, the seven-value argument list (two
+pointers, an offset, two sizes, two strides, no aggregate) is what a kernel
+launched this way wants, and the values come back. So this slice's remaining
+risk is the library plumbing and oneMKL, not the mechanism. The spike calls
+Level Zero directly; when the matmul step arrives the same launch moves onto a
+`sycl::queue`, which is the layer the spike already sits on.
 
 *Proves.* CI takes the no-SDK arm and stays green; the vendor-free pieces have
 unit tests under `tests/runtime/` — the payload walk with `abi=1`/`imagebin=`,
@@ -482,15 +497,23 @@ their provenance in `fleet/arc-a770.vx`.
   shared with #285, recorded rather than folded in; it does not change any
   backend design.
 
+- **4 GiB is the largest single allocation** the driver advertises
+  (`ze_device_properties_t.maxMemAllocSize`, read by
+  `scripts/tools/level_zero_spike.sh`). The card holds 16 GiB, and one
+  allocation can be at most a quarter of that: a placed tensor larger than 4 GiB
+  has to be split across allocations or refused, and a backend that assumes one
+  allocation per tensor inherits the ceiling. The machine file's `capacity:`
+  stays the card's 16 GiB, as the rule above says.
+
 - **64 KiB workgroup shared local memory through Level Zero, 48 KiB through
   Vulkan.** The hardware ceiling is 65536 bytes; Vulkan on the same card reports
   `maxComputeSharedMemorySize` 49152 (`fleet/arc-a770.vx:55-60`). The machine
   file declares the hardware's 64 KiB, and the API's smaller number is a
   backend detail: whichever runtime the backend uses, a kernel's static scratch
-  must be checked against *that API's* ceiling — 64 KiB through Level Zero,
-  which the SYCL runtime sits on,
-  route, 48 KiB on a Vulkan route — and a tile that exceeds it must be a
-  compile error, never silently shrunk. This is one concrete reason the
+  must be checked against *that API's* ceiling — 64 KiB on a Level Zero route,
+  and the same number on the SYCL route, which sits on it; 48 KiB on a Vulkan
+  route — and a tile that exceeds it must be a compile error, never silently
+  shrunk. This is one concrete reason the
   roadmap's compile-error rule exists.
 
 - **1024-invocation workgroups, preferred multiple 64**
