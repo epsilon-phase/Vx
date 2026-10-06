@@ -500,6 +500,14 @@ risk is the library plumbing and oneMKL, not the mechanism. The spike calls
 Level Zero directly; when the matmul step arrives the same launch moves onto a
 `sycl::queue`, which is the layer the spike already sits on.
 
+*The matmul route has a number too.* `scripts/tools/onemkl_gemm_spike.sh` runs a
+square fp32 GEMM through oneMKL on a `sycl::queue`: 8192 x 8192 x 8192, three
+matrices, 768 MiB of VRAM, verified at 256 against a host reference accumulated
+in double (worst relative error 1.4e-06) and timed five times after a warm-up.
+Best of five: 107.4 ms, which is **10.24 TFLOPS** on this card. That is the
+reference a Vx-generated kernel gets compared against, and the reason this plan
+routes `kind=matmul` to oneMKL rather than to generated code.
+
 *Proves.* CI takes the no-SDK arm and stays green; the vendor-free pieces have
 unit tests under `tests/runtime/` — the payload walk with `abi=1`/`imagebin=`,
 and the marshalling against the reference signature (28 parameters for the four
@@ -557,6 +565,11 @@ their provenance in `fleet/arc-a770.vx`.
   16 GiB is admitted here and would fail on the card. That is the open check
   shared with #285, recorded rather than folded in; it does not change any
   backend design.
+
+- **About 10 TFLOPS of fp32 GEMM through oneMKL** (8192 cubed, best of five:
+  107.4 ms, verified correct separately). The first performance number measured
+  on this target through any path, and the one to hold generated kernels
+  against; the plan's bandwidth figures were estimates and stay UNVERIFIED.
 
 - **12 GiB of the card's 16 GiB is the working ceiling, and it is a machine
   fact rather than a card spec.** Above roughly 12 GiB of VRAM in use this
