@@ -401,15 +401,38 @@ only with `use-64bit-index`. Without the flag they come out `i32`, and
 `vx_launch_param_width` counts a rank-2 memref as two pointers plus an `i64`
 offset, two `i64` sizes and two `i64` strides. Set the flag.
 
-*The next step, and what it costs.* Not a parameter-ABI change. The device side
-has to stop using memref values: either the parallel-loop counters stay in SSA
-values instead of `memref<i32>` slots (removes the four variables and both errors
-together), or views of a parameter are expressed without
-`memref.reinterpret_cast` (which is what builds the descriptor that does not
-survive). Both are Vx-side lowering questions. If neither works, the work moves
-to the LLVM/SPIR-V side, where a descriptor's pointer fields must agree with the
-pointers that fill them; no pass mixture or flag found so far does that, and
-neither does `--use-64bit-index`.
+*The next step, and what it costs -- the design is closed by a probe (2026-10-06).*
+A `gpu.func` whose arguments are the flat list the runtime already passes -- a
+pointer into device memory plus the scalars that describe the tensor, with no
+memref value anywhere in the body -- serializes to a **388-byte module that
+`spirv-val` accepts**, through the same pipeline that rejects every
+memref-carrying kernel. Measured with the minimal hand-written kernel
+(`gpu.func @flat(%out: !llvm.ptr<1>, %off: i64, %n0: i64, %n1: i64, %s0: i64,
+%s1: i64)`, one `llvm.getelementptr` and one `llvm.store`). The probe is the
+whole argument: the device twin has to take the flat list.
+
+So the work is one transformation, not a redesign:
+
+1. `mem2reg` on the device clone removes the four `memref<i32>` loop counters
+   (measured: image 5480 to 4328 bytes, and the storage-class error goes), so
+   the counters stop being memref values at all.
+2. A pass over the `gpu.module` rewrites each memref **argument** into the seven
+   values the ABI already packs -- `allocated`, `aligned`, `offset`, two sizes,
+   two strides, which is exactly what `vx_launch_param_width` counts -- and
+   rewrites the body's memref accesses into address arithmetic on those values.
+   A static shape makes the sizes and strides constants; a dynamic one reads
+   them from the new arguments.
+3. It runs on the SPIR-V pipeline only. The same transformation would change
+   PTX, and `deviceImageOf` is already gated on the declared arch, so this joins
+   that gate rather than adding one.
+
+*What the pass must cover, and what it must refuse.* Corpus shapes are
+`memref.load`/`memref.store` with static shapes, row views
+(`memref.reinterpret_cast`), and the loop slots step 1 removes. It must refuse
+rather than mistranslate: a memref handed to a copied callee (the callees
+`collectDeviceCallees` brings along), a memref stored into memory, and any access
+it cannot turn into a computed address. Those want a diagnostic naming the
+construct, in the same spirit as the rest of this plan.
 
 ### Slice 5 — spawn bodies checked against `dtypes:` (landed as e9fbd3b3; shared item 4)
 
