@@ -242,10 +242,14 @@ fn decline_keys(log: &str) -> Vec<String> {
 
 /// Compile one program and report the path it took. `--action emit-mlir` stops at
 /// MLIR, so no accelerator or JIT is needed and the answer is the same everywhere.
+///
+/// The line that says the flat path ran is printed only when `VX_FLAT_DBG` is set,
+/// so this sets it. A normal compile stays quiet.
 fn path_taken(program: &Path) -> Result<CodegenPath, String> {
     let output = Command::new(env!("CARGO_BIN_EXE_vxc"))
         .arg(program)
         .args(["--action", "emit-mlir"])
+        .env("VX_FLAT_DBG", "1")
         .output()
         .map_err(|e| format!("could not run vxc: {e}"))?;
 
@@ -535,6 +539,7 @@ fn flat_path_answers_match_the_backend_expectations() {
         let output = match Command::new(env!("CARGO_BIN_EXE_vxc"))
             .arg(&program)
             .env("PATH", &path_var)
+            .env("VX_FLAT_DBG", "1")
             .output()
         {
             Ok(o) => o,
@@ -548,7 +553,7 @@ fn flat_path_answers_match_the_backend_expectations() {
         // Refuse to pass on a program that quietly took the AST path. Without this the test
         // decays into `test_backend` the moment the flat path declines something new -- which
         // is precisely the failure this test exists because of, so it is checked rather than
-        // assumed.
+        // assumed. The line is printed only with VX_FLAT_DBG, which this command sets.
         if !log.contains("emitted module via the flat path") {
             failures.push(format!(
                 "{rel}: states EXPECT lines but did not compile through the flat path, so \
