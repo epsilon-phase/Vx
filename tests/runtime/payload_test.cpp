@@ -16,12 +16,13 @@
 // it misreads. The version is what a dispatch library checks before it trusts
 // anything else.
 //
-// `imagebin=` carries a device image that is not text. `image=` is one
-// NUL-terminated entry, which is exactly what a PTX module is and exactly what
-// an SPIR-V module is not: the first word of SPIR-V holds NUL bytes, so a raw
-// binary image would truncate the entry and every later one with it. Hence
-// base64, and hence a decoder strict enough that a corrupted image is refused
-// rather than silently shortened.
+// A device image rides in one of two places. PTX is text, so `image=` holds it
+// as a NUL-terminated entry like any other. SPIR-V is not: its first word holds
+// NUL bytes, so it rides in a section after the entries, introduced by an empty
+// entry and counted by a little-endian length. There is no base64 anywhere --
+// that would make a text format carry a binary image, which is the wrong shape
+// for the problem (docs/gpu_backends.md, "Shared work before a second backend",
+// item 2).
 //
 // Driven by tests/integration_test/payload_test.rs.
 //
@@ -45,30 +46,6 @@ void check(bool ok, const char *what) {
     fprintf(stderr, "FAIL: %s\n", what);
     ++failures;
   }
-}
-
-/// Standard base64, written here rather than reusing the decoder: a round trip
-/// through one implementation proves the two agree with each other, and a
-/// decoder that is wrong in the same direction as its encoder is still wrong.
-/// The published vectors below pin the decoder itself.
-std::string b64(const unsigned char *data, size_t len) {
-  static const char *kAlphabet =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  for (size_t i = 0; i < len; i += 3) {
-    unsigned int v = (unsigned int)data[i] << 16;
-    bool two = i + 1 < len;
-    bool three = i + 2 < len;
-    if (two)
-      v |= (unsigned int)data[i + 1] << 8;
-    if (three)
-      v |= (unsigned int)data[i + 2];
-    out.push_back(kAlphabet[(v >> 18) & 0x3F]);
-    out.push_back(kAlphabet[(v >> 12) & 0x3F]);
-    out.push_back(two ? kAlphabet[(v >> 6) & 0x3F] : '=');
-    out.push_back(three ? kAlphabet[v & 0x3F] : '=');
-  }
-  return out;
 }
 
 /// A payload laid out the way the compiler lays one out: the kernel name first,
@@ -176,118 +153,87 @@ void entries_still_walk_with_one_more() {
         "a key before the damage is still found");
 }
 
-void base64_round_trips() {
-  struct Vector {
-    const char *encoded;
-    const char *decoded;
-  };
-  // RFC 4648 section 10, which pins the alphabet and the padding rules against
-  // something outside this repository.
-  const Vector vectors[] = {
-      {"", ""},
-      {"Zg==", "f"},
-      {"Zm8=", "fo"},
-      {"Zm9v", "foo"},
-      {"Zm9vYg==", "foob"},
-      {"Zm9vYmE=", "fooba"},
-      {"Zm9vYmFy", "foobar"},
-  };
-  for (const Vector &v : vectors) {
-    unsigned char out[16] = {};
-    int64_t n =
-        vx_base64_decode(v.encoded, strlen(v.encoded), out, sizeof(out));
-    check(n == (int64_t)strlen(v.decoded),
-          "a published vector decodes to its own length");
-    if (n == (int64_t)strlen(v.decoded))
-      check(memcmp(out, v.decoded, (size_t)n) == 0, "and to its own bytes");
+/// A section appended to a text payload: the empty entry that ends the text
+/// part, then a little-endian 64-bit length, then the bytes. This is the layout
+/// the reader must agree with, written out rather than built by a helper the
+/// reader also uses.
+std::string with_section(std::string payload, const std::string &image) {
+  payload.push_back('\0');
+  uint64_t length = image.size();
+  for (int i = 0; i < 8; ++i) {
+    payload.push_back((char)((length >> (8 * i)) & 0xFF));
   }
-
-  // Our own encoder against the decoder, for lengths that exercise all three
-  // padding cases and then some.
-  for (size_t len = 0; len <= 20; ++len) {
-    std::vector<unsigned char> original(len);
-    for (size_t i = 0; i < len; ++i)
-      original[i] = (unsigned char)(i * 37 + 5);
-    const std::string encoded = b64(original.data(), original.size());
-    std::vector<unsigned char> decoded(len + 1);
-    int64_t n = vx_base64_decode(encoded.c_str(), encoded.size(),
-                                 decoded.data(), decoded.size());
-    check(n == (int64_t)len, "the round trip returns the original length");
-    if (n == (int64_t)len)
-      check(memcmp(decoded.data(), original.data(), len) == 0,
-            "and the original bytes");
-  }
+  payload += image;
+  return payload;
 }
 
-void a_binary_image_survives_the_payload() {
-  // The reason `imagebin=` exists. This is the first word of an SPIR-V module,
-  // little-endian: three NUL bytes in the first four, so a NUL-terminated entry
-  // could carry none of it -- and would drop every entry after it too.
-  std::vector<unsigned char> image = {0x03, 0x02, 0x23, 0x07};
-  for (size_t i = 0; i < 60; ++i)
-    image.push_back((unsigned char)(i == 30 ? 0 : i + 1));
+void the_section_is_read_back() {
+  // A SPIR-V header and then a string that looks exactly like an entry. Both
+  // parts of that are deliberate: the header is why the section exists at all
+  // (NUL bytes cannot ride in a NUL-terminated entry), and the entry-shaped
+  // tail is what a reader that walked into the section would pick up.
+  const std::string image =
+      std::string("\x03\x02\x23\x07", 4) + "\x00" + std::string("evil=1\0", 7);
+  std::string payload = with_section(
+      make_payload("vx_npu_kernel_7", "1",
+                   {{"format=", "spirv"}, {"topo=", "500"}}),
+      image);
 
-  const std::string payload = make_payload(
-      "vx_npu_kernel_3", "1",
-      {{"kind=", "matmul"}, {"imagebin=", b64(image.data(), image.size())}});
+  const char *format =
+      vx_payload_field(payload.data(), payload.size(), "format=");
+  check(format != nullptr && std::string(format) == "spirv",
+        "a text entry before the section is still found");
+  check(vx_payload_field(payload.data(), payload.size(), "topo=") != nullptr,
+        "the last text entry is still found");
+  check(vx_payload_field(payload.data(), payload.size(), "evil=") == nullptr,
+        "the walk stops at the section instead of reading its bytes");
 
-  check(vx_payload_field(payload.data(), payload.size(), "image=") == nullptr,
-        "a binary image is not in the text entry");
+  const void *out = nullptr;
+  int64_t length = vx_payload_section(payload.data(), payload.size(), &out);
+  check(length == (int64_t)image.size(), "the section's length");
+  check(out != nullptr && memcmp(out, image.data(), image.size()) == 0,
+        "the section's bytes, NUL bytes and all");
+}
 
-  std::vector<unsigned char> decoded(image.size() + 8);
-  int64_t n = vx_payload_image_bin(payload.data(), payload.size(),
-                                   decoded.data(), decoded.size());
-  check(n == (int64_t)image.size(), "the image decodes to its own length");
-  if (n == (int64_t)image.size())
-    check(memcmp(decoded.data(), image.data(), image.size()) == 0,
-          "and to its own bytes, NULs included");
-  check(decoded[0] == 0x03 && decoded[1] == 0x02 && decoded[2] == 0x23 &&
-            decoded[3] == 0x07,
-        "the file magic reads back in the right order");
-
-  // A payload whose image is text has no binary image, and asking for one is
-  // absence rather than an error.
-  const std::string text_image =
-      make_payload("vx_npu_kernel_3", "1", {{"image=", ".version 7.6"}});
-  check(vx_payload_image_bin(text_image.data(), text_image.size(),
-                             decoded.data(), decoded.size()) == -1,
-        "a text image carries no binary image");
+void a_text_only_payload_carries_no_section() {
+  // What a PTX payload looks like today: entries and no empty entry, so there
+  // is nothing after the text and the section reader says so rather than
+  // reading the end of the blob.
+  std::string payload = make_payload(
+      "vx_npu_kernel_1", "1", {{"format=", "ptx"}, {"image=", ".version 7.6\n"}});
+  const void *out = nullptr;
+  check(vx_payload_section(payload.data(), payload.size(), &out) == -1,
+        "no section in a text-only payload");
+  check(vx_payload_text_end(payload.data(), payload.size()) == payload.size(),
+        "the text part ends the payload");
 }
 
 void refusals() {
-  unsigned char out[64] = {};
+  const std::string image = "0123456789";
+  std::string payload = with_section(make_payload("k", "1", {}), image);
+  const void *out = nullptr;
+  const size_t length_at = payload.size() - image.size() - 8;
 
-  // Malformed input: -1.
-  struct Bad {
-    const char *encoded;
-    const char *what;
-  };
-  const Bad bad[] = {
-      {"TWF", "a length that is not a multiple of four"},
-      {"TW=u", "a data character after padding"},
-      {"T===", "padding before the last two slots"},
-      {"====", "padding with nothing to pad"},
-      {"TWFu=", "a trailing group of one"},
-      {"TW Fu", "a space the producer never writes"},
-      {"TWFu\n", "a newline the producer never writes"},
-      {"TWF-", "a character outside the alphabet"},
-      {"TWF*", "a character outside the alphabet"},
-  };
-  for (const Bad &b : bad) {
-    check(vx_base64_decode(b.encoded, strlen(b.encoded), out, sizeof(out)) ==
-              -1,
-          b.what);
-  }
+  // A length that does not account for the rest of the payload describes a
+  // truncated or overlapping blob. Both directions are refused, because a
+  // reader that trusted either would read past the end or leave bytes unread.
+  std::string too_long = payload;
+  too_long[length_at] += 1;
+  check(vx_payload_section(too_long.data(), too_long.size(), &out) == -2,
+        "a length longer than the payload");
 
-  // Right input, buffer too small: -2 rather than a truncated decode.
-  int64_t too_small = vx_base64_decode("Zm9vYmFy", 8, out, 2);
-  check(too_small == -2,
-        "a buffer that cannot hold the whole image is a different failure");
+  std::string too_short = payload;
+  too_short[length_at] -= 1;
+  check(vx_payload_section(too_short.data(), too_short.size(), &out) == -2,
+        "a length shorter than the payload");
 
-  check(vx_base64_decode(nullptr, 0, out, sizeof(out)) == -1, "no input");
-  check(vx_base64_decode("Zm9v", 4, nullptr, 0) == -1, "no output buffer");
-  check(vx_base64_decode("", 0, out, sizeof(out)) == 0,
-        "an empty entry decodes to nothing");
+  std::string cut = payload.substr(0, payload.size() - 4);
+  check(vx_payload_section(cut.data(), cut.size(), &out) == -2,
+        "a payload cut short inside the section");
+
+  check(vx_payload_section(nullptr, 0, &out) == -1, "no payload");
+  check(vx_payload_section(payload.data(), payload.size(), nullptr) == -1,
+        "nowhere to put the answer");
 }
 
 } // namespace
@@ -295,8 +241,8 @@ void refusals() {
 int main() {
   the_version_key_is_read();
   entries_still_walk_with_one_more();
-  base64_round_trips();
-  a_binary_image_survives_the_payload();
+  the_section_is_read_back();
+  a_text_only_payload_carries_no_section();
   refusals();
 
   if (failures != 0) {

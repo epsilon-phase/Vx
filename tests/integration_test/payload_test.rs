@@ -11,12 +11,12 @@
 //!
 //! `abi=` is the version a dispatch library checks before it trusts anything
 //! else: a key a consumer does not know is harmless, a value it misreads is not,
-//! and the `vx_plugin_*` interface is not frozen. `imagebin=` carries a device
-//! image that is not text -- SPIR-V's first word holds NUL bytes, so a raw
-//! binary image would truncate a NUL-terminated entry and every entry after it.
+//! and the `vx_plugin_*` interface is not frozen. A binary device image -- SPIR-V
+//! -- rides in a length-prefixed section after the entries, because its first
+//! word holds NUL bytes and a NUL-terminated entry cannot carry it.
 //!
-//! The C++ half (`tests/runtime/payload_test.cpp`) pins the decoder against the
-//! published base64 vectors and against an encoder written separately from it.
+//! The C++ half (`tests/runtime/payload_test.cpp`) pins that layout against a
+//! payload built by hand, including the length that does not match the blob.
 //! The Rust half pins the other end of the contract: that the compiler stamps
 //! the version the header defines. Those are two different failures -- a decoder
 //! that is wrong, and a producer that writes a number its own header does not
