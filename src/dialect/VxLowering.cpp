@@ -2115,8 +2115,19 @@ struct ConvertVxToStandardPass
         return;
       // A kernel that hands back a value writes it into a host stack slot,
       // which a GPU cannot address; the runtime runs it on the host instead.
-      if (k->hasAttr("vx.result_slot"))
+      //
+      // The check above let this kernel through, so a pipeline had claimed it
+      // and a device image was expected. Say so rather than drop the twin in
+      // silence: without the message a program that returns a value out of a
+      // placed region quietly runs at home while its author believes it runs on
+      // the card.
+      if (k->hasAttr("vx.result_slot")) {
+        k.emitWarning()
+            << "this kernel hands a value back through a host stack slot, "
+               "which a device cannot address; the region will run on the "
+               "host instead";
         return;
+      }
       // Only a body the device pipeline can actually compile.
       //
       // Two things get excluded, for two different reasons, and both are
