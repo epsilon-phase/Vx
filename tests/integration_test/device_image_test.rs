@@ -418,10 +418,29 @@ fn payload_section(payload: &[u8]) -> &[u8] {
 
 /// Ask `spirv-val` about a module, or `None` when this machine has no
 /// `spirv-val` to ask.
+///
+/// The module goes in on standard input rather than through a file: the SPIR-V
+/// tests run in parallel, and one shared file name would let either overwrite
+/// the other's module between the write and the check.
 fn spirv_val(module: &[u8]) -> Option<Result<(), String>> {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spirv_device_image.spv");
-    std::fs::write(&path, module).expect("could not write the module out for spirv-val");
-    let out = Command::new("spirv-val").arg(&path).output().ok()?;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new("spirv-val")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    // Taking the handle and letting it drop closes the pipe, so the validator
+    // sees the end of the module rather than waiting for more.
+    child
+        .stdin
+        .take()
+        .expect("spirv-val's stdin was piped")
+        .write_all(module)
+        .ok()?;
+    let out = child.wait_with_output().ok()?;
     if out.status.success() {
         Some(Ok(()))
     } else {
@@ -488,4 +507,97 @@ fn a_spirv_topology_gets_a_spirv_module_in_the_payload_section() {
         ),
         None => println!("spirv-val is not installed; the module was not validated"),
     }
+}
+
+/// The shape a real placed kernel has -- four rank-2 operands, a loop nest, and
+/// each row read through a view -- also reaches the payload's section as a
+/// SPIR-V module the validator accepts (#1137).
+///
+/// `spirv_device_image.vx` proves the mechanism on two 2x2 tensors. This is the
+/// corpus shape `placed_kernel_four_operands.vx` has: four rank-2 operands, 28
+/// flat parameters once expanded, so the rewrite has to keep four expansions
+/// and the accesses into each apart. The loops' counters start in
+/// `memref<i32>` slots (`{vx.parallel_init}` / `{vx.parallel_bound}`, which
+/// `mem2reg` has to promote before SPIR-V sees them), and every row is read
+/// through a `memref.reinterpret_cast` whose offset has to reach the address
+/// arithmetic the flat arguments are addressed through.
+#[test]
+fn a_loop_and_views_kernel_gets_a_spirv_module_in_the_payload_section() {
+    let ir = emit_llvm("spirv_device_image_loop_kernel.vx");
+    let kernel = "vx_npu_kernel_0";
+    let payload = payload_bytes(&ir, kernel);
+
+    let has = |needle: &[u8]| payload.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        has(b"format=spirv\0"),
+        "the payload does not say the image is SPIR-V, so a dispatch library \
+         has to guess"
+    );
+    assert!(
+        !has(b"image="),
+        "the image is in a NUL-terminated `image=` entry, where its own first \
+         word would end it"
+    );
+
+    let section = payload_section(&payload);
+    assert_eq!(
+        &section[..4],
+        &[0x03, 0x02, 0x23, 0x07],
+        "the section does not start with SPIR-V's magic number 0x07230203"
+    );
+    assert!(
+        section
+            .windows(kernel.len())
+            .any(|w| w == kernel.as_bytes()),
+        "the module does not name `{kernel}`, so a loader would load it and then \
+         ask for a function that is not in it"
+    );
+
+    match spirv_val(section) {
+        Some(Ok(())) => {}
+        Some(Err(report)) => panic!(
+            "spirv-val rejected the module the compiler emitted:\n{report}"
+        ),
+        None => println!("spirv-val is not installed; the module was not validated"),
+    }
+}
+
+/// A `--legacy-codegen` compile of the same `spirv64` topology still gets no
+/// image, and now says so out loud.
+///
+/// The AST code generator represents a kernel's tensors as memrefs of memrefs
+/// (`memref<memref<...>>`), and SPIR-V has no form for one, so the kernel keeps
+/// the host path -- which computes the right answer, one thread at a time, and
+/// never touches the card. That is a decision the program's author has to be
+/// able to see; before, the twin was simply absent and the output said nothing.
+///
+/// NVPTX compiles the cell shape (it is the AST path's own PTX image), so the
+/// refusal this reports is the SPIR-V arm alone and nothing about NVPTX changes.
+#[test]
+fn a_legacy_compiled_spirv_kernel_says_it_runs_on_the_host() {
+    let path = corpus("spirv_device_image_loop_kernel.vx");
+    let out = Command::new(env!("CARGO_BIN_EXE_vxc"))
+        .arg(&path)
+        .arg("--legacy-codegen")
+        .arg("--emit-llvm")
+        .output()
+        .unwrap_or_else(|e| panic!("could not run vxc: {e}"));
+    assert!(
+        out.status.success(),
+        "legacy path failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !ir.contains("format=spirv"),
+        "the AST path cannot express a memref of memrefs, so there must be no \
+         SPIR-V image rather than one that is wrong"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("memref of memrefs") && stderr.contains("run on the host"),
+        "the compiler dropped this kernel's device twin without saying why, so \
+         the author believes it runs on the card; stderr was:\n{stderr}"
+    );
 }
