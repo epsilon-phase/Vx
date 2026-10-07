@@ -1987,6 +1987,14 @@ struct ConvertVxToStandardPass
         // alone, and the region keeps the host path, which computes the right
         // answer.
         if (pipeline == DevicePipeline::Spirv && mentionsMemrefCell(op)) {
+          // Say so rather than drop the twin in silence. A program compiled
+          // with `--legacy-codegen` reaches here with a memref cell in its
+          // kernel body, so without this the whole program quietly runs at home
+          // while its author believes it runs on the card.
+          k.emitWarning()
+              << "this kernel cannot become a SPIR-V device image because its "
+                 "body holds a memref of memrefs (`memref<memref<...>>`); the "
+                 "region will run on the host instead";
           deviceReady = false;
           return WalkResult::interrupt();
         }
