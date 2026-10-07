@@ -328,3 +328,164 @@ fn a_matmul_is_left_to_the_vendor_library() {
          anyway"
     );
 }
+
+/// The dispatch payload global's bytes, decoded from the emitted LLVM IR.
+///
+/// The payload is one string constant, printed escaped: `\XX` for a byte that
+/// is not printable, and `\\` for a backslash, which would otherwise end the
+/// literal. A quote inside is printed `\22`, so the literal's own closing quote
+/// is the first `"` after it. What is under test is the payload's own format,
+/// not MLIR's escaping, so decode it back to bytes rather than match on the
+/// text.
+fn payload_bytes(ir: &str, kernel: &str) -> Vec<u8> {
+    let marker = format!("@{kernel}_str(\"");
+    let start = ir
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no dispatch payload global for {kernel}"))
+        + marker.len();
+    let rest = &ir[start..];
+    let end = rest
+        .find('"')
+        .expect("the payload global is not terminated");
+    let escaped = rest[..end].as_bytes();
+
+    let mut bytes = Vec::new();
+    let mut i = 0;
+    while i < escaped.len() {
+        if escaped[i] == b'\\' {
+            match &escaped[i + 1..] {
+                [b'\\', ..] => {
+                    bytes.push(b'\\');
+                    i += 2;
+                    continue;
+                }
+                [a, b, ..] => {
+                    let digits = [*a, *b];
+                    let hex = std::str::from_utf8(&digits).unwrap_or("");
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        bytes.push(byte);
+                        i += 3;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        bytes.push(escaped[i]);
+        i += 1;
+    }
+    bytes
+}
+
+/// The payload's section, walked the way a dispatch library walks it
+/// (`vx_payload_text_end` and `vx_payload_section` in
+/// include/vx_hardware_runtime.h): the text part is the kernel name and the
+/// `key=value` entries, an empty entry ends it, and the section is a
+/// little-endian 64-bit length followed by that many bytes.
+///
+/// Written out here rather than shared with the runtime, so that the two are
+/// two statements of the same format rather than one.
+fn payload_section(payload: &[u8]) -> &[u8] {
+    let mut pos = payload
+        .iter()
+        .position(|&b| b == 0)
+        .expect("the payload's kernel name is unterminated")
+        + 1;
+    loop {
+        let len = payload[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("the payload's entries are unterminated");
+        if len == 0 {
+            break; // the empty entry: the section starts after it
+        }
+        pos += len + 1;
+    }
+    let start = pos + 1;
+
+    let length = u64::from_le_bytes(
+        payload[start..start + 8]
+            .try_into()
+            .expect("the payload is too short to hold the section's length"),
+    ) as usize;
+    assert_eq!(
+        length,
+        payload.len() - start - 8,
+        "the section's length does not account for the rest of the payload"
+    );
+    &payload[start + 8..]
+}
+
+/// Ask `spirv-val` about a module, or `None` when this machine has no
+/// `spirv-val` to ask.
+fn spirv_val(module: &[u8]) -> Option<Result<(), String>> {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spirv_device_image.spv");
+    std::fs::write(&path, module).expect("could not write the module out for spirv-val");
+    let out = Command::new("spirv-val").arg(&path).output().ok()?;
+    if out.status.success() {
+        Some(Ok(()))
+    } else {
+        Some(Err(String::from_utf8_lossy(&out.stderr).into_owned()))
+    }
+}
+
+/// A topology whose machine model declares `arch: spirv64` gets a SPIR-V
+/// module, and it is carried in the payload's section rather than in an
+/// `image=` entry (#1137).
+///
+/// The assertions are on the module's *content*, because a section that held
+/// four right bytes and then nothing, or a module that never named the kernel
+/// it is entered through, would satisfy "a section exists" and then fail at a
+/// loader in another process. SPIR-V's own validator is the strongest claim
+/// available here -- not "these bytes look like SPIR-V" but "this is a
+/// module", which is the thing the memref-carried form of this kernel failed.
+///
+/// The section is the only shape that can carry the image: its first word is
+/// `0x07230203`, which holds NUL bytes, so an `image=` entry would end at the
+/// module's first word.
+#[test]
+fn a_spirv_topology_gets_a_spirv_module_in_the_payload_section() {
+    let ir = emit_llvm("spirv_device_image.vx");
+    let kernel = "vx_npu_kernel_0";
+    let payload = payload_bytes(&ir, kernel);
+
+    // The text part: the kernel name first, then the entries.
+    assert!(
+        payload.starts_with(format!("{kernel}\0").as_bytes()),
+        "the payload does not lead with the kernel name, which is what selects \
+         an entry point out of a loaded module"
+    );
+    let has = |needle: &[u8]| payload.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        has(b"format=spirv\0"),
+        "the payload does not say the image is SPIR-V, so a dispatch library \
+         has to guess"
+    );
+    assert!(
+        !has(b"image="),
+        "the image is in a NUL-terminated `image=` entry, where its own first \
+         word would end it"
+    );
+
+    let section = payload_section(&payload);
+    assert_eq!(
+        &section[..4],
+        &[0x03, 0x02, 0x23, 0x07],
+        "the section does not start with SPIR-V's magic number 0x07230203"
+    );
+    assert!(
+        section
+            .windows(kernel.len())
+            .any(|w| w == kernel.as_bytes()),
+        "the module does not name `{kernel}`, so a loader would load it and then \
+         ask for a function that is not in it"
+    );
+
+    match spirv_val(section) {
+        Some(Ok(())) => {}
+        Some(Err(report)) => panic!(
+            "spirv-val rejected the module the compiler emitted:\n{report}"
+        ),
+        None => println!("spirv-val is not installed; the module was not validated"),
+    }
+}
