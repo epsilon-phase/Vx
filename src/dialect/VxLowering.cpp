@@ -1636,8 +1636,8 @@ static void fillToDeviceLoops(linalg::FillOp fill) {
   bool across = kernel && kernel->hasAttr("vx.across");
   if (shared && !everyThread && !across)
     fill->getParentOp()->emitWarning()
-        << "Warning: a GPU region sets shared memory to zero in a branch or a "
-           "loop, so the compiler adds no barrier after it. Another thread "
+        << "a GPU region sets shared memory to zero in a branch or a loop, so "
+           "the compiler adds no barrier after it. Another thread "
            "can write the memory before the zero fill ends. Make the shared "
            "tensor at the start of the region.";
   bool sync = shared && everyThread && !across;
@@ -3522,11 +3522,23 @@ struct ConvertVxToStandardPass
         if (runsOnDevice(op, module, pipelineOfKernel(k), callees[k]))
           return WalkResult::advance();
         blocker = op;
-
         return WalkResult::interrupt();
       });
       if (!blocker) {
         kernels.push_back(k);
+        return;
+      }
+      // A memref cell is the AST code generator's shape for a kernel's tensors:
+      // a buffer holding a descriptor, which the SPIR-V flat argument list has
+      // no form for. Say so rather than drop the twin in silence, because the
+      // region keeps the host path and its author would otherwise believe it
+      // runs on the card.
+      if (pipelineOfKernel(k) == DevicePipeline::Spirv &&
+          mentionsMemrefCell(blocker)) {
+        k.emitWarning()
+            << "this kernel cannot become a SPIR-V device image because its "
+               "body holds a memref of memrefs (`memref<memref<...>>`), and the "
+               "region will run on the host instead";
         return;
       }
       // Say so, or a program meant for the GPU runs on the CPU in silence. A
@@ -3552,9 +3564,10 @@ struct ConvertVxToStandardPass
         signalPassFailure();
         return;
       }
-      // The driver prints the message as it is, with no source position.
-      k.emitWarning() << "Warning: a GPU region runs on the CPU, because the "
-                         "GPU code generator cannot take "
+      // The driver prints the message as it is, with no source position, and
+      // puts the word "Warning" in front of it.
+      k.emitWarning() << "a GPU region runs on the CPU, because the GPU code "
+                         "generator cannot take "
                       << what << ".";
     });
     if (kernels.empty())
