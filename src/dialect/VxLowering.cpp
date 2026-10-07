@@ -2762,6 +2762,11 @@ struct LaunchOpLowering : public OpRewritePattern<vx::LaunchOp> {
     if (deviceImages) {
       auto image = deviceImages->find(callee);
       if (image != deviceImages->end()) {
+        // What the image is, before the image itself: a dispatch library that
+        // meets a format it does not know refuses instead of guessing, and the
+        // section below is unreadable without knowing which it is.
+        payload += "format=ptx";
+        payload.push_back('\0');
         payload += "image=";
         payload += image->second;
         payload.push_back('\0');
