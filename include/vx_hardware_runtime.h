@@ -241,15 +241,53 @@ static inline void vx_memref_write_desc(void *desc, void *data, int32_t rank,
 /// producer that predates the extension: report absence rather than reading a
 /// length that was never written.
 ///
+/// Where the text part of a payload ends: the offset of the first byte that is
+/// not part of a NUL-terminated entry.
+///
+/// The payload is the kernel name, then `key=value` entries, and -- when a
+/// device image is too large or too binary to ride in one entry -- a section
+/// after them. An entry of zero length ends the walk, so a reader that stops
+/// here never reads an image byte as the start of a key. A payload with no
+/// section ends at `payload_size`.
+static inline size_t vx_payload_text_end(const void *payload,
+                                         size_t payload_size) {
+  if (!payload || payload_size == 0) {
+    return 0;
+  }
+  const char *base = (const char *)payload;
+  size_t pos = 0;
+
+  while (pos < payload_size && base[pos] != '\0') {
+    ++pos; /* the kernel name */
+  }
+  ++pos;
+
+  while (pos < payload_size) {
+    size_t len = 0;
+    while (pos + len < payload_size && base[pos + len] != '\0') {
+      ++len;
+    }
+    if (pos + len == payload_size) {
+      return payload_size; /* unterminated: there is no section to find */
+    }
+    if (len == 0) {
+      return pos + 1; /* the empty entry: the section starts after it */
+    }
+    pos += len + 1;
+  }
+
+  return payload_size;
+}
+
 /// The entries the compiler writes today, in the order it writes them: `abi=`
 /// (the payload format version, see `VX_PAYLOAD_ABI`), `kind=` (what the kernel
 /// computes, "matmul", so a plugin can route it to a vendor library instead of
 /// guessing from buffer shapes -- which cannot be done for square operands,
 /// where every operand assignment conforms), `roles=`, `outkind=`, `topo=` (the
 /// dispatch id, decoded by vx_payload_topology), `toponame=`, `launch=`,
-/// `coop=`, and one of `image=` (a device image that is text, which today means
-/// PTX) or `imagebin=` (one that is not, base64, decoded by
-/// vx_payload_image_bin).
+/// `coop=`, `format=` (`ptx` or `spirv`, what the image is), and one of
+/// `image=` (a device image that is text, which today means PTX) or a section
+/// after the entries (one that is not, read by vx_payload_section).
 ///
 /// Every entry is optional to a reader, and that is what let each of them land
 /// without breaking a consumer that predates it. `kind=` absent means
@@ -262,15 +300,16 @@ vx_payload_field(const void *payload, size_t payload_size, const char *key) {
 
   const char *base = (const char *)payload;
   size_t key_len = strlen(key);
+  size_t text_end = vx_payload_text_end(payload, payload_size);
   size_t pos = 0;
 
   /* Skip the kernel name, then walk the remaining NUL-terminated entries. */
-  while (pos < payload_size && base[pos] != '\0') {
+  while (pos < text_end && base[pos] != '\0') {
     ++pos;
   }
   ++pos;
 
-  while (pos < payload_size) {
+  while (pos < text_end) {
     const char *entry = base + pos;
     size_t remaining = payload_size - pos;
     size_t len = 0;
@@ -324,92 +363,49 @@ static inline int32_t vx_payload_abi(const void *payload, size_t payload_size) {
   return version;
 }
 
-/// Decode standard base64 (`A-Z a-z 0-9 + /`, `=` padding) into `out`.
+/// The device image the payload carries in its section, or a negative code.
 ///
-/// Returns the number of bytes written, -1 when `in` is not well-formed base64,
-/// or -2 when the decoded bytes do not fit in `out_cap`. The two are distinct
-/// because they mean different things: -1 is a corrupt or hostile entry, -2 is
-/// a caller whose buffer is too small, and reporting both as "failed" would
-/// leave a truncated image indistinguishable from a short one.
+/// The section is a little-endian 64-bit length followed by that many bytes,
+/// placed after the text part. It exists because a SPIR-V module's header
+/// contains NUL bytes and so cannot ride in a NUL-terminated entry, and because
+/// base64 inside a text format was the wrong answer to that
+/// (docs/gpu_backends.md, "Shared work before a second backend", item 2).
 ///
-/// Strict on purpose. `in_len` must be a multiple of four, padding may appear
-/// only at the end, and nothing else -- no whitespace, no newlines -- is
-/// accepted. The producer emits one line of base64, and a decoder that skips
-/// what it does not recognize is a decoder that turns a corrupted entry into a
-/// shorter image.
-static inline int64_t vx_base64_decode(const char *in, size_t in_len,
-                                       unsigned char *out, size_t out_cap) {
-  if (!in || !out || in_len % 4 != 0) {
+/// Returns the image's length in bytes and points `out` at it. -1 means the
+/// payload carries no section, which is what a producer that emits only text
+/// entries (PTX today, in `image=`) answers. -2 means a section is present but
+/// its length does not account for the rest of the payload: a truncated or
+/// overlapping blob, which a consumer must refuse rather than read past.
+///
+/// The image's format is the `format=` entry, not a property of the section: a
+/// consumer that meets a format it does not know refuses instead of guessing.
+static inline int64_t vx_payload_section(const void *payload,
+                                         size_t payload_size,
+                                         const void **out) {
+  if (!payload || !out) {
     return -1;
   }
 
-  size_t written = 0;
-  for (size_t i = 0; i < in_len; i += 4) {
-    int quad[4];
-    int padding = 0;
-    for (int k = 0; k < 4; ++k) {
-      char c = in[i + k];
-      if (c == '=') {
-        /* Padding only in the final group, and only in its last two slots. */
-        if (i + 4 != in_len || k < 2) {
-          return -1;
-        }
-        ++padding;
-        quad[k] = 0;
-        continue;
-      }
-      if (padding != 0) {
-        return -1; /* A data character after padding. */
-      }
-      if (c >= 'A' && c <= 'Z') {
-        quad[k] = c - 'A';
-      } else if (c >= 'a' && c <= 'z') {
-        quad[k] = c - 'a' + 26;
-      } else if (c >= '0' && c <= '9') {
-        quad[k] = c - '0' + 52;
-      } else if (c == '+') {
-        quad[k] = 62;
-      } else if (c == '/') {
-        quad[k] = 63;
-      } else {
-        return -1;
-      }
-    }
-
-    unsigned int bits = ((unsigned int)quad[0] << 18) |
-                        ((unsigned int)quad[1] << 12) |
-                        ((unsigned int)quad[2] << 6) | (unsigned int)quad[3];
-    size_t bytes = padding == 0 ? 3u : (padding == 1 ? 2u : 1u);
-    if (written + bytes > out_cap) {
-      return -2;
-    }
-    out[written++] = (unsigned char)(bits >> 16);
-    if (bytes > 1) {
-      out[written++] = (unsigned char)((bits >> 8) & 0xFF);
-    }
-    if (bytes > 2) {
-      out[written++] = (unsigned char)(bits & 0xFF);
-    }
-  }
-
-  return (int64_t)written;
-}
-
-/// The `imagebin=` entry, decoded, or -1 when the payload carries none.
-///
-/// The counterpart of `image=`, for a device image that is not text. SPIR-V is
-/// a binary module whose header contains NUL bytes, so it cannot ride in a
-/// NUL-terminated entry -- which is the whole reason this key exists. Returns
-/// what vx_base64_decode returns, so -2 still means the caller's buffer is too
-/// small.
-static inline int64_t vx_payload_image_bin(const void *payload,
-                                           size_t payload_size,
-                                           unsigned char *out, size_t out_cap) {
-  const char *encoded = vx_payload_field(payload, payload_size, "imagebin=");
-  if (!encoded) {
+  size_t start = vx_payload_text_end(payload, payload_size);
+  if (start == payload_size) {
     return -1;
   }
-  return vx_base64_decode(encoded, strlen(encoded), out, out_cap);
+
+  const unsigned char *section = (const unsigned char *)payload + start;
+  if (payload_size - start < 8) {
+    return -2;
+  }
+
+  uint64_t length = 0;
+  for (int i = 7; i >= 0; --i) {
+    length = (length << 8) | section[i];
+  }
+  if (length != payload_size - start - 8) {
+    return -2;
+  }
+
+  *out = section + 8;
+  return (int64_t)length;
 }
 
 /// Topology id bands, mirroring `topology_dispatch_id` in src/arch.rs. An id is
