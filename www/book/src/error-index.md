@@ -17,12 +17,12 @@ the test suite has one, a program that triggers it.
 - [Warnings](#warnings) — `W1001`–`W1031` (23 codes)
 - [Parser Errors](#parser-errors) — `E1001`–`E1013` (13 codes)
 - [Name Resolution Errors](#name-resolution-errors) — `E2001`–`E2007` (7 codes)
-- [Type Errors](#type-errors) — `E3001`–`E3045` (44 codes)
-- [Borrow/Ownership Errors](#borrowownership-errors) — `E4001`–`E4011` (11 codes)
+- [Type Errors](#type-errors) — `E3001`–`E3046` (45 codes)
+- [Borrow/Ownership Errors](#borrowownership-errors) — `E4001`–`E4012` (12 codes)
 - [Safety Errors](#safety-errors) — `E5001`–`E5002` (2 codes)
-- [Topology/Hardware Errors](#topologyhardware-errors) — `E6001`–`E6029` (29 codes)
+- [Topology/Hardware Errors](#topologyhardware-errors) — `E6001`–`E6030` (30 codes)
 - [Tensor/Math Errors](#tensormath-errors) — `E7001`–`E7004` (4 codes)
-- [Contract/Verification Errors](#contractverification-errors) — `E8001`–`E8005` (5 codes)
+- [Contract/Verification Errors](#contractverification-errors) — `E8001`–`E8006` (6 codes)
 
 ## Warnings
 
@@ -138,6 +138,7 @@ Raised by the type checker. Vx performs no implicit numeric conversion, so many 
 | [`E3043`](/errors/E3043/) | A `for` loop over a reference to a type with no method to iterate it by. The loop calls `iter()` for `for x in &c` and `iter_mut()` for `for x in &mut c`, as Rust's collections do, so the type needs the one the loop asks for. |
 | [`E3044`](/errors/E3044/) | A top-level `const` whose value is not known while compiling, or does not fit its declared type. A `const` holds a number or a `bool`: a literal, or arithmetic on literals and other `const`s. A `const` table holds a list of number literals, and is read one number at a time, as `TABLE[i]`. |
 | [`E3045`](/errors/E3045/) | A number literal that does not fit `usize`, which holds 0 up to the largest `i64`. |
+| [`E3046`](/errors/E3046/) | A `for` loop over a tensor that is not a variable or a flat array literal, such as one a function call returns, or a nested array literal. The loop reads the tensor by index, so it needs a name: bind the tensor with `let` first. |
 
 ## Borrow/Ownership Errors
 
@@ -156,6 +157,7 @@ Raised by the borrow checker and the linear-type rules. These rule out use-after
 | [`E4009`](/errors/E4009/) | An assignment to a variable, or a field or element of it, while a `&` borrow of it is still used afterwards: `let r = &x; x = 2;` and then a use of `r`. The borrow would see the value change under it. |
 | [`E4010`](/errors/E4010/) | A change to a variable declared without `mut`: assigning it, or a field or element of it, borrowing it `&mut`, or calling a method that takes `&mut self` on it. Declare it `let mut x`, or for a parameter `mut x : T`. |
 | [`E4011`](/errors/E4011/) | A view of a tensor (a row `q[i]` or a field `h.t`) used where a tensor of its own is held: stored in a variable that already exists (`t = q[i]`) or a struct field (`h.t = q[i]`, `Holder { t : q[i] }`), or passed to a function that takes the tensor by value (`f(q[i])`). A view shares its owner's memory and is not a copy. Bind it to a new variable with `let`, pass `q[i].clone()`, or take the parameter by reference. |
+| [`E4012`](/errors/E4012/) | A call to the `drop` method of a `Drop` impl by hand: `x.drop()`. `drop` runs when the value is dropped, so calling it as well would run it twice. Write `drop(x)`, from `core::mem`, to drop a value early. |
 
 ## Safety Errors
 
@@ -201,6 +203,7 @@ Raised by the placement and capacity rules — the checks that make Vx different
 | [`E6027`](/errors/E6027/) | A working set that overflows a space only across call boundaries: the peak along some call path -- what each caller still holds when it calls, plus the deepest callee's own peak -- exceeds the space's declared capacity, while every function on the path fits by itself (that case is E6010's). Computed by folding per-function capacity summaries over the call graph, after the per-function checks. Downgraded to W1028 when the space is declared `overcommit`. |
 | [`E6028`](/errors/E6028/) | A recursive cycle that places tiles in a space with a declared capacity. The recursion depth is not known at compile time, so the true peak is unbounded and the placement is refused conservatively. Downgraded to W1028 when the space is declared `overcommit`. |
 | [`E6029`](/errors/E6029/) | A pointer argument into one memory passed to a parameter that wants a pointer into another: a host `*mut f32` where `*mut f32 in Memory::GPU_HBM` is declared, or the reverse. The two are different types, and the C library or kernel behind the parameter reads the memory the declaration names, so the spaces must match exactly. |
+| [`E6030`](/errors/E6030/) | A `spawn` region on a device hands out a tensor it makes, which the host could not free. The compiler makes such a tensor before the region instead, in the device's memory, when the region hands it out as a variable created with `Tensor<..>(..)`, `::new()` or `::uninit()`, with no type annotation, a size that uses nothing the region computes, and a name nothing outside the region already uses. |
 
 ## Tensor/Math Errors
 
@@ -224,7 +227,8 @@ Raised when a `requires`, `ensures` or `invariant` clause cannot be discharged, 
 | [`E8003`](/errors/E8003/) | Compile-time index out of range |
 | [`E8004`](/errors/E8004/) | Compile-time evaluation exceeded the call-depth limit |
 | [`E8005`](/errors/E8005/) | Compile-time evaluation ran more loop iterations than the budget allows. A loop whose end condition is never reached is the usual cause; without this it hung the compiler. |
+| [`E8006`](/errors/E8006/) | A call does not meet the called function's precondition (`requires`) |
 
 ______________________________________________________________________
 
-138 diagnostics.
+142 diagnostics.

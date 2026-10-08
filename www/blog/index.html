@@ -43,6 +43,30 @@
 
   <ul class="posts">
     <li>
+      <a href="/blog/cant-a-library-do-this.html">Can a library describe the memory hierarchy?</a>
+      <time datetime="2026-10-08">8 October 2026</time>
+      <p>A Rust library can put the memory space in a tensor's type, and the Rust compiler then
+      rejects a host read of GPU memory. It cannot add up how much memory a call path uses,
+      compute shapes on stable Rust, or check the code that runs on the device. Both versions,
+      side by side.</p>
+    </li>
+    <li>
+      <a href="/blog/void-is-a-value.html">Why void is a value in Vx</a>
+      <time datetime="2026-10-08">8 October 2026</time>
+      <p>In Vx, <code>void</code> is an ordinary type with exactly one value, as <code>()</code> is
+      in Rust and unlike <code>void</code> in C, so generic code needs no special case for it. A
+      bug treated that value as something that could be moved; the fix, and four gaps found while
+      writing this.</p>
+    </li>
+    <li>
+      <a href="/blog/how-vx-frees-memory.html">How Vx frees memory</a>
+      <time datetime="2026-10-07">7 October 2026</time>
+      <p>Vx frees memory in four ways, and the type checker decides almost all of it. A tensor is
+      freed right after its last use, a value with a <code>Drop</code> impl at the end of its
+      block as in Rust, and GPU memory through the plugin that allocated it. With the drop points
+      the compiler prints, and the gaps that are left.</p>
+    </li>
+    <li>
       <a href="/blog/proving-tensor-indices.html">Proving tensor indices at compile time</a>
       <time datetime="2026-10-05">5 October 2026</time>
       <p>The Vx compiler hands index arithmetic to the z3 theorem prover. It proves that a KV-cache
