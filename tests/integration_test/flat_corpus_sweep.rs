@@ -195,6 +195,9 @@ const KNOWN_DECLINES: &[&str] = &[
     // A row chosen by an `if` used as a value: the flat path has no slot for a tensor view
     // ("an aggregate slot with no struct type").
     "backend/pass/let_if_tensor_inside_an_if.vx",
+    // A call through a pointer to a `void` function: the flat path declines it ("an indirect
+    // callee returning a non-scalar").
+    "backend/pass/generic_call_of_a_void_function.vx",
 ];
 
 /// Every `.vx` file under `dir`, recursively, sorted for a stable report.
