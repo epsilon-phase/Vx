@@ -98,11 +98,17 @@ void the_version_key_is_read() {
       make_payload("vx_npu_kernel_0", "", {{"abi=", ""}});
   check(vx_payload_abi(empty_version.data(), empty_version.size()) == -1,
         "an empty version is not version 0");
+  check(vx_payload_field(empty_version.data(), empty_version.size(), "abi=") !=
+            nullptr,
+        "an empty `abi=` is present to a field lookup, not absent");
 
   const std::string not_a_number =
       make_payload("vx_npu_kernel_0", "1x", {{"kind=", "matmul"}});
   check(vx_payload_abi(not_a_number.data(), not_a_number.size()) == -1,
         "a version that is not a decimal number is refused");
+  check(vx_payload_field(not_a_number.data(), not_a_number.size(), "abi=") !=
+            nullptr,
+        "and a malformed one is still distinct from an absent one");
 
   const std::string huge =
       make_payload("vx_npu_kernel_0", "99999999999999999999", {});
@@ -232,8 +238,10 @@ void refusals() {
         "a payload cut short inside the section");
 
   check(vx_payload_section(nullptr, 0, &out) == -1, "no payload");
-  check(vx_payload_section(payload.data(), payload.size(), nullptr) == -1,
-        "nowhere to put the answer");
+  // A NULL `out` is a caller bug, not a payload shape, so it must not answer
+  // the same -1 a text-only payload does: -3 is its own code.
+  check(vx_payload_section(payload.data(), payload.size(), nullptr) == -3,
+        "nowhere to put the answer is not the same as no section");
 }
 
 } // namespace
