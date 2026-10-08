@@ -6,12 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 // REQUIRES: flat-codegen
-// RUN: vxc %s 2>&1 | FileCheck %s --check-prefixes=CHECK,FLAT
+// RUN: VX_FLAT_DBG=1 vxc %s 2>&1 | FileCheck %s --check-prefixes=CHECK,FLAT
 // RUN: vxc %s --legacy-codegen 2>&1 | FileCheck %s
 //
 // `-t` negates each element of a tensor into a new one. A float zero becomes `-0`; an integer
-// is `0 - x`. The first run checks the default code generator compiled it itself, so the file
-// names its code generators instead of the test harness choosing them.
+// is `0 - x`. The first run checks the default code generator compiled it itself.
+// VX_FLAT_DBG only asks that compile to say so; it does not choose the code generator.
 
 fn main() -> i32 {
   let mut a = Tensor<f32, [2, 2]>::new();

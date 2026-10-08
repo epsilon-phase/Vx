@@ -21,14 +21,23 @@ const KNOWN_DECLINES: &[&str] = &[
     // `c as ||->i32`: the flat path declines a cast to the built-in closure type ("a cast to a
     // non-scalar"); the AST path compiles it.
     "backend/pass/returning_a_closure_that_uses_nothing.vx",
+    // A user `impl Transfer` lowering: the flat path declines its body, which the AST path
+    // copies into the caller.
     "backend/pass/custom_topology_user_lowering.vx",
+    "frontend/pass/assert_in_a_transfer_lowering_stays_in_it.vx",
+    // `c = a @ b` where `c` may be read by an operand (the same name, or a view through its
+    // pointer): the flat path only fills the destination in place, and declines the rest.
     "backend/pass/matmul_assign_alias.vx",
+    "backend/pass/matmul_into_a_tensor_read_through_a_view.vx",
+    // A tuple holding an `Option<i32>`: the flat path has no layout for a generic struct holding
+    // an enum ("a struct with no GID"), and it also declines a `match` used as a value.
+    "backend/pass/tuple_match_with_enum_variants_as_a_value.vx",
     // A row chosen by an `if` used as a value: the flat path has no slot for a tensor view
     // ("an aggregate slot with no struct type").
     "backend/pass/tensor_views_end_at_their_last_use.vx",
-    // A generic enum holding a struct, `Opt<Pair>`: the flat path has no layout for it ("an
-    // enum with no modelled instance layout"). The file checks the checker only.
-    "frontend/pass/match_moves_only_what_it_binds.vx",
+    // `Duration`'s `+` and `-` go through `Option<Duration>`, and the flat path declines its
+    // `unwrap` ("a non-scalar default return").
+    "backend/pass/operators_on_user_types.vx",
     // `t = pass(t)` inside an `if`: on the flat path a tensor local is one register, so the
     // new value cannot leave the branch. The flat path used to read the wrong tensor after it.
     "frontend/pass/tensor_drops_written_into_the_program.vx",
@@ -238,10 +247,14 @@ fn decline_keys(log: &str) -> Vec<String> {
 
 /// Compile one program and report the path it took. `--action emit-mlir` stops at
 /// MLIR, so no accelerator or JIT is needed and the answer is the same everywhere.
+///
+/// The line that says the flat path ran is printed only when `VX_FLAT_DBG` is set,
+/// so this sets it. A normal compile stays quiet.
 fn path_taken(program: &Path) -> Result<CodegenPath, String> {
     let output = Command::new(env!("CARGO_BIN_EXE_vxc"))
         .arg(program)
         .args(["--action", "emit-mlir"])
+        .env("VX_FLAT_DBG", "1")
         .output()
         .map_err(|e| format!("could not run vxc: {e}"))?;
 
@@ -531,6 +544,7 @@ fn flat_path_answers_match_the_backend_expectations() {
         let output = match Command::new(env!("CARGO_BIN_EXE_vxc"))
             .arg(&program)
             .env("PATH", &path_var)
+            .env("VX_FLAT_DBG", "1")
             .output()
         {
             Ok(o) => o,
@@ -544,7 +558,7 @@ fn flat_path_answers_match_the_backend_expectations() {
         // Refuse to pass on a program that quietly took the AST path. Without this the test
         // decays into `test_backend` the moment the flat path declines something new -- which
         // is precisely the failure this test exists because of, so it is checked rather than
-        // assumed.
+        // assumed. The line is printed only with VX_FLAT_DBG, which this command sets.
         if !log.contains("emitted module via the flat path") {
             failures.push(format!(
                 "{rel}: states EXPECT lines but did not compile through the flat path, so \

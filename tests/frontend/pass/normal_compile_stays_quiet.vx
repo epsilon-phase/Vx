@@ -1,0 +1,22 @@
+//===- normal_compile_stays_quiet.vx - Vx Compiler ---------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A normal compile does not print which code generator it used. That line is
+// for someone working on the compiler, and it shows up only when VX_FLAT_DBG
+// is set.
+//
+// RUN: env -u VX_FLAT_DBG vxc %s --emit-mlir 2>&1 | FileCheck %s --check-prefix=CHECK
+// RUN: VX_FLAT_DBG=1 vxc %s --emit-mlir 2>&1 | FileCheck %s --check-prefix=CHECK-DBG
+
+fn main() -> i32 {
+  return 0;
+}
+
+// CHECK-NOT: [flat-codegen] emitted module via the flat path
+// CHECK: func.func @main
+// CHECK-DBG: [flat-codegen] emitted module via the flat path
+// CHECK-DBG: func.func @main
