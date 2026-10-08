@@ -33,6 +33,10 @@
 // datasheet: the rendered spec table did not yield a readable figure, and a
 // memory bandwidth is what derives every transfer cost on this SKU's edges.
 //
+// Measured: what the card reaches of it is a device-to-device copy at
+// 449 GB/s and a triad at 422 GB/s (scripts/tools/xpu_bandwidth_spike.sh),
+// the fraction of peak those two traffic shapes normally carry.
+//
 // Measured: the driver reports 16225243136 bytes (15.11 GiB) of device memory,
 // about 0.9 GiB below the 16 GiB the part carries. Following fleet/README.md,
 // `capacity:` is what the hardware has, not what a deployment may use, so the
@@ -84,15 +88,21 @@ Topology Device {
   // program that would probably have run, which is the safe direction. Adding
   // it is one token once a source says so.
   dtypes: [f32, f16, i8, u8, i16, u16, i32, u32, i64, u64, bool],
-  // spec: PCIe Gen4 x16 = 31.5 GB/s per direction (16 GT/s x 16 lanes, 128b/130b).
-  // UNVERIFIED on this SKU: the achieved host bandwidth is an open experiment
-  // (utils/memalg), as it is for the NVIDIA PCIe figures.
-  transfer Memory::CPU_DRAM -> Memory::HBM : 31.5 GB/s,
-  // The way home. Reading a placed tensor back is how a program says it still
-  // holds it; without the edge the model can only describe one direction, and
-  // fleet/mi300x.vx is the file that currently cannot serve admission because
-  // it declares only the outbound hop.
-  transfer Memory::HBM -> Memory::CPU_DRAM : 31.5 GB/s,
+  // Measured: 10.8 GB/s, and it is this platform's edge, not the card's. The
+  // A770 is a Gen4 x16 part, so the datasheet figure is 31.5 GB/s per
+  // direction, but this machine's CPU is a Ryzen 7 5700G (Cezanne) and its
+  // lanes are PCIe 3.0 only, so the card runs at Gen3 x16: 15.75 GB/s of
+  // theory, of which a copy through pinned host staging gets about two thirds.
+  // Do not take the number back out of sysfs: `current_link_speed` and
+  // `max_link_speed` at 0000:12:00.0 both report 2.5 GT/s x1 (Gen1 x1), which
+  // cannot carry 10.8 GB/s, so this driver's link attributes are stale.
+  // scripts/tools/xpu_bandwidth_spike.sh measures both directions.
+  transfer Memory::CPU_DRAM -> Memory::HBM : 10.8 GB/s,
+  // The way home, measured in the same run: 10.0 GB/s. Reading a placed tensor
+  // back is how a program says it still holds it; without the edge the model
+  // can only describe one direction, and fleet/mi300x.vx is the file that
+  // currently cannot serve admission because it declares only the outbound hop.
+  transfer Memory::HBM -> Memory::CPU_DRAM : 10.0 GB/s,
   // The on-die hops declare no cost: HBM and L2 nest via `within:`, so the
   // roofline derives what their bandwidths support (E6013 forbids a second
   // source on one edge). No `copy_engine` on the scratchpad hop: whether a
