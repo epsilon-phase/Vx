@@ -736,7 +736,48 @@ impl<'a> TypeChecker<'a> {
             Expr::Closure(c) => {
                 Self::extract_uses_expr(&c.body, uses);
             }
-            _ => {}
+            Expr::EnumVariant(v) => {
+                for e in v.payload.iter().flatten() {
+                    Self::extract_uses_expr(e, uses);
+                }
+            }
+            Expr::IndirectCall(c) => {
+                Self::extract_uses_expr(&c.callee, uses);
+                for a in &c.args {
+                    Self::extract_uses_expr(a, uses);
+                }
+            }
+            Expr::VecMacro(v) => {
+                for e in &v.elements {
+                    Self::extract_uses_expr(e, uses);
+                }
+            }
+            Expr::InlineMlir(m) => {
+                for (_, e, _) in &m.inputs {
+                    Self::extract_uses_expr(e, uses);
+                }
+                for e in &m.clobbers {
+                    Self::extract_uses_expr(e, uses);
+                }
+            }
+            Expr::Jvp(j) => {
+                for a in &j.args {
+                    Self::extract_uses_expr(a, uses);
+                }
+                Self::extract_uses_expr(&j.tangent, uses);
+            }
+            Expr::Vjp(v) => {
+                for a in &v.args {
+                    Self::extract_uses_expr(a, uses);
+                }
+                Self::extract_uses_expr(&v.cotangent, uses);
+            }
+            // No names inside. A macro call is expanded before the checker runs.
+            Expr::Number(_)
+            | Expr::StringLiteral(_)
+            | Expr::MemorySpace(_)
+            | Expr::SizeOf(_)
+            | Expr::MacroCall(_) => {}
         }
     }
 
@@ -1356,9 +1397,9 @@ impl<'a> TypeChecker<'a> {
             }
             walk(&func.return_type, &mut names);
             for n in names {
-                // `void`/`none` are spelled as nominals but are builtins, and a `Closure_N` is
+                // `void`/`none`/`!` are spelled as nominals but are builtins, and a `Closure_N` is
                 // synthesized by the compiler rather than written by anyone.
-                if n == "void" || n == "none" || n.starts_with("Closure_") {
+                if n == "void" || n == "none" || n == "!" || n.starts_with("Closure_") {
                     continue;
                 }
                 let sym = crate::symbol::Symbol::from(n.as_str());
@@ -1377,9 +1418,25 @@ impl<'a> TypeChecker<'a> {
         // A non-void function whose body can complete without returning. Left to codegen this
         // surfaced as `block with no terminator` naming an arith op, with no source location and
         // no statement of what was wrong -- unreadable for the most ordinary mistake there is.
-        if !crate::syntax::is_void_ty(&func.return_type)
-            && !crate::syntax::expr::block_always_exits(&func.body)
-        {
+        let functions = &self.env.functions;
+        let never = |name: &str| {
+            functions
+                .get(name)
+                .is_some_and(|f| crate::syntax::is_never_ty(&f.0))
+        };
+        let exits = crate::syntax::expr::block_always_exits(&func.body, &never);
+        if crate::syntax::is_never_ty(&func.return_type) && !exits {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E3028,
+                format!(
+                    "'{}' is declared `-> !`, so it must never return, but its body can finish",
+                    func.name
+                ),
+                func.body
+                    .last()
+                    .map(|st| crate::diagnostic::SourceSpan::from_ast_span(&st.span())),
+            );
+        } else if !crate::syntax::is_void_ty(&func.return_type) && !exits {
             self.errors.error_with_code(
                 crate::diagnostic::DiagnosticCode::E3028,
                 format!(
@@ -1395,6 +1452,8 @@ impl<'a> TypeChecker<'a> {
         }
 
         let prev_constraints = self.consteval.constraints.clone();
+        let prev_ensures =
+            std::mem::replace(&mut self.consteval.current_ensures, func.ensures.clone());
         let prev_ret_ty = self.current_return_type.clone();
         let prev_fn = std::mem::replace(&mut self.current_function, func.name.as_ref().to_string());
         self.current_return_type = Some(func.return_type.clone());
@@ -1471,34 +1530,23 @@ impl<'a> TypeChecker<'a> {
 
         self.seam.contracts = prev_contracts;
 
-        // Combine return constraints into a single OR constraint
-        if !self.consteval.return_constraints.is_empty() {
-            let mut combined = self.consteval.return_constraints[0].clone();
-            for rc in self.consteval.return_constraints.iter().skip(1) {
-                combined = Expr::LogicalOp(LogicalOpExpr {
-                    lhs: Box::new(combined),
-                    op: LogicalOp::Or,
-                    rhs: Box::new(rc.clone()),
-                    span: crate::syntax::Span::default(),
-                });
-            }
-            self.consteval.constraints.push(combined);
-            self.consteval.return_constraints.clear();
-        }
-
-        // Verify postconditions (ensures)
-        for ens in &func.ensures {
-            if !self.prove_expr(ens) {
-                self.errors.error_with_code(
-                    crate::diagnostic::DiagnosticCode::E8001,
-                    format!(
-                        "Function '{}' cannot prove postcondition (ensures) at compile time",
-                        func.name
-                    ),
-                    None,
-                );
+        // Each `return` checked the `ensures` where it stood. A body that can also reach its end
+        // without one is checked here, from what is known at the end.
+        if !exits && !self.speculating {
+            for ens in &func.ensures {
+                if !self.prove_expr(ens) {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E8001,
+                        format!(
+                            "Function '{}' cannot prove postcondition (ensures) at compile time",
+                            func.name
+                        ),
+                        None,
+                    );
+                }
             }
         }
+        self.consteval.current_ensures = prev_ensures;
 
         // W1009: Unused function parameters
         for (param_name, _) in &func.params {
