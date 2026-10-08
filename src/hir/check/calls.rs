@@ -547,7 +547,69 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// E8006: a call must meet the called function's `requires`. Each one, with the call's
+    /// arguments in place of the parameters, must follow from what the prover knows at the call.
+    /// An argument the prover cannot model, such as another call, is an unknown value.
+    fn check_call_requires(&mut self, name: &str, args: &[Expr], span: &crate::syntax::Span) {
+        if self.speculating {
+            return;
+        }
+        let Some(func) = self.env.syntax_functions.get(name) else {
+            return;
+        };
+        if func.requires.is_empty() {
+            return;
+        }
+        let mut names = HashMap::new();
+        for (i, ((param, _), arg)) in func.params.iter().zip(args).enumerate() {
+            let value = if crate::hir::prover::is_modelled(arg) {
+                arg.clone()
+            } else {
+                Expr::Identifier(IdentifierExpr {
+                    name: format!("$arg_{}_{}_{i}", span.line, span.column).into(),
+                    span: *span,
+                })
+            };
+            names.insert(param.clone(), value);
+        }
+        for req in &func.requires {
+            let at_call = crate::hir::prover::substitute_names(req, &names);
+            if !self.prove_expr(&at_call) {
+                let condition = crate::hir::prover::to_source(req)
+                    .map(|c| format!(" `{c}`"))
+                    .unwrap_or_default();
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E8006,
+                    format!(
+                        "this call to '{name}' may not meet its precondition{condition}: \
+                         the compiler cannot prove it from what is known here"
+                    ),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+                );
+            }
+        }
+    }
+
     pub(crate) fn check_functioncall_expr(&mut self, expr: &mut Expr) -> Type {
+        // `core::mem::needs_drop<T>()` answers whether dropping a `T` runs anything, which only
+        // the checker knows, so the call becomes `true` or `false` here.
+        if let Expr::FunctionCall(fc) = expr {
+            if fc.name.as_ref() == "needs_drop"
+                && fc.args.is_empty()
+                && self.env.generic_functions.contains_key("needs_drop")
+            {
+                if let Some([ty]) = fc.type_args.as_deref() {
+                    if !ty.has_generic_params() {
+                        let answer = !self.drops_glue(ty).is_empty();
+                        *expr = Expr::Identifier(IdentifierExpr {
+                            name: if answer { "true" } else { "false" }.into(),
+                            span: fc.span,
+                        });
+                        return Type::Scalar(ElementType::Bool);
+                    }
+                }
+            }
+        }
         match expr {
             Expr::FunctionCall(FunctionCallExpr {
                 name,
@@ -786,6 +848,7 @@ impl<'a> TypeChecker<'a> {
                         &arg_types,
                         span,
                     );
+                    self.check_call_requires(resolved_name.as_ref(), args, span);
                     ret_ty.clone()
                 } else if let Some((mono_topology, param_types, mono_ret)) = self
                     .mono
@@ -1777,6 +1840,11 @@ impl<'a> TypeChecker<'a> {
             return;
         }
         let Some(ty) = ty else { return };
+        // A reference to a placed tensor is read where the tensor is.
+        let ty = match ty {
+            Type::Borrow { inner, .. } => inner.as_ref(),
+            other => other,
+        };
         let Some(p) = ty.placement() else { return };
         let owner = self.transfer_cost_graph.placement_topology(p);
         let src = self.transfer_cost_graph.placement_space(p);
@@ -1983,7 +2051,21 @@ impl<'a> TypeChecker<'a> {
                 self.errors
                     .push("Function 'abort' expects no arguments".to_string());
             }
-            Some(Type::Scalar(ElementType::I32))
+            Some(crate::syntax::never_ty())
+        } else if resolved_name == "panic" {
+            // `abort()` with a message. The message is a C string, so it can be a parameter that
+            // a caller filled in, as `expect(msg)` needs, not only a literal.
+            let c_string = Type::Pointer(Box::new(Type::Scalar(ElementType::I8)), None, false);
+            if args.len() != 1 {
+                self.errors
+                    .push("Function 'panic' expects 1 argument, the message".to_string());
+            } else if arg_types[0] != c_string {
+                self.errors.push(format!(
+                    "Function 'panic' expects a string message, got {}",
+                    arg_types[0]
+                ));
+            }
+            Some(crate::syntax::never_ty())
         } else if resolved_name == "print" {
             if args.len() != 1 {
                 self.errors
@@ -2504,12 +2586,6 @@ impl<'a> TypeChecker<'a> {
                     self.expected_type = prev;
                 }
 
-                if _method.as_ref() == "drop" && args.is_empty() {
-                    if let Expr::Identifier(id) = &**obj {
-                        self.consume(&id.name);
-                    }
-                }
-
                 if let Type::Module(ref path, ref exports) = base_ty {
                     if let Some(exported_ty) = exports.get(_method) {
                         let prefix = TypeChecker::mangle_path(path);
@@ -2681,6 +2757,31 @@ impl<'a> TypeChecker<'a> {
                         }
                         _ => None,
                     };
+                    // `x.drop()` would run `drop`, and `x` would be dropped again when its owner
+                    // gives it up, as in Rust.
+                    if ib.trait_name.as_deref() == Some("Drop") && !self.speculating {
+                        self.errors.error_with_code(
+                            crate::diagnostic::DiagnosticCode::E4012,
+                            "`drop` is called for you when a value is dropped, and cannot be \
+                             called by hand. To drop a value early, write `drop(x)` (from \
+                             `core::mem`)",
+                            Some(crate::diagnostic::SourceSpan::from_ast_span(&method_span)),
+                        );
+                    }
+                    // A method that takes `self` by value moves its receiver: `w.into_iter()`.
+                    let self_by_value = generic_method.params.first().is_some_and(|(_, t)| {
+                        !matches!(t, Type::Borrow { .. } | Type::Pointer(..))
+                    });
+                    if consume
+                        && self_by_value
+                        && !matches!(base_ty, Type::Borrow { .. } | Type::Pointer(..))
+                        && base_ty.is_linear()
+                        && !self.is_copy(&base_ty)
+                    {
+                        if let Expr::Identifier(id) = &**obj {
+                            self.consume(&id.name);
+                        }
+                    }
                     let (ret_ty, func_call) = self.instantiate_method_call_rewrite(
                         generic_method,
                         mapping,

@@ -307,11 +307,7 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
         let mut src_val = src_val;
         if let Some(t) = static_target {
             if src_ty != t {
-                let cast = OperationBuilder::new("memref.cast", location)
-                    .add_operands(&[src_val])
-                    .add_results(&[t])
-                    .build()?;
-                src_val = block.append_operation(cast).result(0)?.into();
+                src_val = crate::codegen::lower::cast_memref(gen, &block, src_val, src_ty, t)?;
             }
         }
 
@@ -464,6 +460,8 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
             let saved_ast_env = gen.ast_env.clone();
             let saved_allocs = gen.allocs.clone();
             let saved_returned = gen.has_returned;
+            // An `assert` in the body is a fact about the body, not about the rest of the caller.
+            let saved_facts = gen.assert_facts.len();
 
             let src_sym = body_fn.params[0].0.clone();
             let dst_sym = body_fn.params[1].0.clone();
@@ -496,6 +494,7 @@ impl<'c> LowerToMelior<'c> for syntax::TransferExpr {
             gen.ast_env = saved_ast_env;
             gen.allocs = saved_allocs;
             gen.has_returned = saved_returned;
+            gen.assert_facts.truncate(saved_facts);
         }
 
         Ok((result_val, target_ty, block))

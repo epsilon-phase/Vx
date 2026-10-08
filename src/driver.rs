@@ -1272,7 +1272,10 @@ impl CompilerDriver {
 
         let module = match flat_module {
             Some(m) => {
-                eprintln!("[flat-codegen] emitted module via the flat path");
+                // Quiet by default: the flat path is the usual one. VX_FLAT_DBG asks for the line.
+                if std::env::var("VX_FLAT_DBG").is_ok() {
+                    eprintln!("[flat-codegen] emitted module via the flat path");
+                }
                 m
             }
             None if !interfaces.is_empty() => {

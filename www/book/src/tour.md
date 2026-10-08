@@ -142,7 +142,31 @@ fn main() -> i32 {
 ```
 
 A tuple has two to six elements. Patterns nest, `let ((a, _), c) = t;`, and `_` skips an element.
-Tuple patterns in `match` are not supported yet.
+
+`match` takes a tuple apart too. A literal in a pattern must equal that element, and a name binds
+it. The last arm must match every value, such as `_` or `(x, y)`:
+
+```rust
+fn sign_pair(a: i64, b: i64) -> i64 {
+    match (a, b) {
+        (0, 0) => { return 0; },
+        (0, y) => { return y; },
+        (x, _) => { return x; }
+    }
+}
+```
+
+An element of a pattern can also be an enum variant, which binds its payload:
+
+```rust
+fn add(a: Option<i64>, b: Option<i64>) -> i64 {
+    match (a, b) {
+        (Option<i64>::Some(x), Option<i64>::Some(y)) => { return x + y; },
+        (Option<i64>::Some(x), _) => { return x; },
+        _ => { return 0; }
+    }
+}
+```
 
 ## Enums and pattern matching
 
@@ -181,6 +205,24 @@ fn pick(x : i32) -> i32 {
     match x { 0 => { 7 }, _ => { 9 } }
 }
 ```
+
+## Stopping a program
+
+`panic(msg)` prints `panic: ` and the message, then stops the program; `abort()` stops it with no
+message. A function declared `-> !` never returns, like `core::panic`'s `unreachable()`, `todo()`
+and `unimplemented()`. A function can end with a call to one, and the call can stand where any
+value is expected:
+
+```rust
+import core::panic;
+
+fn get(ok: bool, v: i64) -> i64 {
+    let x: i64 = if ok { v } else { todo() };
+    return x;
+}
+```
+
+`Option::expect(msg)` and `Result::expect(msg)` stop the program with the caller's message.
 
 ## Arrays and tensors
 

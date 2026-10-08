@@ -131,9 +131,11 @@ impl<'a> TypeChecker<'a> {
     /// This allows the Non-Lexical Lifetimes (NLL) borrow checker to query its `is_variable_used_after`
     /// in O(1) time instead of performing an O(N^2) AST tree-walk!
     pub(crate) fn check_block(&mut self, body: &mut Vec<Statement>, return_type: &Type) {
+        Self::name_loop_literals(body);
         let mut terminated = false;
 
         // 1. Liveness Analysis Pass
+        self.hoist_spawn_allocations(body);
         let last_use = Self::compute_block_liveness(body);
 
         self.borrow.enter_block(last_use);
@@ -222,7 +224,19 @@ impl<'a> TypeChecker<'a> {
                 let op = op.clone();
                 self.check_assign_stmt(lhs, Some(&op), rhs, consume, Some(operand_ty))
             }
-            Statement::Return(ret) => self.check_return_stmt(ret, consume, return_type),
+            Statement::Return(ret) => {
+                if self.check_return_stmt(ret, consume, return_type) {
+                    // `return todo()`: the call never finishes, so nothing is returned. Keep the
+                    // call as a statement, which the code generators end the block after.
+                    let expr = ret.expr.take().expect("a returned value was checked");
+                    let span = ret.span;
+                    *stmt = Statement::ExprStmt(ExprStmtStmt {
+                        expr,
+                        has_semi: true,
+                        span,
+                    });
+                }
+            }
             Statement::ExprStmt(ExprStmtStmt {
                 expr,
                 has_semi: _,
@@ -417,6 +431,37 @@ impl<'a> TypeChecker<'a> {
         })
     }
 
+    /// `for x in [1, 2, 3]` loops over the tensor the literal makes. The literal is bound to a
+    /// variable first, so the loop reads it by index as it does a tensor variable.
+    pub(crate) fn name_loop_literals(stmts: &mut Vec<Statement>) {
+        let mut i = 0;
+        while i < stmts.len() {
+            if let Statement::ForLoop(f) = &mut stmts[i] {
+                if matches!(&*f.iterable, Expr::Array(a)
+                    if !a.elements.iter().any(|el| matches!(el, Expr::Array(_))))
+                {
+                    let name = format!("$for_items_{}_{}", f.span.line, f.span.column);
+                    let span = f.span;
+                    let literal = std::mem::replace(
+                        &mut *f.iterable,
+                        Expr::Identifier(syntax::expr::IdentifierExpr {
+                            name: name.as_str().into(),
+                            span,
+                        }),
+                    );
+                    stmts.insert(
+                        i,
+                        Statement::LetDecl(syntax::stmt::LetDeclStmt::new(
+                            name, false, None, literal, span,
+                        )),
+                    );
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
     fn check_for_loop_stmt(&mut self, floop: &mut ForLoopStmt, consume: bool, return_type: &Type) {
         let ForLoopStmt {
             iter,
@@ -427,6 +472,66 @@ impl<'a> TypeChecker<'a> {
             next_fn,
         } = floop;
         let loop_span = *loop_span;
+        // `for x in t` over a tensor reads it by index: `for $i in 0..t.len() { let x = t[$i]; .. }`.
+        // A tensor of rank 2 or more gives its rows.
+        if matches!(&**iterable, Expr::Array(_))
+            || matches!(self.check_expr_type_probe(iterable), Type::Tensor(..))
+        {
+            if let Expr::Identifier(id) = &**iterable {
+                let index = format!("$for_index_{}_{}", loop_span.line, loop_span.column);
+                let name = |n: &str| {
+                    Expr::Identifier(syntax::expr::IdentifierExpr {
+                        name: n.into(),
+                        span: loop_span,
+                    })
+                };
+                let item = Expr::IndexAccess(syntax::expr::IndexAccessExpr::new(
+                    Box::new(Expr::Identifier(id.clone())),
+                    Box::new(name(&index)),
+                    loop_span,
+                ));
+                let len = Self::method_call_on(Expr::Identifier(id.clone()), "len", loop_span);
+                body.insert(
+                    0,
+                    Statement::LetDecl(syntax::stmt::LetDeclStmt::new(
+                        iter.clone(),
+                        false,
+                        None,
+                        item,
+                        loop_span,
+                    )),
+                );
+                **iterable = Expr::Range(syntax::expr::RangeExpr::new(
+                    Box::new(Expr::Number(syntax::expr::NumberExpr::new(
+                        "0".to_string(),
+                        Some(ElementType::I32),
+                        loop_span,
+                    ))),
+                    Box::new(len),
+                    loop_span,
+                ));
+                *iter = index;
+            } else if !self.speculating {
+                let message = if matches!(&**iterable, Expr::Array(_)) {
+                    "a `for` loop cannot go over a nested array literal; make it with \
+                     `Tensor<T>([[..], [..]])` and bind it with `let` first"
+                } else {
+                    "a `for` loop over a tensor reads it by index, so the tensor needs a name: \
+                     bind it with `let` first"
+                };
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3046,
+                    message.to_string(),
+                    // An array literal has no position of its own; the loop has.
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(
+                        &match &**iterable {
+                            Expr::Array(_) => loop_span,
+                            other => other.span(),
+                        },
+                    )),
+                );
+            }
+        }
         // `for x in it` consumes `it`, as Rust's does: the loop drives a copy of the
         // iterator to exhaustion, so letting the name live on would hand back a value
         // that had not moved.
@@ -574,6 +679,9 @@ impl<'a> TypeChecker<'a> {
             };
         }
 
+        if next_fn.is_some() {
+            self.drops_bind_loop_item(iter, body, &iter_ty);
+        }
         self.insert(iter.clone(), iter_ty); // Still assuming i64 for most things, but it works for our current test cases.
 
         // Prove invariants hold on entry, then assume them inside the loop
@@ -849,9 +957,21 @@ impl<'a> TypeChecker<'a> {
         if let Some(root) = self.read_only_root(lhs) {
             self.report_read_only(&root, "it cannot be assigned", &lhs.span());
         }
+        // `*v.at_mut(i) = x`, or `v[i] = x` through `IndexMut`, writes through a reference
+        // the call returns and nothing keeps, so the borrow it makes ends with the statement.
+        // The check is what turns `v[i]` into that call, so the place is looked at after it.
+        let before_lhs = self.borrow.snapshot();
         self.checking_assign_lhs = true;
         let lhs_ty = self.check_expr_type_flag(lhs, false);
         self.checking_assign_lhs = false;
+        let temporary_place = matches!(lhs, Expr::Dereference(d)
+            if matches!(*d.expr, Expr::FunctionCall(_) | Expr::MethodCall(_)));
+        // Rust evaluates the value before the place it goes into, so the place's mutable borrow is
+        // only reserved while the right-hand side is checked: `v[i] = v[i] + 1` reads `v` there.
+        let lhs_borrows = temporary_place.then(|| {
+            let added = self.borrow.added_since(&before_lhs);
+            self.borrow.reserve(&added)
+        });
         if let Some(shared) = self.shared_reference_in_place(lhs) {
             if !self.speculating {
                 self.errors.error_with_code(
@@ -885,6 +1005,9 @@ impl<'a> TypeChecker<'a> {
         // defaulting and mismatching (#240).
         let mut rhs_ty = self.check_expr_expecting(rhs, Some(lhs_ty.clone()), consume);
         self.current_assignment_target = None;
+        if let Some(borrows) = lhs_borrows {
+            self.borrow.forget(&borrows);
+        }
         // `s += r` with `r : &i64` adds the number `r` points at, as `s + r` does.
         if op.is_some() && matches!(lhs_ty, Type::Scalar(_)) {
             if let Some(t) = Self::deref_number_operand(rhs, &rhs_ty) {
@@ -1162,8 +1285,22 @@ impl<'a> TypeChecker<'a> {
 
     /// Check a `return`: type the returned expression against the declared return type, run the
     /// return-escape analysis (#243), and bind `return` for `ensures` constraints.
-    fn check_return_stmt(&mut self, ret: &mut ReturnStmt, consume: bool, return_type: &Type) {
+    /// Returns whether the returned expression has the type `!`, so never finishes.
+    fn check_return_stmt(
+        &mut self,
+        ret: &mut ReturnStmt,
+        consume: bool,
+        return_type: &Type,
+    ) -> bool {
         let ReturnStmt { expr, span } = ret;
+
+        if crate::syntax::is_never_ty(return_type) {
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E3002,
+                "this function is declared `-> !`, so it cannot return".to_string(),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+            );
+        }
 
         // `return;` -- valid only where there is no value to return. Everything below types a
         // returned expression, so there is nothing left to do once the function type is checked.
@@ -1176,7 +1313,7 @@ impl<'a> TypeChecker<'a> {
                 );
             }
             self.drops_exit("return", span.line, false);
-            return;
+            return false;
         };
 
         let prev_expected = self.expected_type.take();
@@ -1226,7 +1363,8 @@ impl<'a> TypeChecker<'a> {
             );
         }
 
-        // Bind 'return' to this expression in the constraints so `ensures` clauses can use it
+        // Each `ensures` must hold here, from what is known on this path, with `return` standing
+        // for this value.
         let return_ident = Expr::Identifier(IdentifierExpr {
             name: "return".to_string().into(),
             span: *span,
@@ -1238,7 +1376,24 @@ impl<'a> TypeChecker<'a> {
             span: *span,
             operand_ty: None,
         });
-        self.consteval.return_constraints.push(return_eq);
+        let ensures = self.consteval.current_ensures.clone();
+        if !ensures.is_empty() && !self.speculating {
+            self.consteval.constraints.push(return_eq);
+            for ens in &ensures {
+                if !self.prove_expr(ens) {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E8001,
+                        format!(
+                            "Function '{}' cannot prove postcondition (ensures) at compile time",
+                            self.current_function
+                        ),
+                        Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+                    );
+                }
+            }
+            self.consteval.constraints.pop();
+        }
+        crate::syntax::is_never_ty(&ty)
     }
 
     /// Check an `assert`: require a boolean condition, evaluate it at comptime when possible, and
@@ -1291,27 +1446,90 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// `e` with each call replaced by a fresh name, `$call_N`. For a callee that declares
+    /// `ensures`, each one is pushed onto `facts` with the call's arguments in place of the
+    /// parameters and the fresh name in place of `return`.
+    fn abstract_calls(&self, e: &Expr, calls: &mut usize, facts: &mut Vec<Expr>) -> Expr {
+        let mut sub = |x: &Expr| Box::new(self.abstract_calls(x, calls, facts));
+        match e {
+            Expr::FunctionCall(c) => {
+                let args: Vec<Expr> = c.args.iter().map(|a| *sub(a)).collect();
+                let result = Expr::Identifier(IdentifierExpr {
+                    name: format!("$call_{}", *calls).into(),
+                    span: c.span,
+                });
+                *calls += 1;
+                if let Some(func) = self.env.syntax_functions.get(c.name.as_ref()) {
+                    let mut names: HashMap<crate::symbol::Symbol, Expr> = func
+                        .params
+                        .iter()
+                        .map(|(p, _)| p.clone())
+                        .zip(args)
+                        .collect();
+                    names.insert("return".into(), result.clone());
+                    for ens in &func.ensures {
+                        facts.push(hir::prover::substitute_names(ens, &names));
+                    }
+                }
+                result
+            }
+            Expr::BinaryOp(b) => {
+                let mut b = b.clone();
+                b.lhs = sub(&b.lhs);
+                b.rhs = sub(&b.rhs);
+                Expr::BinaryOp(b)
+            }
+            Expr::RelationalOp(r) => {
+                let mut r = r.clone();
+                r.lhs = sub(&r.lhs);
+                r.rhs = sub(&r.rhs);
+                Expr::RelationalOp(r)
+            }
+            Expr::LogicalOp(l) => {
+                let mut l = l.clone();
+                l.lhs = sub(&l.lhs);
+                l.rhs = sub(&l.rhs);
+                Expr::LogicalOp(l)
+            }
+            Expr::UnaryOp(u) => {
+                let mut u = u.clone();
+                u.expr = sub(&u.expr);
+                Expr::UnaryOp(u)
+            }
+            _ => e.clone(),
+        }
+    }
+
     pub(crate) fn prove_expr(&mut self, expr: &Expr) -> bool {
         let mut prover = hir::prover::SmtProver::new();
-        for constraint in &self.consteval.constraints {
-            if let Err(e) = prover.add_constraint(constraint) {
-                // If we can't lower a constraint, we log a warning
-                self.errors
-                    .push_warning(format!("Could not add constraint to SMT solver: {}", e));
+        // Each call becomes a fresh name, and the callee's `ensures` become facts about it.
+        let mut calls = 0;
+        let mut facts = Vec::new();
+        let constraints: Vec<Expr> = self
+            .consteval
+            .constraints
+            .iter()
+            .map(|c| self.abstract_calls(c, &mut calls, &mut facts))
+            .collect();
+        let goal = self.abstract_calls(expr, &mut calls, &mut facts);
+        // A fact the prover cannot express is left out, so it knows less and proves less. Say so,
+        // or a later "cannot prove" has no visible cause.
+        for constraint in constraints.iter().chain(&facts) {
+            if let Err(what) = prover.add_constraint(constraint) {
+                self.errors.push_warning(format!(
+                    "the prover ignores a condition here: it cannot reason about {what}"
+                ));
             }
         }
 
-        // To prove `expr` holds under `constraints`, we assert `!expr` and check for unsatisfiability.
+        // To prove `goal` holds under the facts, assert `!goal` and check for unsatisfiability.
         let negated_expr = Expr::UnaryOp(UnaryOpExpr {
             op: UnaryOp::Not,
-            expr: Box::new(expr.clone()),
+            expr: Box::new(goal),
             span: Span::default(),
         });
-
-        if let Err(e) = prover.add_constraint(&negated_expr) {
-            self.errors
-                .push_warning(format!("Could not lower expression to SMT solver: {}", e));
-            return false; // Can't prove
+        if prover.add_constraint(&negated_expr).is_err() {
+            return false;
         }
 
         match prover.prove() {

@@ -26,6 +26,15 @@ impl<'a> TypeChecker<'a> {
     /// the discipline, and none of them can declare itself `Copy`, so they stay linear with
     /// no special case. Duplicating placed data is still an explicit `transfer`.
     pub(crate) fn is_copy(&mut self, ty: &Type) -> bool {
+        // The built-in kinds that are `Copy` whatever impls exist, as in Rust: numbers and
+        // `bool`, shared references, raw pointers and functions.
+        match ty {
+            Type::Scalar(e) if !matches!(e, ElementType::Generic(_)) => return true,
+            Type::Borrow { is_mut: false, .. } | Type::Pointer(..) | Type::Function(..) => {
+                return true
+            }
+            _ => {}
+        }
         let Some(impls) = self.env.impls.get("Copy") else {
             return false;
         };
@@ -161,6 +170,48 @@ impl<'a> TypeChecker<'a> {
             Expr::AsCast(c) => Self::collect_identifiers(&c.expr, out),
             _ => {}
         }
+    }
+
+    /// E6003: `what`, of type `ty` on `top`, lives where the active topology cannot see it, and
+    /// a transfer of `cost` would bring it here. The message names the memory, what the active
+    /// topology sees, and the transfer to write.
+    fn report_needs_transfer(
+        &mut self,
+        what: &str,
+        ty: &Type,
+        top: &Topology,
+        cost: u32,
+        span: &crate::syntax::Span,
+    ) {
+        let src = self.value_memory_space(ty, top);
+        let dst = self
+            .transfer_cost_graph
+            .default_memory_for(&self.active_topology);
+        let visible = self
+            .transfer_cost_graph
+            .descriptor(&self.active_topology.kind())
+            .map(|d| {
+                d.visibility
+                    .iter()
+                    .map(|s| s.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        self.errors.error_with_code(
+            crate::diagnostic::DiagnosticCode::E6003,
+            format!(
+                "'{}' lives in {} but {} sees only [{}]; insert an explicit transfer to {} \
+                 (cost {} on the declared path)",
+                what,
+                src.name(),
+                self.active_topology.display_name(),
+                visible,
+                dst.name(),
+                cost
+            ),
+            Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+        );
     }
 
     pub(crate) fn check_identifier_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
@@ -325,12 +376,15 @@ impl<'a> TypeChecker<'a> {
 
                 match lookup_res {
                     Some((ty, top)) => {
-                        // Enforce Topology Boundaries!
-                        let is_valid = self.transfer_cost_graph.is_type_accessible(
-                            &self.active_topology,
-                            &top,
-                            &ty,
-                        );
+                        // Enforce Topology Boundaries! A reference to a placed tensor is only a
+                        // pointer, so naming it reads nothing; indexing and `print` check the
+                        // tensor's placement where the data is read.
+                        let is_valid = matches!(&ty, Type::Borrow { inner, .. } if inner.placement().is_some())
+                            || self.transfer_cost_graph.is_type_accessible(
+                                &self.active_topology,
+                                &top,
+                                &ty,
+                            );
 
                         if !is_valid {
                             let is_pinned_on_host = matches!(ty, Type::Pinned(_, _))
@@ -432,37 +486,12 @@ impl<'a> TypeChecker<'a> {
                                             // handoff (e.g. an un-transferred KV cache in a
                                             // disaggregated prefill/decode split) is a compile
                                             // error carrying its own remedy (#253).
-                                            let src = self.value_memory_space(&ty, &top);
-                                            let dst = self
-                                                .transfer_cost_graph
-                                                .default_memory_for(&self.active_topology);
-                                            let visible = self
-                                                .transfer_cost_graph
-                                                .descriptor(&self.active_topology.kind())
-                                                .map(|d| {
-                                                    d.visibility
-                                                        .iter()
-                                                        .map(|s| s.name())
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ")
-                                                })
-                                                .unwrap_or_default();
-                                            self.errors.error_with_code(
-                                                crate::diagnostic::DiagnosticCode::E6003,
-                                                format!(
-                                                    "'{}' lives in {} but {} sees only [{}]; \
-                                                     insert an explicit transfer to {} (cost {} \
-                                                     on the declared path)",
-                                                    name,
-                                                    src.name(),
-                                                    self.active_topology.display_name(),
-                                                    visible,
-                                                    dst.name(),
-                                                    cost
-                                                ),
-                                                Some(crate::diagnostic::SourceSpan::from_ast_span(
-                                                    &span,
-                                                )),
+                                            self.report_needs_transfer(
+                                                name.as_ref(),
+                                                &ty,
+                                                &top,
+                                                cost,
+                                                &span,
                                             );
                                         }
                                         Reachability::Unreachable => self.errors.push(format!(
@@ -696,8 +725,9 @@ impl<'a> TypeChecker<'a> {
                             .push(format!("Module '{}' does not export '{}'", path, member));
                     }
                 } else if member.as_ref() == "$extent" {
-                    // The form `t.extent(i)` is rewritten to; no source spells this member.
-                    return Type::Tensor(ElementType::I32, vec![], None);
+                    // The form `t.extent(i)` is rewritten to; no source spells this member. It
+                    // is the list of the tensor's extents, indexed by axis.
+                    return Type::Tensor(ElementType::I32, vec![crate::syntax::Dim::Dyn], None);
                 } else if member.as_ref() == "shape" && Self::tensor_operand_elem(&obj_ty).is_some()
                 {
                     self.errors.error_with_code(
@@ -762,7 +792,41 @@ impl<'a> TypeChecker<'a> {
         None
     }
 
-    pub(crate) fn check_indexaccess_expr(&mut self, expr: &mut Expr) -> Type {
+    pub(crate) fn check_indexaccess_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
+        // `a[i]` on a struct or an enum whose type implements `Index` reads `*a.index(i)`, and
+        // a write, `a[i] = x`, goes through `*a.index_mut(i)`, as in Rust.
+        if let Expr::IndexAccess(IndexAccessExpr {
+            base, index, span, ..
+        }) = expr
+        {
+            let method = if self.checking_assign_lhs {
+                "index_mut"
+            } else {
+                "index"
+            };
+            let ty = self.operand_type(base);
+            if Self::is_user_type(&ty)
+                && self
+                    .resolve_method_in_impls(&ty, &method.into(), &mut HashMap::new())
+                    .is_some()
+            {
+                let span = *span;
+                let mut read = Expr::Dereference(crate::syntax::expr::DereferenceExpr {
+                    expr: Box::new(Expr::MethodCall(crate::syntax::MethodCallExpr {
+                        base: base.clone(),
+                        method_name: method.into(),
+                        type_args: None,
+                        args: vec![(**index).clone()],
+                        span,
+                    })),
+                    ty: None,
+                    span,
+                });
+                let t = self.check_expr_type_flag(&mut read, consume);
+                *expr = read;
+                return t;
+            }
+        }
         match expr {
             Expr::IndexAccess(IndexAccessExpr {
                 base: obj,
@@ -830,11 +894,37 @@ impl<'a> TypeChecker<'a> {
                         &obj_ty,
                     ) && !self.speculating
                     {
-                        self.errors.push(format!(
-                            "Cross-topology access error: a value on {} cannot be read from {}",
-                            value_top.display_name(),
-                            self.active_topology.display_name()
-                        ));
+                        // A place whose root variable is not placed itself, such as the field
+                        // `h.t` of a struct, was not named by the check on the variable, so name
+                        // it here with the transfer that fixes it.
+                        let unnamed_place =
+                            crate::hir::places::base_and_path(obj).filter(|(root, path)| {
+                                !path.is_empty()
+                                    && self.lookup_with_depth(root.as_ref()).is_some_and(
+                                        |(t, _, _)| {
+                                            t.placement().is_none()
+                                                && !matches!(t, Type::Pinned(..))
+                                        },
+                                    )
+                            });
+                        let reach = self.transfer_cost_graph.reachable(
+                            &self.active_topology,
+                            &value_top,
+                            &obj_ty,
+                        );
+                        match (unnamed_place, reach) {
+                            (Some((root, path)), crate::arch::Reachability::NeedsSeam { cost }) => {
+                                let what = crate::hir::places::display_place(root.as_ref(), &path);
+                                self.report_needs_transfer(
+                                    &what, &obj_ty, &value_top, cost, &ix_span,
+                                );
+                            }
+                            _ => self.errors.push(format!(
+                                "Cross-topology access error: a value on {} cannot be read from {}",
+                                value_top.display_name(),
+                                self.active_topology.display_name()
+                            )),
+                        }
                     }
                 }
 
@@ -900,16 +990,30 @@ impl<'a> TypeChecker<'a> {
                     // `memref.load` on the struct value here (Vx#398). A store place
                     // (`v[i] = x`) and a speculative probe keep the typed-only answer: the
                     // first is not a read, the second must not mutate the AST.
+                    //
+                    // `get` hands out a copy, so it exists only for a `Copy` element. Any other
+                    // element is read through a reference, `*v.get_ref(i)`, which moving out of
+                    // is E4008, as in Rust.
                     if !self.speculating && !self.checking_assign_lhs {
-                        let mut call = Expr::MethodCall(crate::syntax::MethodCallExpr {
+                        let by_copy = elem.has_generic_params() || self.is_copy(&elem);
+                        let call = Expr::MethodCall(crate::syntax::MethodCallExpr {
                             base: obj.clone(),
-                            method_name: "get".into(),
+                            method_name: if by_copy { "get" } else { "get_ref" }.into(),
                             type_args: None,
                             args: vec![(**idx).clone()],
                             span: ix_span,
                         });
-                        let t = self.check_methodcall_expr(&mut call, false);
-                        *expr = call;
+                        let mut read = if by_copy {
+                            call
+                        } else {
+                            Expr::Dereference(crate::syntax::expr::DereferenceExpr {
+                                expr: Box::new(call),
+                                ty: None,
+                                span: ix_span,
+                            })
+                        };
+                        let t = self.check_expr_type_flag(&mut read, consume);
+                        *expr = read;
                         return t;
                     }
                     elem
@@ -958,7 +1062,14 @@ impl<'a> TypeChecker<'a> {
                 is_mut,
                 span,
             }) => {
+                // Taking a reference to a placed tensor reads nothing. The reference keeps the
+                // placement in its type, so each read through it is checked where it happens.
+                let borrows_placed = Self::extract_base_and_path(inner).is_some()
+                    && self.check_expr_type_probe(inner).placement().is_some();
+                let old_allow = self.allow_cross_topology;
+                self.allow_cross_topology |= borrows_placed;
                 let inner_ty = self.check_expr_type_flag(inner, false);
+                self.allow_cross_topology = old_allow;
                 if *is_mut {
                     if let Some(root) = self.read_only_root(inner) {
                         self.report_read_only(&root, "it cannot be borrowed `&mut`", span);
@@ -1203,18 +1314,6 @@ impl<'a> TypeChecker<'a> {
                 // `|| &x`) or a body local is an escape — keep the env so its `Local` provenance is
                 // seen. The closure's own return summary tells them apart.
                 let name = fc.name.as_ref();
-                // A callee whose every `return` is `&*p` or `&mut *p` of a raw pointer hands
-                // back raw memory -- a `Vec`'s heap, through `as_mut_slice` -- which no
-                // argument's lifetime constrains, since a raw pointer has none. Without this
-                // the `&mut tmp` the checker passes as a method's receiver made the result
-                // look like a borrow of the temporary.
-                //
-                // Safe today only because nothing frees that memory early. Once a `Vec` is
-                // dropped at the end of its scope (#495), a slice that outlives it is a
-                // use-after-free, and this rule has to go.
-                if self.callee_returns_through_raw_pointer(name) {
-                    return Some(RefProvenance::External);
-                }
                 let is_closure_call =
                     name.starts_with("Closure_") && name.ends_with("_call") && !fc.args.is_empty();
                 let skip_env = is_closure_call
@@ -1290,91 +1389,6 @@ impl<'a> TypeChecker<'a> {
                 Self::join_provenances(parts)
             }
             _ => None,
-        }
-    }
-
-    /// Does every `return` in `name`'s body reborrow through a raw pointer (`&*p`,
-    /// `&mut *p`, with `p` a raw-pointer parameter or local)? Then its result points at raw
-    /// memory and not at any argument. Unknown callees answer no.
-    fn callee_returns_through_raw_pointer(&self, name: &str) -> bool {
-        let Some((func, _)) = self
-            .mono
-            .functions
-            .iter()
-            .find(|f| f.0.name.as_ref() == name)
-        else {
-            return false;
-        };
-        let mut raw: std::collections::HashSet<String> = func
-            .params
-            .iter()
-            .filter(|(_, t)| matches!(t, Type::Pointer(..)))
-            .map(|(n, _)| n.to_string())
-            .collect();
-        let mut returns: Vec<&Expr> = Vec::new();
-        Self::collect_returns_and_raw_locals(&func.body, &mut raw, &mut returns);
-        !returns.is_empty()
-            && returns
-                .iter()
-                .all(|e| Self::is_reborrow_of_raw_pointer(e, &raw))
-    }
-
-    fn collect_returns_and_raw_locals<'e>(
-        stmts: &'e [Statement],
-        raw: &mut std::collections::HashSet<String>,
-        returns: &mut Vec<&'e Expr>,
-    ) {
-        for s in stmts {
-            match s {
-                Statement::LetDecl(l) => {
-                    if matches!(l.ty_ann, Some(Type::Pointer(..))) {
-                        raw.insert(l.name.to_string());
-                    }
-                }
-                Statement::Return(r) => {
-                    if let Some(e) = &r.expr {
-                        returns.push(e);
-                    }
-                }
-                Statement::Loop(l) => Self::collect_returns_and_raw_locals(&l.body, raw, returns),
-                Statement::ForLoop(f) => {
-                    Self::collect_returns_and_raw_locals(&f.body, raw, returns)
-                }
-                Statement::ExprStmt(e) => match &e.expr {
-                    Expr::If(i) => {
-                        Self::collect_returns_and_raw_locals(&i.then_block, raw, returns);
-                        if let Some(eb) = &i.else_block {
-                            Self::collect_returns_and_raw_locals(eb, raw, returns);
-                        }
-                    }
-                    Expr::Match(m) => {
-                        for arm in &m.arms {
-                            Self::collect_returns_and_raw_locals(&arm.body, raw, returns);
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-    }
-
-    fn is_reborrow_of_raw_pointer(expr: &Expr, raw: &std::collections::HashSet<String>) -> bool {
-        match expr {
-            Expr::UnsafeBlock(u) => match (&u.ret, u.stmts.last()) {
-                (Some(r), _) => Self::is_reborrow_of_raw_pointer(r, raw),
-                (None, Some(Statement::ExprStmt(e))) if !e.has_semi => {
-                    Self::is_reborrow_of_raw_pointer(&e.expr, raw)
-                }
-                _ => false,
-            },
-            Expr::Borrow(b) => match &*b.expr {
-                Expr::Dereference(d) => {
-                    matches!(&*d.expr, Expr::Identifier(id) if raw.contains(id.name.as_ref()))
-                }
-                _ => false,
-            },
-            _ => false,
         }
     }
 
