@@ -150,7 +150,7 @@ matrix, but enough to flip a marginal cell.
 | `L2` capacity and bandwidth | **unverified** — transcribed from architecture whitepapers from memory |
 | `SMEM` capacity | **unverified** — per-SM/CU configurable maximum |
 | **arc-a770** capacities (`HBM`, `L2`, `SMEM`) | **measured 2026-10-04** — device-reported figures from Level Zero, OpenCL and Vulkan queries on the card (16 GiB part; 15.11 GiB reported usable, recorded in the file) |
-| **arc-a770** `HBM` bandwidth (512 GB/s) | **unverified** — derived from a secondary source's 16 Gbps effective memory clock (256-bit bus); Intel's own figure was not readable from its product page, and 17.5 Gbps would make it 560 GB/s |
+| **arc-a770** `HBM` bandwidth (560 GB/s) | **unverified** — derived from the 16 GB card's 17.5 Gbps effective memory clock (256-bit bus); the 512 GB/s sometimes quoted for the part is the 8 GB card; Intel's own figure was not readable from its product page |
 | **arc-a770** `SMEM` and `L2` bandwidths | **absent on purpose** — not published for this part, so the on-die hops are left unpriceable rather than priced by a guess |
 | **cortex-m7** capacities (AXI SRAM, DTCM, L1 D-cache) | **verified 2026-09-17** — quoted from the ST datasheet (DS12110) |
 | **cortex-m7** bandwidths | **unverified** — derived from bus width x clock (64-bit AXI at 240 MHz; 64-bit TCM at the 480 MHz core clock), not quoted |
