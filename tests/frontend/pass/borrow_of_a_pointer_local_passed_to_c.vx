@@ -10,10 +10,11 @@
 // address of the local's stack slot, passed as a plain pointer.
 //
 // The flat path used to give up on the whole function here and fall back to the
-// AST path, so the first check is that it did not. `makes_handle` is not a real
-// library function, so only the MLIR is checked.
+// AST path, so the first check is that it did not. VX_FLAT_DBG asks the compiler
+// to say which path it took. `makes_handle` is not a real library function, so
+// only the MLIR is checked.
 //===----------------------------------------------------------------------===//
-// RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// RUN: VX_FLAT_DBG=1 vxc %s --action emit-mlir 2>&1 | FileCheck %s
 // CHECK: emitted module via the flat path
 // CHECK: [[SLOT:%.*]] = llvm.alloca %{{.*}} x !llvm.ptr : (i32) -> !llvm.ptr
 // CHECK: call @makes_handle([[SLOT]]) : (!llvm.ptr) -> i32

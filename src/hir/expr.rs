@@ -97,6 +97,8 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub(crate) fn check_expr_block(&mut self, stmts: &mut Vec<Statement>, consume: bool) -> Type {
+        Self::name_loop_literals(stmts);
+        self.hoist_spawn_allocations(stmts);
         let block_unused = std::mem::replace(&mut self.value_unused, false);
         let mut ret_ty = Type::Struct("void".into(), None);
         let mut terminated = false;
@@ -133,6 +135,11 @@ impl<'a> TypeChecker<'a> {
                 self.value_unused = *has_semi || i != last || block_unused;
                 let ty = self.check_expr_type_flag(expr, consume);
                 if !*has_semi {
+                    // A last expression that never finishes, `todo()`, gives the block the type
+                    // `!` but no value: it is a statement, after which nothing runs.
+                    if crate::syntax::is_never_ty(&ty) {
+                        *has_semi = true;
+                    }
                     ret_ty = ty;
                 }
                 self.borrow.restore(saved_borrows);
@@ -234,7 +241,7 @@ impl<'a> TypeChecker<'a> {
             Expr::IndirectCall(..) => self.check_indirectcall_expr(expr, consume),
             Expr::Array(..) => self.check_array_expr(expr),
             Expr::MemberAccess(..) => self.check_memberaccess_expr(expr),
-            Expr::IndexAccess(..) => self.check_indexaccess_expr(expr),
+            Expr::IndexAccess(..) => self.check_indexaccess_expr(expr, consume),
             Expr::MethodCall(..) => self.check_methodcall_expr(expr, consume),
             Expr::BinaryOp(..) => self.check_binaryop_expr(expr, consume),
             Expr::RelationalOp(..) => self.check_relationalop_expr(expr),
@@ -366,7 +373,9 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub(crate) fn is_assignable(&self, target: &Type, source: &Type) -> bool {
-        if target == source {
+        // A value of type `!` never exists, since the expression never finishes, so it fits
+        // wherever a value is expected.
+        if target == source || crate::syntax::is_never_ty(source) {
             return true;
         }
 
@@ -483,25 +492,23 @@ impl<'a> TypeChecker<'a> {
                 // Rank is static and no cast changes it. Per dimension, a `?` in the target
                 // accepts any extent and a static extent accepts only itself: `[512, 8]` widens
                 // to `[?, 8]`, and `[?, 8]` does not narrow to `[512, 8]` without saying so.
-                if !dims_target.is_empty() && !dims_source.is_empty() {
-                    if dims_target.len() != dims_source.len() {
+                if dims_target.len() != dims_source.len() {
+                    return false;
+                }
+                let empty_env = std::collections::HashMap::new();
+                for (dt, ds) in dims_target.iter().zip(dims_source.iter()) {
+                    let Some(et) = dt.as_static() else { continue };
+                    let Some(es) = ds.as_static() else {
                         return false;
-                    }
-                    let empty_env = std::collections::HashMap::new();
-                    for (dt, ds) in dims_target.iter().zip(dims_source.iter()) {
-                        let Some(et) = dt.as_static() else { continue };
-                        let Some(es) = ds.as_static() else {
-                            return false;
-                        };
-                        let vt = self.eval_expr(et, &empty_env);
-                        let vs = self.eval_expr(es, &empty_env);
-                        if vt.is_some() && vs.is_some() {
-                            if vt != vs {
-                                return false;
-                            }
-                        } else if et != es {
+                    };
+                    let vt = self.eval_expr(et, &empty_env);
+                    let vs = self.eval_expr(es, &empty_env);
+                    if vt.is_some() && vs.is_some() {
+                        if vt != vs {
                             return false;
                         }
+                    } else if et != es {
+                        return false;
                     }
                 }
                 return true;

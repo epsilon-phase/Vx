@@ -69,9 +69,21 @@ pub fn scalar_of(ty: &Type) -> Option<ElementType> {
 }
 
 /// Whether a return type is `void` — spelled `Type::Struct("void", _)`. A void-returning call
-/// produces no result value; the flat emitter prints `-> ()`.
+/// produces no result value; the flat emitter prints `-> ()`. `!` counts too: a function that
+/// never returns has no result value either.
 pub fn is_void_ty(ty: &Type) -> bool {
     matches!(ty, Type::Struct(n, _) if n.as_ref() == "void" || n.as_ref() == "none")
+        || is_never_ty(ty)
+}
+
+/// The return type `!`: the function never returns. Spelled `Type::Struct("!", _)`, like `void`.
+pub fn never_ty() -> Type {
+    Type::Struct("!".into(), None)
+}
+
+/// Whether a return type is `!`.
+pub fn is_never_ty(ty: &Type) -> bool {
+    matches!(ty, Type::Struct(n, _) if n.as_ref() == "!")
 }
 
 /// A module's top-level names mapped to their GIDs, and every module's table by module path.
@@ -809,8 +821,9 @@ impl Type {
             | Type::Matrix
             | Type::Verified(_)
             | Type::Pinned(_, _)
-            | Type::Struct(_, _)
             | Type::Enum(_, _) => true,
+            // `void` is spelled as a struct, but there is nothing in it to move.
+            Type::Struct(..) => !is_void_ty(self),
             // `Option<Noisy>` or `W<i32>` moves as `Noisy` and `W` do.
             Type::GenericInstance(base, _) => base.is_linear(),
             _ => false,
@@ -910,6 +923,26 @@ impl Type {
     /// `Pinned<Tensor<..>, Topology::X>`), so a type with no tensor in it has nothing for a
     /// placement check to look at. Exhaustive over the variants, so a new one that holds a
     /// type is walked rather than skipped.
+    /// Whether a type parameter, `T`, is still in the type: `Vec<T>` or `&T`.
+    pub fn has_generic_params(&self) -> bool {
+        match self {
+            Type::Generic(..) | Type::Scalar(ElementType::Generic(_)) => true,
+            Type::Tensor(el, ..) | Type::Simd(el, _) => matches!(el, ElementType::Generic(_)),
+            Type::GenericInstance(base, args) => {
+                base.has_generic_params() || args.iter().any(Type::has_generic_params)
+            }
+            Type::Borrow { inner, .. }
+            | Type::Ref(inner, _)
+            | Type::Pointer(inner, ..)
+            | Type::Verified(inner)
+            | Type::Pinned(inner, _) => inner.has_generic_params(),
+            Type::Function(params, ret, _) | Type::Closure(params, ret) => {
+                params.iter().any(Type::has_generic_params) || ret.has_generic_params()
+            }
+            _ => false,
+        }
+    }
+
     pub fn mentions_tensor(&self) -> bool {
         match self {
             Type::Tensor(..) => true,
@@ -1000,6 +1033,64 @@ impl Type {
             _ => {}
         }
     }
+}
+
+/// The value of a const generic argument written with numbers and `+ - * /`, as text: `3.14`,
+/// `-2`, or `3` for `1 + 2`. `None` for anything else.
+fn const_value_text(e: &crate::syntax::Expr) -> Option<String> {
+    use crate::syntax::expr::{BinaryOp, UnaryOp};
+    use crate::syntax::Expr;
+    #[derive(Clone, Copy)]
+    enum Num {
+        Int(i128),
+        Float(f64),
+    }
+    fn eval(e: &Expr) -> Option<Num> {
+        match e {
+            Expr::Number(n) => {
+                let t = n.value.as_ref();
+                if t.contains(['.', 'e', 'E']) {
+                    t.parse::<f64>().ok().map(Num::Float)
+                } else {
+                    t.parse::<i128>().ok().map(Num::Int)
+                }
+            }
+            Expr::UnaryOp(u) if u.op == UnaryOp::Neg => match eval(&u.expr)? {
+                Num::Int(i) => i.checked_neg().map(Num::Int),
+                Num::Float(f) => Some(Num::Float(-f)),
+            },
+            Expr::BinaryOp(b) => match (eval(&b.lhs)?, eval(&b.rhs)?) {
+                (Num::Int(l), Num::Int(r)) => match b.op {
+                    BinaryOp::Add => l.checked_add(r),
+                    BinaryOp::Sub => l.checked_sub(r),
+                    BinaryOp::Mul => l.checked_mul(r),
+                    BinaryOp::Div if r != 0 => l.checked_div(r),
+                    _ => None,
+                }
+                .map(Num::Int),
+                (l, r) => {
+                    let float = |n| match n {
+                        Num::Int(i) => i as f64,
+                        Num::Float(f) => f,
+                    };
+                    let (l, r) = (float(l), float(r));
+                    match b.op {
+                        BinaryOp::Add => Some(l + r),
+                        BinaryOp::Sub => Some(l - r),
+                        BinaryOp::Mul => Some(l * r),
+                        BinaryOp::Div if r != 0.0 => Some(l / r),
+                        _ => None,
+                    }
+                    .map(Num::Float)
+                }
+            },
+            _ => None,
+        }
+    }
+    Some(match eval(e)? {
+        Num::Int(i) => i.to_string(),
+        Num::Float(f) => format!("{f:?}"),
+    })
 }
 
 impl ElementType {
@@ -1341,8 +1432,10 @@ impl Mangle for Type {
                 inner.mangle_to(w)
             }
             Type::Const(expr) => {
-                let debug_str = format!("{:?}", expr);
-                let sanitized: String = debug_str
+                // Named by its value, so `3.14` and `3.140`, or `3` and `1 + 2`, are one
+                // function. An argument that does not fold keeps its syntax as the name.
+                let text = const_value_text(expr).unwrap_or_else(|| format!("{:?}", expr));
+                let sanitized: String = text
                     .chars()
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
                     .collect();
