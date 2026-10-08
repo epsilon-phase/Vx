@@ -237,9 +237,11 @@ static inline void vx_memref_write_desc(void *desc, void *data, int32_t rank,
 /// function behaves as it always did.
 ///
 /// `key` includes the `=` (e.g. "kind="). Returns a pointer to the value, still
-/// within the blob and NUL-terminated, or NULL when absent. A zero size means a
-/// producer that predates the extension: report absence rather than reading a
-/// length that was never written.
+/// within the blob and NUL-terminated, or NULL when absent. An entry whose
+/// value is empty (the entry is exactly the key, like `abi=`) returns a pointer
+/// to its terminating NUL rather than NULL, so a caller can tell present from
+/// absent. A zero size means a producer that predates the extension: report
+/// absence rather than reading a length that was never written.
 ///
 /// Where the text part of a payload ends: the offset of the first byte that is
 /// not part of a NUL-terminated entry.
@@ -320,7 +322,10 @@ vx_payload_field(const void *payload, size_t payload_size, const char *key) {
       /* Unterminated: refuse rather than read past the blob. */
       return NULL;
     }
-    if (len > key_len && memcmp(entry, key, key_len) == 0) {
+    /* `len >= key_len`, not `>`: an entry that is exactly the key (an empty
+       value, like `abi=`) still matches, so a consumer can tell "present but
+       empty" from "absent" -- the promise vx_payload_abi makes. */
+    if (len >= key_len && memcmp(entry, key, key_len) == 0) {
       return entry + key_len;
     }
     pos += len + 1;
@@ -375,14 +380,20 @@ static inline int32_t vx_payload_abi(const void *payload, size_t payload_size) {
 /// payload carries no section, which is what a producer that emits only text
 /// entries (PTX today, in `image=`) answers. -2 means a section is present but
 /// its length does not account for the rest of the payload: a truncated or
-/// overlapping blob, which a consumer must refuse rather than read past.
+/// overlapping blob, which a consumer must refuse rather than read past. -3
+/// means `out` was NULL, which is a caller bug and not a payload shape: it gets
+/// its own answer so a NULL that was never passed anywhere cannot read as a
+/// text-only payload.
 ///
 /// The image's format is the `format=` entry, not a property of the section: a
 /// consumer that meets a format it does not know refuses instead of guessing.
 static inline int64_t vx_payload_section(const void *payload,
                                          size_t payload_size,
                                          const void **out) {
-  if (!payload || !out) {
+  if (!out) {
+    return -3;
+  }
+  if (!payload) {
     return -1;
   }
 
