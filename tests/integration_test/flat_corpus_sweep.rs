@@ -21,7 +21,10 @@ const KNOWN_DECLINES: &[&str] = &[
     // `c as ||->i32`: the flat path declines a cast to the built-in closure type ("a cast to a
     // non-scalar"); the AST path compiles it.
     "backend/pass/returning_a_closure_that_uses_nothing.vx",
+    // A user `impl Transfer` lowering: the flat path declines its body, which the AST path
+    // copies into the caller.
     "backend/pass/custom_topology_user_lowering.vx",
+    "frontend/pass/assert_in_a_transfer_lowering_stays_in_it.vx",
     // `c = a @ b` where `c` may be read by an operand (the same name, or a view through its
     // pointer): the flat path only fills the destination in place, and declines the rest.
     "backend/pass/matmul_assign_alias.vx",
