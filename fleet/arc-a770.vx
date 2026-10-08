@@ -82,12 +82,15 @@ Topology Device {
   // memory, so either direction is an explicit transfer and E6003 says so.
   visible: [Memory::HBM, Memory::L2, Memory::SMEM],
   // spec: the XMX matrix units take INT2, INT4 and INT8 (TechPowerUp's DG2-512
-  // entry), and the scalar path is f32/f16 and integer.
+  // entry), and the scalar path is f32/f16 and integer. INT4 is therefore a
+  // matrix-unit format here, as it is on Ampere, and `i4`/`u4` are declared for
+  // the same reason a100-80 declares them. INT2 has no `ElementType` and is not
+  // listed, the way TF32 is absent from every file.
   // bf16 is left out although the matrix units most likely take it: an element
   // type lists what a machine file can cite, and omitting one rejects a bf16
   // program that would probably have run, which is the safe direction. Adding
   // it is one token once a source says so.
-  dtypes: [f32, f16, i8, u8, i16, u16, i32, u32, i64, u64, bool],
+  dtypes: [f32, f16, i4, u4, i8, u8, i16, u16, i32, u32, i64, u64, bool],
   // Measured: 10.8 GB/s, and it is this platform's edge, not the card's. The
   // A770 is a Gen4 x16 part, so the datasheet figure is 31.5 GB/s per
   // direction, but this machine's CPU is a Ryzen 7 5700G (Cezanne) and its
