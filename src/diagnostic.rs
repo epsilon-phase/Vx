@@ -335,6 +335,10 @@ pub enum DiagnosticCode {
     E3044,
     /// A number literal that does not fit `usize`, which holds 0 up to the largest `i64`.
     E3045,
+    /// A `for` loop over a tensor that is not a variable or a flat array literal, such as one a
+    /// function call returns, or a nested array literal. The loop reads the tensor by index, so
+    /// it needs a name: bind the tensor with `let` first.
+    E3046,
 
     // --- Borrow/Ownership Errors (E4xxx) ---
     /// Use of moved or consumed linear variable
@@ -376,6 +380,10 @@ pub enum DiagnosticCode {
     /// value (`f(q[i])`). A view shares its owner's memory and is not a copy. Bind it to a new
     /// variable with `let`, pass `q[i].clone()`, or take the parameter by reference.
     E4011,
+    /// A call to the `drop` method of a `Drop` impl by hand: `x.drop()`. `drop` runs when the
+    /// value is dropped, so calling it as well would run it twice. Write `drop(x)`, from
+    /// `core::mem`, to drop a value early.
+    E4012,
 
     // --- Safety Errors (E5xxx) ---
     /// Unsafe function call outside unsafe block
@@ -517,6 +525,12 @@ pub enum DiagnosticCode {
     /// are different types, and the C library or kernel behind the parameter reads the memory the
     /// declaration names, so the spaces must match exactly.
     E6029,
+    /// A `spawn` region on a device hands out a tensor it makes, which the host could not free.
+    /// The compiler makes such a tensor before the region instead, in the device's memory, when
+    /// the region hands it out as a variable created with `Tensor<..>(..)`, `::new()` or
+    /// `::uninit()`, with no type annotation, a size that uses nothing the region computes, and
+    /// a name nothing outside the region already uses.
+    E6030,
 
     // --- Tensor/Math Errors (E7xxx) ---
     /// Matmul dimension mismatch
@@ -540,6 +554,8 @@ pub enum DiagnosticCode {
     /// Compile-time evaluation ran more loop iterations than the budget allows. A loop whose
     /// end condition is never reached is the usual cause; without this it hung the compiler.
     E8005,
+    /// A call does not meet the called function's precondition (`requires`)
+    E8006,
 }
 
 impl std::fmt::Display for DiagnosticCode {

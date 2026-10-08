@@ -215,6 +215,11 @@ fn tensor_memref_of_type(ty: &Type) -> Option<String> {
 /// agree: every fixture runs on both back ends against one set of CHECK lines, and a caller on one
 /// path can link a body compiled by the other.
 pub(crate) fn returns_through_slot(ty: &Type) -> Option<String> {
+    // A placed tensor stays where it was placed: the callee hands back its buffer, which the
+    // caller frees through its plugin, rather than copying it into a slot on the caller's stack.
+    if crate::codegen::generator::written_placement(ty).is_some() {
+        return None;
+    }
     let memty = tensor_memref_of_type(ty)?;
     crate::codegen::generator::returns_through_slot(&memty).then_some(memty)
 }
@@ -265,20 +270,49 @@ fn is_ptr_ty(ty: &Type) -> bool {
 /// it rests on the borrow checker's soundness rather than on a runtime oracle — hence the deliberately
 /// conservative choice above (exactly what rustc emits for `&mut`/`&`). Rendered with a leading space
 /// for direct concatenation after the param type, or `""` for none.
-fn param_alias_attrs(ty: &Type) -> &'static str {
+/// The `vx.placed` mark of a placed parameter or result. On-chip memory, by its built-in kind or
+/// its declared scope, is scratch nothing frees.
+fn placed_attr(p: &crate::syntax::Placement, ctx: &EmitCtx) -> String {
+    let id = crate::arch::memory_space_dispatch_id(&p.space) as u64;
+    let on_chip = declared_scratch(id, ctx)
+        || crate::codegen::generator::on_chip(crate::arch::builtin_address_space(&p.space));
+    crate::codegen::generator::placed_attr(&p.space, on_chip)
+}
+
+/// A declared memory space that is on-chip scratch: shared or per-thread memory.
+fn declared_scratch(id: u64, ctx: &EmitCtx) -> bool {
+    ctx.subspaces
+        .get(&id)
+        .and_then(|s| s.scope.as_deref())
+        .is_some_and(|s| matches!(s, "sm" | "cta" | "thread"))
+}
+
+/// The device whose memory a tensor placed in the space with dispatch id `id` is allocated
+/// in, or `None` for host memory and on-chip scratch.
+pub(crate) fn placed_device(id: u64, ctx: &EmitCtx) -> Option<i32> {
+    let host_or_on_chip = [
+        crate::syntax::MemorySpace::LocalSRAM,
+        crate::syntax::MemorySpace::CPUDRAM,
+    ]
+    .iter()
+    .any(|m| crate::arch::memory_space_dispatch_id(m) as u64 == id);
+    if id == 0 || host_or_on_chip || declared_scratch(id, ctx) {
+        return None;
+    }
+    Some(id as i32)
+}
+
+fn param_alias_attrs(ty: &Type, ctx: &EmitCtx) -> String {
     match ty {
-        Type::Borrow { is_mut: true, .. } => " {llvm.noalias}",
-        Type::Borrow { is_mut: false, .. } => " {llvm.readonly}",
+        Type::Borrow { is_mut: true, .. } => " {llvm.noalias}".to_string(),
+        Type::Borrow { is_mut: false, .. } => " {llvm.readonly}".to_string(),
         // A tensor taken by value belongs to the function, which frees it. One placed in
-        // another memory is not freed by its drop yet.
-        Type::Tensor(_, _, placement) => {
-            if placement.is_some() {
-                " {vx.placed}"
-            } else {
-                " {vx.owned}"
-            }
-        }
-        _ => "",
+        // another memory names the topology its plugin frees it on.
+        _ => match crate::codegen::generator::owned_tensor(ty) {
+            Some(Some(p)) => format!(" {}", placed_attr(&p, ctx)),
+            Some(None) => " {vx.owned}".to_string(),
+            None => String::new(),
+        },
     }
 }
 
@@ -442,12 +476,18 @@ pub struct Callee {
     /// Whether the callee returns an opaque `!llvm.ptr` (a `*const`/`*mut`/`&` return, e.g. an FFI
     /// allocator). The call's result is then a pointer value tracked in `ptr_of`. (#235)
     pub ret_ptr: bool,
+    /// For a returned reference to a struct (`&Noisy` from `Vec::get_ref`), the struct's GID, so
+    /// a field read through the result, `v.get_ref(0).id`, knows its layout.
+    pub ret_pointee: Option<TypeId>,
     /// Whether the callee returns `void`. The call emits `func.call @name(..) : (..) -> ()` and binds
     /// no result register — the statement-position form (`bump(&mut x);`) used by `&mut` mutators. (#230)
     pub ret_void: bool,
     /// The memref spelling when the callee returns a statically shaped tensor (wrappers peeled) --
     /// the call's result is then a memref value tracked in `mem_of`.
     pub ret_tensor: Option<String>,
+    /// Whether the returned tensor is placed in another memory. Such a result is handed back
+    /// as a buffer, never through a slot on the caller's stack.
+    pub ret_placed: bool,
     /// The memref spelling of each tensor parameter, by value or by reference; `None` for any
     /// other parameter. A row passed in is a strided view, and is cast to this at the call.
     pub param_tensors: Vec<Option<String>>,
@@ -563,8 +603,15 @@ pub fn build_callee_map(
                 }),
                 ret_agg: resolve_agg_gid(&sig.ret_ty, aggs, agg_names),
                 ret_ptr: is_ptr_ty(&sig.ret_ty),
+                ret_pointee: match peel_wrappers(&sig.ret_ty) {
+                    Type::Borrow { inner, .. } | Type::Pointer(inner, ..) => {
+                        resolve_agg_gid(inner, aggs, agg_names)
+                    }
+                    _ => None,
+                },
                 ret_void: is_void_ty(&sig.ret_ty),
                 ret_tensor: tensor_memref_of_type(&sig.ret_ty),
+                ret_placed: crate::codegen::generator::written_placement(&sig.ret_ty).is_some(),
                 param_tensors: sig
                     .params
                     .iter()
@@ -749,7 +796,7 @@ pub fn build_agg_map(registry: &ImmutableGlobalRegistry, sched: crate::config::S
 /// by-value nested-aggregate field expands to its nested struct type. `None` if the layout is a stub,
 /// field-less, or has any unmodelled field (a non-lowerable scalar, or a nested aggregate that itself
 /// fails). `visiting` guards against a cyclic layout (which would be infinite-size anyway). (#242)
-fn agg_struct_ty_of(
+pub(crate) fn agg_struct_ty_of(
     gid: TypeId,
     registry: &ImmutableGlobalRegistry,
     visiting: &mut Vec<TypeId>,
@@ -1794,6 +1841,10 @@ pub(crate) struct FnEmit<'a> {
     /// claims the next granule-rounded `offset` and advances the cursor, so both paths assign
     /// identical offsets. Reset per function, as in the AST codegen.
     pub(crate) subspace_offsets: HashMap<u64, u64>,
+    /// The tensors a `::new()` or `::fill(v)` writes right after they are allocated.
+    pub(crate) filled: std::collections::HashSet<usize>,
+    /// A filled tensor placed on a device: filled on the host, then copied to this topology.
+    pub(crate) copy_after_fill: HashMap<usize, i32>,
 }
 
 impl<'a> FnEmit<'a> {
@@ -2072,7 +2123,7 @@ pub fn emit_function_mlir(
         // fn-pointer), tensor memref, or by-value aggregate `!llvm.struct`; else the function declines.
         let pty = ty_mlir(ty, ctx)?;
         let n = i as u32 + arg_offset;
-        params.push(format!("%arg{n}: {pty}{}", param_alias_attrs(ty)));
+        params.push(format!("%arg{n}: {pty}{}", param_alias_attrs(ty, ctx)));
     }
     // A `Pinned<i32, ..>` return is the scalar it wraps, as at a call site.
     let ret_elem = match peel_wrappers(&func.return_type) {
@@ -2181,6 +2232,12 @@ pub fn emit_function_mlir(
         pending_args: Vec::new(),
         spawn_stack: Vec::new(),
         subspace_offsets: HashMap::new(),
+        filled: hir
+            .iter()
+            .filter(|i| matches!(i.opcode, Opcode::TensorZero | Opcode::TensorFill))
+            .map(|i| i.operand1.0 as usize)
+            .collect(),
+        copy_after_fill: HashMap::new(),
     };
     // `main` installs the runtime crash handler first, exactly as the AST codegen does (`is_main` ->
     // `func.call @vx_init_signals`), so a wild memory access is caught + backtraced rather than exiting
@@ -2207,10 +2264,22 @@ pub fn emit_function_mlir(
         }
     }
 
-    let ret_sig = match &ret_mlir {
+    // A placed result the callee hands back names the topology the caller frees it on.
+    let ret_attr = match crate::codegen::generator::owned_tensor(&func.return_type) {
+        Some(Some(p)) if returns_through_slot(&func.return_type).is_none() => {
+            format!(" {}", placed_attr(&p, ctx))
+        }
+        _ => String::new(),
+    };
+    let mut ret_sig = match &ret_mlir {
+        Some(t) if !ret_attr.is_empty() => format!(" -> ({t}{ret_attr})"),
         Some(t) => format!(" -> {t}"),
         None => String::new(),
     };
+    // A function declared `-> !` is `noreturn` to LLVM.
+    if crate::syntax::is_never_ty(&func.return_type) {
+        ret_sig += " attributes {passthrough = [\"noreturn\"]}";
+    }
     let mut out = format!(
         "func.func {}({}){} {{\n",
         sym_ref(&func.name),

@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 import core::default;
 import core::iter::traits;
+import core::marker;
+import core::mem;
 import core::ops;
 
 // Memory management is delegated to the type-erased byte allocator in
@@ -31,8 +33,8 @@ extern "C" {
 /// A growable array of `T`, held in a buffer the Rust core owns.
 ///
 /// Vx keeps a typed view into that buffer and does its own element loads and stores; growth,
-/// alignment and the `capacity * elem_size` overflow check belong to Rust. There is no `Drop`
-/// in the language, so the buffer is released by calling `free` and not before.
+/// alignment and the `capacity * elem_size` overflow check belong to Rust. The buffer is
+/// released when the vector is dropped.
 struct Vec<T> {
   data : *mut T,
   len : i32,
@@ -54,21 +56,6 @@ Vec<T> {
     };
   }
 
-  /// Release the buffer and leave the vector empty with no capacity.
-  ///
-  /// Called by hand, because the language has no `Drop` yet (Vx#495). Reading an element after
-  /// this is reading freed memory; `len` answers 0, so a loop over it is safe.
-  fn free(self : &mut Vec<T>) -> i32 {
-    unsafe {
-      let ptr_i8 : *mut i8 = self.data;
-      vx_vec_free(ptr_i8, self.capacity as i64, sizeof<T>());
-      self.data = 0 as *mut T;
-    }
-    self.len = 0;
-    self.capacity = 0;
-    return 0;
-  }
-
   /// A raw pointer to the first element. Invalidated by anything that grows the vector.
   fn as_mut_ptr(self : &Vec<T>) -> *mut T {
     return self.data;
@@ -81,6 +68,14 @@ Vec<T> {
   /// separately by whoever reads it.
   fn as_mut_slice(self : &mut Vec<T>) -> &mut T {
     let ptr : *mut T = self.data;
+    return unsafe { &mut *ptr };
+  }
+
+  /// Gives up the vector without freeing its buffer, and returns its first element as
+  /// `as_mut_slice` does. Nothing frees the buffer, so the reference stays valid.
+  fn leak(self : Vec<T>) -> &mut T {
+    let ptr : *mut T = self.data;
+    forget(self);
     return unsafe { &mut *ptr };
   }
 
@@ -116,25 +111,28 @@ Vec<T> {
     return 0;
   }
 
-  /// The element at `index`, by value.
+  /// A reference to the element at `index`. `v[i]` reads through this when the element type
+  /// is not `Copy`.
   ///
   /// # Panics
   ///
   /// When `index` is negative or not below `len`. The check is in the Rust core, which prints
   /// the index and the length and aborts the process -- it does not unwind.
-  fn get(self : &Vec<T>, index: i32) -> T {
+  fn get_ref(self : &Vec<T>, index: i32) -> &T {
     unsafe { vx_vec_bounds_check(index as i64, self.len as i64); }
-    return unsafe { self.data[index] };
+    return unsafe { &self.data[index] };
   }
 
-  /// Overwrite the element at `index`.
+  /// Overwrite the element at `index`, dropping the one that was there.
   ///
   /// # Panics
   ///
-  /// As `get` does, and for the same reason. Setting past the end does not extend the vector;
-  /// `push` is what grows it.
+  /// As `get_ref` does, and for the same reason. Setting past the end does not extend the
+  /// vector; `push` is what grows it.
   fn set(self : &mut Vec<T>, index: i32, val: T) -> i32 {
     unsafe { vx_vec_bounds_check(index as i64, self.len as i64); }
+    let old : T = unsafe { self.data[index] };
+    drop(old);
     unsafe { self.data[index] = val; }
     return 0;
   }
@@ -174,6 +172,35 @@ Vec<T> {
     return VecIterMut<T> {
       vec : self, current : 0, back : n
     };
+  }
+}
+
+impl<T : Copy> Vec<T> {
+  /// A copy of the element at `index`. For an element type that is not `Copy`, `get_ref`
+  /// gives a reference instead.
+  ///
+  /// # Panics
+  ///
+  /// As `get_ref` does.
+  fn get(self : &Vec<T>, index: i32) -> T {
+    unsafe { vx_vec_bounds_check(index as i64, self.len as i64); }
+    return unsafe { self.data[index] };
+  }
+}
+
+impl<T> Drop for Vec<T> {
+  /// Drop each element, then release the buffer.
+  fn drop(self : &mut Vec<T>) -> void {
+    if needs_drop<T>() {
+      for i in 0..self.len {
+        let element : T = unsafe { self.data[i] };
+        drop(element);
+      }
+    }
+    unsafe {
+      let ptr_i8 : *mut i8 = self.data;
+      vx_vec_free(ptr_i8, self.capacity as i64, sizeof<T>());
+    }
   }
 }
 
@@ -218,7 +245,7 @@ impl<T> Default for Vec<T> {
 }
 
 impl<T> FromIterator<T> for Vec<T> {
-  /// A new `Vec` holding every item `iter` has left, which the caller owns and must `free`.
+  /// A new `Vec` holding every item `iter` has left, which the caller owns.
   fn from_iter<I : Iterator>(iter : I) -> Vec<T> {
     let mut out = Vec<T>::new ();
     let mut it = iter;
@@ -253,6 +280,21 @@ struct VecIntoIter<T> {
   current: i32,
   // One past the last element not yet handed out from the back.
   back: i32,
+}
+
+impl<T> Drop for VecIntoIter<T> {
+  /// Drop the elements not handed out yet. The vector it holds is dropped next, and its
+  /// length is set to 0 so that it frees the buffer without dropping any element again.
+  fn drop(self : &mut VecIntoIter<T>) -> void {
+    if needs_drop<T>() {
+      for i in self.current..self.back {
+        let element : T = unsafe { self.vec.data[i] };
+        drop(element);
+      }
+    }
+    let vec : &mut Vec<T> = &mut self.vec;
+    vec.len = 0;
+  }
 }
 
 impl<T> Iterator for VecIntoIter<T> {
@@ -417,7 +459,7 @@ impl<T, NewItem> ExactSizeIterator for VecMap<T, NewItem> {
 
 impl<T, NewItem>
 VecMap<T, NewItem> {
-  /// Drain the iterator into a fresh `Vec`, which the caller owns and must `free`.
+  /// Drain the iterator into a fresh `Vec`, which the caller owns.
   fn collect(self : &mut VecMap<T, NewItem>) -> Vec<NewItem> {
     let mut result = Vec<NewItem>::new ();
     loop {

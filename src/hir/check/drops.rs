@@ -68,6 +68,30 @@ pub(crate) struct GluePart {
     /// Each field followed, with the type of the struct it is a field of.
     path: Vec<(crate::symbol::Symbol, String)>,
     call: Option<crate::symbol::Symbol>,
+    /// For an enum: what dropping each variant's payload does, by element. Dropping it
+    /// matches on the value.
+    payload: Option<EnumGlue>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EnumGlue {
+    /// The enum's type as a pattern names it: `Opt<Noisy>`.
+    name: String,
+    /// The variants with something to drop: each payload element's glue, or `None`.
+    arms: Vec<(crate::symbol::Symbol, Vec<Option<Vec<GluePart>>>)>,
+}
+
+impl GluePart {
+    /// Whether dropping this runs a `Drop` impl anywhere.
+    fn calls(&self) -> bool {
+        self.call.is_some()
+            || self.payload.as_ref().is_some_and(|p| {
+                p.arms
+                    .iter()
+                    .flat_map(|(_, elems)| elems.iter().flatten().flatten())
+                    .any(GluePart::calls)
+            })
+    }
 }
 
 /// One walk over a statement's calls, in the order they are evaluated.
@@ -193,6 +217,39 @@ fn owner_drop(owner: &Owner) -> Vec<Statement> {
     glue_drops(&owner.name, &owner.glue, flag)
 }
 
+/// `match place { E::V(p0, _) => { drops of p0 } .. _ => {} }`: the active variant's payload
+/// dropped, element by element. `name` keeps the names it binds apart from others.
+fn payload_match(name: &str, place: Expr, payload: &EnumGlue) -> Expr {
+    let mut arms = Vec::new();
+    for (variant, elems) in &payload.arms {
+        let mut patterns = Vec::new();
+        let mut body = Vec::new();
+        for (k, glue) in elems.iter().enumerate() {
+            match glue {
+                Some(glue) => {
+                    let bound = format!("{name}__payload{k}");
+                    patterns.push(Pattern::Identifier(bound.as_str().into()));
+                    body.extend(glue_drops(&bound, glue, None));
+                }
+                None => patterns.push(Pattern::Wildcard),
+            }
+        }
+        arms.push(MatchArm {
+            pattern: Pattern::EnumVariant(
+                payload.name.as_str().into(),
+                variant.clone(),
+                Some(patterns),
+            ),
+            body,
+        });
+    }
+    arms.push(MatchArm {
+        pattern: Pattern::Wildcard,
+        body: Vec::new(),
+    });
+    Expr::Match(MatchExpr::new(Box::new(place), arms, Span::default()))
+}
+
 /// The drops that run `glue` on `name`.
 fn glue_drops(name: &str, glue: &[GluePart], flag: Option<&str>) -> Vec<Statement> {
     glue.iter()
@@ -203,6 +260,17 @@ fn glue_drops(name: &str, glue: &[GluePart], flag: Option<&str>) -> Vec<Statemen
                     MemberAccessExpr::new(Box::new(place), field.clone(), Span::default());
                 access.struct_name = Some(struct_ty.as_str().into());
                 place = Expr::MemberAccess(access);
+            }
+            if let Some(payload) = &part.payload {
+                return Statement::Drop(DropStmt {
+                    name: name.into(),
+                    path: part.path.iter().map(|(f, _)| f.clone()).collect(),
+                    call: None,
+                    expr: Some(Box::new(payload_match(name, place, payload))),
+                    flag: flag.map(Into::into),
+                    after_value: false,
+                    span: Span::default(),
+                });
             }
             let expr = match &part.call {
                 Some(call) => Some(Expr::FunctionCall(FunctionCallExpr::new(
@@ -241,6 +309,24 @@ impl<'a> TypeChecker<'a> {
             }) == Some(true)
     }
 
+    /// `for n in it { .. }` over an iterator whose items need dropping: the loop binds a hidden
+    /// name, and the body starts with `let n = <hidden>;`. `n` is then a variable of the body,
+    /// dropped at the end of each pass and on `break`, `continue` and `return`, as in Rust.
+    pub(crate) fn drops_bind_loop_item(
+        &mut self,
+        iter: &mut String,
+        body: &mut Vec<Statement>,
+        item_ty: &Type,
+    ) {
+        if !self.drops_rewriting() || self.drops_glue(item_ty).is_empty() {
+            return;
+        }
+        let item = self.drops_fresh("item");
+        let user = std::mem::replace(iter, item.clone());
+        let is_mut = crate::hir::check::raw::body_reassigns(body, &user);
+        body.insert(0, let_stmt(&user, is_mut, item_ty.clone(), ident(&item)));
+    }
+
     fn drops_fresh(&mut self, what: &str) -> String {
         self.borrow.drops.counter += 1;
         format!("__vx_{what}_{}", self.borrow.drops.counter)
@@ -258,7 +344,13 @@ impl<'a> TypeChecker<'a> {
             Type::Tensor(..) => vec![GluePart {
                 path: Vec::new(),
                 call: None,
+                payload: None,
             }],
+            // The same value as the type inside, with a proof or a location attached.
+            Type::Verified(inner) | Type::Pinned(inner, _) => self.drops_glue_at(inner, depth),
+            // A type is often written as a struct before anything knows it names an enum, so
+            // the declarations decide.
+            _ if self.drops_enum_decl(ty).is_some() => self.drops_enum_glue(ty, depth),
             Type::Struct(..) | Type::GenericInstance(..) => {
                 if self.is_copy(ty) {
                     return Vec::new();
@@ -266,6 +358,12 @@ impl<'a> TypeChecker<'a> {
                 // A closure's environment holds what it captured, views among them, and the
                 // function that made it still owns those: nothing to drop.
                 if ty.to_string().starts_with("Closure_") {
+                    return Vec::new();
+                }
+                // `core::mem::ManuallyDrop` is the one struct whose value is never dropped:
+                // `forget` is built on it, as in Rust.
+                let name = ty.to_string();
+                if name == "ManuallyDrop" || name.starts_with("ManuallyDrop<") {
                     return Vec::new();
                 }
                 let Some(fields) = self.drops_struct_fields(ty) else {
@@ -276,6 +374,7 @@ impl<'a> TypeChecker<'a> {
                     glue.push(GluePart {
                         path: Vec::new(),
                         call: Some(call),
+                        payload: None,
                     });
                 }
                 let struct_ty = ty.to_string();
@@ -289,6 +388,92 @@ impl<'a> TypeChecker<'a> {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The declaration of the enum `ty` names, and its type arguments.
+    fn drops_enum_decl(&self, ty: &Type) -> Option<(decl::EnumDecl, Vec<Type>)> {
+        let (name, args): (&crate::symbol::Symbol, Vec<Type>) = match ty {
+            Type::Enum(name, _) | Type::Struct(name, _) => (name, Vec::new()),
+            Type::GenericInstance(base, args) => match base.as_ref() {
+                Type::Enum(name, _) | Type::Struct(name, _) => (name, args.clone()),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let base = name.split('<').next().unwrap_or(name);
+        let decl = (*self.env.enums.get(base)?).clone();
+        Some((decl, args))
+    }
+
+    /// An enum's glue: its `Drop` impl's `drop`, then the active variant's payload.
+    fn drops_enum_glue(&mut self, ty: &Type, depth: usize) -> Vec<GluePart> {
+        if self.is_copy(ty) {
+            return Vec::new();
+        }
+        let Some((decl, args)) = self.drops_enum_decl(ty) else {
+            return Vec::new();
+        };
+        let mapping: HashMap<crate::symbol::Symbol, Type> = decl
+            .generics
+            .iter()
+            .map(|g| crate::symbol::Symbol::from(g.name()))
+            .zip(args.iter().cloned())
+            .collect();
+        // The legacy code generator gives each payload position one slot of one type, so a
+        // `match` on an enum whose variants put a number and a struct at the same position does
+        // not compile there. Such an enum is not dropped yet; it leaks, as before.
+        let arity = decl
+            .variants
+            .iter()
+            .filter_map(|(_, p)| p.as_ref().map(Vec::len))
+            .max()
+            .unwrap_or(0);
+        for position in 0..arity {
+            let mut kinds = decl
+                .variants
+                .iter()
+                .filter_map(|(_, p)| p.as_ref()?.get(position))
+                .map(|t| t.substitute(&mapping))
+                .map(|t| matches!(t, Type::Scalar(_) | Type::Pointer(..) | Type::Borrow { .. }));
+            if let Some(first) = kinds.next() {
+                if kinds.any(|k| k != first) {
+                    return Vec::new();
+                }
+            }
+        }
+        let mut arms = Vec::new();
+        for (variant, payload) in &decl.variants {
+            let elems: Vec<Option<Vec<GluePart>>> = payload
+                .iter()
+                .flatten()
+                .map(|t| {
+                    let glue = self.drops_glue_at(&t.substitute(&mapping), depth + 1);
+                    (!glue.is_empty()).then_some(glue)
+                })
+                .collect();
+            if elems.iter().any(Option::is_some) {
+                arms.push((variant.clone(), elems));
+            }
+        }
+        let mut glue = Vec::new();
+        if let Some(call) = self.drops_impl_call(ty) {
+            glue.push(GluePart {
+                path: Vec::new(),
+                call: Some(call),
+                payload: None,
+            });
+        }
+        if !arms.is_empty() {
+            glue.push(GluePart {
+                path: Vec::new(),
+                call: None,
+                payload: Some(EnumGlue {
+                    name: ty.to_string(),
+                    arms,
+                }),
+            });
+        }
+        glue
     }
 
     /// The fields of struct type `ty`, with its type arguments put in. `None` when `ty` is not
@@ -423,7 +608,7 @@ impl<'a> TypeChecker<'a> {
                 name,
                 is_param: true,
                 decl: None,
-                to_block_end: glue.iter().any(|g| g.call.is_some()),
+                to_block_end: glue.iter().any(GluePart::calls),
                 scope,
                 moved: Moved::No,
                 moved_at: None,
@@ -462,7 +647,13 @@ impl<'a> TypeChecker<'a> {
     /// impl waits for the end of its block, as in Rust, since what the impl does may be part
     /// of what the program means; one that only frees memory is freed after its last use.
     pub(crate) fn drops_note_owner(&mut self, name: &str, ty: &Type) {
-        if self.borrow.views.contains_key(name) {
+        // `let (a, b) = e` holds `e` in a `$tuple` local and moves each part out of it, so the
+        // parts are dropped as `a` and `b`, and the local owns nothing.
+        // The same for the `$value` an `unsafe` block's value is moved into.
+        if self.borrow.views.contains_key(name)
+            || name.starts_with("$tuple")
+            || name.starts_with("$value")
+        {
             return;
         }
         let glue = self.drops_glue(ty);
@@ -475,7 +666,7 @@ impl<'a> TypeChecker<'a> {
                 name: name.to_string(),
                 is_param: false,
                 decl: Some(*stmt),
-                to_block_end: glue.iter().any(|g| g.call.is_some()),
+                to_block_end: glue.iter().any(GluePart::calls),
                 scope,
                 moved: Moved::No,
                 moved_at: None,
@@ -487,6 +678,10 @@ impl<'a> TypeChecker<'a> {
 
     /// `name` was moved, or (`again`) given a new value after a move.
     pub(crate) fn drops_note_move(&mut self, name: &str, again: bool) {
+        // A speculative check only asks what a type is; it moves nothing.
+        if self.speculating {
+            return;
+        }
         let here = self.scopes.len() - 1;
         let rewriting = self.drops_rewriting();
         if !again {
@@ -818,11 +1013,12 @@ impl<'a> TypeChecker<'a> {
                 continue;
             }
             let at = if owner.to_block_end {
-                if terminated_at.is_some() || body.is_empty() {
+                if terminated_at.is_some() {
                     continue;
                 }
                 self.drops_print(owner, "at the end of its block".to_string());
-                Some(body.len() - 1)
+                // An empty block, as `fn drop<T>(_x : T) {}` has, drops it where it starts.
+                body.len().checked_sub(1)
             } else {
                 match self.drops_last_use(&owner.name, &last_use) {
                     Some(i) if terminated_at.is_some_and(|t| i >= t) => continue,
@@ -864,6 +1060,28 @@ impl<'a> TypeChecker<'a> {
     /// and is not dropped.
     fn drops_hoist_temporaries(&mut self, body: &mut [Statement], edits: &mut Edits) {
         for (i, stmt) in body.iter_mut().enumerate() {
+            // `for n in it` moves `it` into the loop, which drops what it has not handed out
+            // when it ends. The loop advances a variable of its own, made here, in memory.
+            if let Statement::ForLoop(f) = stmt {
+                if let (Some(_), Expr::Identifier(id)) = (&f.next_fn, &*f.iterable) {
+                    let ty = self.lookup(id.name.as_ref()).map(|(t, _)| t.clone());
+                    let glue = ty.as_ref().map(|t| self.drops_glue(t)).unwrap_or_default();
+                    if let (Some(ty), false) = (ty, glue.is_empty()) {
+                        let name = self.drops_fresh("temp");
+                        let value = std::mem::replace(&mut *f.iterable, ident(&name));
+                        edits
+                            .lets
+                            .entry(i)
+                            .or_default()
+                            .push(let_stmt(&name, true, ty, value));
+                        let after = edits.after.entry(i).or_default();
+                        for (k, drop) in glue_drops(&name, &glue, None).into_iter().enumerate() {
+                            after.insert(k, drop);
+                        }
+                        continue;
+                    }
+                }
+            }
             // Where the last temporary that can move out is, counted in calls.
             let mut probe = TempScan::new(None);
             let mut copy = stmt.clone();
@@ -874,11 +1092,13 @@ impl<'a> TypeChecker<'a> {
             let mut scan = TempScan::new(Some(last));
             self.drops_scan_stmt(stmt, &mut scan);
             for (name, ty, expr, glue) in scan.found {
+                // Mutable, so it has a place in memory: the loop advances it there, and its
+                // `drop` changes it before its fields are dropped.
                 edits
                     .lets
                     .entry(i)
                     .or_default()
-                    .push(let_stmt(&name, false, ty, expr));
+                    .push(let_stmt(&name, true, ty, expr));
                 let after = edits.after.entry(i).or_default();
                 for (k, drop) in glue_drops(&name, &glue, None).into_iter().enumerate() {
                     after.insert(k, drop);
@@ -898,7 +1118,11 @@ impl<'a> TypeChecker<'a> {
             Statement::ExprStmt(e) => self.drops_scan_temps(&mut e.expr, true, scan),
             Statement::Assign(a) => self.drops_scan_temps(&mut a.rhs, false, scan),
             Statement::Assert(a) => self.drops_scan_temps(&mut a.expr, false, scan),
-            Statement::ForLoop(f) => self.drops_scan_temps(&mut f.iterable, false, scan),
+            // An iterator the loop makes, `for n in v.into_iter()`, lives until the loop ends.
+            Statement::ForLoop(f) => {
+                let iterator = f.next_fn.is_some();
+                self.drops_scan_temps(&mut f.iterable, iterator, scan)
+            }
             _ => {}
         }
     }
@@ -985,6 +1209,10 @@ impl<'a> TypeChecker<'a> {
 
     /// Make a block's edits, from its last statement back so the indices hold.
     fn drops_apply(&mut self, body: &mut Vec<Statement>, mut edits: Edits) {
+        if body.is_empty() {
+            body.extend(edits.before.remove(&0).unwrap_or_default());
+            return;
+        }
         let last = body.len().checked_sub(1);
         let mut at: Vec<usize> = edits
             .lets
