@@ -347,7 +347,7 @@ fn payload_bytes(ir: &str, kernel: &str) -> Vec<u8> {
     let end = rest
         .find('"')
         .expect("the payload global is not terminated");
-    let escaped = rest[..end].as_bytes();
+    let escaped = &rest.as_bytes()[..end];
 
     let mut bytes = Vec::new();
     let mut i = 0;
@@ -502,9 +502,9 @@ fn a_spirv_topology_gets_a_spirv_module_in_the_payload_section() {
 
     match spirv_val(section) {
         Some(Ok(())) => {}
-        Some(Err(report)) => panic!(
-            "spirv-val rejected the module the compiler emitted:\n{report}"
-        ),
+        Some(Err(report)) => {
+            panic!("spirv-val rejected the module the compiler emitted:\n{report}")
+        }
         None => println!("spirv-val is not installed; the module was not validated"),
     }
 }
@@ -555,9 +555,9 @@ fn a_loop_and_views_kernel_gets_a_spirv_module_in_the_payload_section() {
 
     match spirv_val(section) {
         Some(Ok(())) => {}
-        Some(Err(report)) => panic!(
-            "spirv-val rejected the module the compiler emitted:\n{report}"
-        ),
+        Some(Err(report)) => {
+            panic!("spirv-val rejected the module the compiler emitted:\n{report}")
+        }
         None => println!("spirv-val is not installed; the module was not validated"),
     }
 }
@@ -606,9 +606,9 @@ fn a_strided_and_dynamic_row_kernel_gets_a_spirv_module_in_the_payload_section()
 
     match spirv_val(section) {
         Some(Ok(())) => {}
-        Some(Err(report)) => panic!(
-            "spirv-val rejected the module the compiler emitted:\n{report}"
-        ),
+        Some(Err(report)) => {
+            panic!("spirv-val rejected the module the compiler emitted:\n{report}")
+        }
         None => println!("spirv-val is not installed; the module was not validated"),
     }
 }
