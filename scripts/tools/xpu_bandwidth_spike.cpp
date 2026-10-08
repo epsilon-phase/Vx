@@ -14,7 +14,8 @@
 //
 // Memory. The card is shared and this machine is unstable above 12 GiB of VRAM
 // in use, so the program prints its footprint and refuses to allocate past a
-// ceiling (`VX_VRAM_CEILING`, 12 GiB by default). At the default 512 MiB per
+// ceiling (`VX_VRAM_CEILING`, a decimal number of bytes, 12 GiB by default). At
+// the default 512 MiB per
 // buffer the copy phase holds 1 GiB and the triad phase 1.5 GiB.
 //
 // Build and run: scripts/tools/xpu_bandwidth_spike.sh [size in MiB]
@@ -22,6 +23,7 @@
 #include <level_zero/ze_api.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -46,11 +48,25 @@ static constexpr uint64_t kGroups = 4096; // 1M work-items
 static constexpr int kWarmup = 2, kReps = 10;
 static constexpr float kA = 1.5f, kB = 2.0f;
 
+/// The VRAM ceiling in bytes: `VX_VRAM_CEILING` when it is set, else 12 GiB.
+///
+/// A value that is not a decimal number of bytes is refused rather than turned
+/// into 0 by `strtoull`, which would make every run fail the ceiling check with
+/// a message that never mentions the variable.
 static uint64_t vramCeiling() {
   const char *env = std::getenv("VX_VRAM_CEILING");
   if (!env)
     return 12ull * 1024 * 1024 * 1024;
-  return std::strtoull(env, nullptr, 10);
+  char *end = nullptr;
+  errno = 0;
+  const unsigned long long value = std::strtoull(env, &end, 10);
+  if (end == env || *end != '\0' || errno == ERANGE) {
+    std::fprintf(stderr,
+                 "VX_VRAM_CEILING must be a decimal number of bytes, got \"%s\"\n",
+                 env);
+    std::exit(1);
+  }
+  return value;
 }
 
 static std::vector<char> readFile(const char *path) {
@@ -82,7 +98,9 @@ int main(int argc, char **argv) {
 
   const uint64_t peak = std::max(2 * bytesPerBuffer, 3 * bytesPerBuffer);
   if (peak > vramCeiling()) {
-    std::fprintf(stderr, "refusing to run: %llu bytes, ceiling %llu\n",
+    std::fprintf(stderr,
+                 "refusing to run: %llu bytes needed, VX_VRAM_CEILING is %llu "
+                 "bytes\n",
                  (unsigned long long)peak, (unsigned long long)vramCeiling());
     return 1;
   }
