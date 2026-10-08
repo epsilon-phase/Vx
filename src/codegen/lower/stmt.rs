@@ -199,6 +199,32 @@ impl<'c> LowerToMelior<'c> for LetDeclStmt {
             (val, ty)
         };
 
+        // `let t : Tensor<f32, []> = 1.0`: a rank-0 tensor is a buffer holding one value, so the
+        // scalar the initializer produced is stored into one.
+        let (val, ty) = match ty_ann {
+            Some(syntax::Type::Tensor(_, dims, _)) if dims.is_empty() && !gen.is_memref(&ty) => {
+                let buffer_ty =
+                    Type::parse(gen.context, &format!("memref<{ty}>")).ok_or_else(|| {
+                        crate::codegen::lower::LowerError::ParseType(format!("memref<{ty}>"))
+                    })?;
+                let alloc = OperationBuilder::new("memref.alloc", gen.loc())
+                    .add_attributes(&[(
+                        Identifier::new(gen.context, "operandSegmentSizes"),
+                        DenseI32ArrayAttribute::new(gen.context, &[0, 0]).into(),
+                    )])
+                    .add_results(&[buffer_ty])
+                    .build()?;
+                let buffer: Value = block.append_operation(alloc).result(0)?.into();
+                let store = OperationBuilder::new("memref.store", gen.loc())
+                    .add_operands(&[val, buffer])
+                    .build()?;
+                block.append_operation(store);
+                gen.owned_tensors.insert(name.to_string().into());
+                (buffer, buffer_ty)
+            }
+            _ => (val, ty),
+        };
+
         if *is_mut {
             let ty_str = ty.to_string();
             if ty_str.contains("!llvm.struct") || ty_str.contains("!llvm.ptr") {
@@ -343,6 +369,7 @@ fn matmul_assign_shapes_agree(gen: &MeliorGenerator<'_>, dst: &Expr, a: &Expr, b
     // naming the same buffer would read zeros. Each of the three has to be a local declared a
     // tensor -- a name bound to a borrow denotes whatever it points at, and following that is
     // the analysis this check exists to avoid.
+    // A destination whose pointer is taken can be read under another name, through a view.
     let root = |e: &Expr| -> Option<crate::symbol::Symbol> {
         let r = syntax::matmul_operand_root(e)?;
         let named = Expr::Identifier(IdentifierExpr {
@@ -359,7 +386,7 @@ fn matmul_assign_shapes_agree(gen: &MeliorGenerator<'_>, dst: &Expr, a: &Expr, b
     let (Some(d), Some(l), Some(r)) = (root(dst), root(a), root(b)) else {
         return false;
     };
-    if !gen.owned_tensors.contains(&d) || d == l || d == r {
+    if !gen.owned_tensors.contains(&d) || gen.pointer_taken.contains(&d) || d == l || d == r {
         return false;
     }
 
