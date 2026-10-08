@@ -562,6 +562,93 @@ fn a_loop_and_views_kernel_gets_a_spirv_module_in_the_payload_section() {
     }
 }
 
+/// A kernel that reads a view of a view -- a strided row -- or a row of a
+/// run-time-shaped tensor also reaches the payload's section as a SPIR-V module
+/// the validator accepts (#1137).
+///
+/// These are the shapes the flat emitter builds with
+/// `memref.extract_strided_metadata` and `memref.dim`, neither of which the
+/// SPIR-V argument flattening knew how to rewrite. It refused them, and the
+/// refusal was fatal: the whole compile failed rather than the region taking
+/// the host path. The fix teaches the flattening both ops, so the kernel stays
+/// on the device and the image has to be a real one.
+#[test]
+fn a_strided_and_dynamic_row_kernel_gets_a_spirv_module_in_the_payload_section() {
+    let ir = emit_llvm("spirv_device_image_strided_row.vx");
+    let kernel = "vx_npu_kernel_0";
+    let payload = payload_bytes(&ir, kernel);
+
+    let has = |needle: &[u8]| payload.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        has(b"format=spirv\0"),
+        "the payload does not say the image is SPIR-V, so a dispatch library \
+         has to guess"
+    );
+    assert!(
+        !has(b"image="),
+        "the image is in a NUL-terminated `image=` entry, where its own first \
+         word would end it"
+    );
+
+    let section = payload_section(&payload);
+    assert_eq!(
+        &section[..4],
+        &[0x03, 0x02, 0x23, 0x07],
+        "the section does not start with SPIR-V's magic number 0x07230203"
+    );
+    assert!(
+        section
+            .windows(kernel.len())
+            .any(|w| w == kernel.as_bytes()),
+        "the module does not name `{kernel}`, so a loader would load it and then \
+         ask for a function that is not in it"
+    );
+
+    match spirv_val(section) {
+        Some(Ok(())) => {}
+        Some(Err(report)) => panic!(
+            "spirv-val rejected the module the compiler emitted:\n{report}"
+        ),
+        None => println!("spirv-val is not installed; the module was not validated"),
+    }
+}
+
+/// A `spirv64` region that yields a value gets no `format=spirv` image, and
+/// says why: the value is handed back through a host stack slot, which a device
+/// cannot address (#1137).
+///
+/// The memref-cell warning the legacy path gets has a test of its own; this is
+/// its sibling on the flat path, and it is the one the compiler has to make for
+/// a value-yielding kernel rather than a memref-shaped one. The message names
+/// the host stack slot so the author can tell this refusal from the others.
+#[test]
+fn a_yielding_spirv_region_says_it_runs_on_the_host() {
+    let path = corpus("spirv_device_image_result_slot.vx");
+    let out = Command::new(env!("CARGO_BIN_EXE_vxc"))
+        .arg(&path)
+        .arg("--emit-llvm")
+        .output()
+        .unwrap_or_else(|e| panic!("could not run vxc: {e}"));
+    assert!(
+        out.status.success(),
+        "the flat path failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !ir.contains("format=spirv"),
+        "a kernel that yields a host-stack value must have no SPIR-V image \
+         rather than one that is wrong"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("host stack slot") && stderr.contains("run on the host"),
+        "the compiler dropped this kernel's device twin without saying why, so \
+         the author believes it runs on the card; stderr was:\n{stderr}"
+    );
+}
+
 /// A `--legacy-codegen` compile of the same `spirv64` topology still gets no
 /// image, and now says so out loud.
 ///
