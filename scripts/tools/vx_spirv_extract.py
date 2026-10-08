@@ -35,12 +35,16 @@ def decode_escaped(text):
                 out.append(0x5C)
                 i += 2
                 continue
-            try:
-                out.append(int(raw[i + 1 : i + 3].decode("ascii"), 16))
-                i += 3
-                continue
-            except (ValueError, UnicodeDecodeError):
-                pass
+            # Two hex digits, no fewer: a trailing single digit is not an escape,
+            # and the Rust twin in device_image_test.rs reads it the same way.
+            digits = raw[i + 1 : i + 3]
+            if len(digits) == 2:
+                try:
+                    out.append(int(digits.decode("ascii"), 16))
+                    i += 3
+                    continue
+                except (ValueError, UnicodeDecodeError):
+                    pass
         out.append(c)
         i += 1
     return bytes(out)
