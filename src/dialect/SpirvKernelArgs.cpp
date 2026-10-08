@@ -37,6 +37,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <optional>
+
 using namespace mlir;
 
 namespace mlir {
@@ -51,13 +53,15 @@ constexpr unsigned kDeviceAddressSpace = 1;
 
 /// What one memref value on the device side becomes: the pointer the elements
 /// are addressed through, the linear element offset from that pointer, one
-/// stride per dimension, and the element type.
+/// size per dimension, one stride per dimension, and the element type.
 ///
-/// No sizes: nothing here addresses by a size, and the runtime's sizes stay in
-/// the argument list for whoever wants them.
+/// The sizes are kept even though nothing here addresses by a size: a body that
+/// reads one back (`memref.dim`, which the flat emitter writes for a `?`-shaped
+/// row) needs the value the ABI passed for it.
 struct FlatView {
   Value base;
   Value offset;
+  SmallVector<Value, 4> sizes;
   SmallVector<Value, 4> strides;
   Type elementType;
 };
@@ -67,6 +71,14 @@ Value asI64(OpBuilder &builder, Location loc, Value v) {
   if (v.getType().isInteger(64))
     return v;
   return arith::IndexCastOp::create(builder, loc, builder.getI64Type(), v);
+}
+
+/// `v`, as an `index`, for the arithmetic a `memref.dim` or an
+/// `extract_strided_metadata` result takes part in.
+Value asIndex(OpBuilder &builder, Location loc, Value v) {
+  if (v.getType().isIndex())
+    return v;
+  return arith::IndexCastOp::create(builder, loc, builder.getIndexType(), v);
 }
 
 Value constantI64(OpBuilder &builder, Location loc, int64_t v) {
@@ -196,13 +208,15 @@ LogicalResult lowerLoad(memref::LoadOp load, const FlatView &view,
 /// Rewrite one `memref.reinterpret_cast` into the arithmetic its accesses will
 /// use.
 ///
-/// The cast's offset is added to the source's, and its strides replace the
-/// source's. That is what the frontend means by these casts: a row view names
-/// `index * row_size` relative to the memref it is made from, and when the
-/// source is already a view of its own (`strided_row`) the frontend reads that
-/// offset out and folds it into the same operand before emitting the cast --
-/// so the offset a launch passes for that tensor always reaches the address,
-/// which is what the `offset` argument in the ABI is for.
+/// The cast's offset is added to the source's, and its sizes and strides
+/// replace the source's. That is what the frontend means by these casts: a row
+/// view names `index * row_size` relative to the memref it is made from. When
+/// the source is already a view of its own (`strided_row`), the frontend reads
+/// the source's offset, sizes and strides back out with
+/// `memref.extract_strided_metadata`, folds the row index into the offset, and
+/// makes the cast from the base buffer -- so the offset a launch passes for
+/// that tensor still reaches the address, which is what the `offset` argument
+/// in the ABI is for.
 ///
 /// The op is left in place for the caller to erase: its result still has uses
 /// until they have been rewritten, and erasing an op whose result is used
@@ -217,12 +231,16 @@ void lowerReinterpretCast(memref::ReinterpretCastOp cast, const FlatView &view,
     offset = addI64(builder, loc, offset,
                     asI64(builder, loc,
                           getValueOrCreateConstantIndexOp(builder, loc, part)));
+  SmallVector<Value, 4> sizes;
+  for (OpFoldResult part : cast.getMixedSizes())
+    sizes.push_back(asI64(builder, loc,
+                          getValueOrCreateConstantIndexOp(builder, loc, part)));
   SmallVector<Value, 4> strides;
   for (OpFoldResult part : cast.getMixedStrides())
     strides.push_back(asI64(
         builder, loc, getValueOrCreateConstantIndexOp(builder, loc, part)));
-  views[cast.getResult()] =
-      FlatView{view.base, offset, strides, cast.getType().getElementType()};
+  views[cast.getResult()] = FlatView{view.base, offset, sizes, strides,
+                                     cast.getType().getElementType()};
 }
 
 /// Rewrite one kernel, in three steps: expand its memref arguments in place,
@@ -260,8 +278,16 @@ LogicalResult flattenKernel(gpu::GPUFuncOp func, std::string &error) {
       entry.insertArgument(i + k, types[k], arg.getLoc());
 
     // The offset is the runtime's, always: it describes the buffer this launch
-    // was handed, which no type can know. A stride comes from the type when
-    // the type has one and from the argument when it says `?`.
+    // was handed, which no type can know. A size or a stride comes from the
+    // type when it has one and from the argument when it says `?`.
+    SmallVector<Value, 4> sizeValues;
+    for (int64_t d = 0; d < memref.getRank(); ++d) {
+      if (memref.isDynamicDim(d))
+        sizeValues.push_back(entry.getArgument(i + 3 + d));
+      else
+        sizeValues.push_back(
+            constantI64(builder, func.getLoc(), memref.getShape()[d]));
+    }
     SmallVector<Value, 4> strideValues;
     for (int64_t d = 0; d < memref.getRank(); ++d) {
       int64_t stride = (*strides)[d];
@@ -271,8 +297,8 @@ LogicalResult flattenKernel(gpu::GPUFuncOp func, std::string &error) {
         strideValues.push_back(constantI64(builder, func.getLoc(), stride));
     }
     views.try_emplace(arg, FlatView{entry.getArgument(i + 1),
-                                    entry.getArgument(i + 2), strideValues,
-                                    memref.getElementType()});
+                                    entry.getArgument(i + 2), sizeValues,
+                                    strideValues, memref.getElementType()});
   }
 
   // The body. The ops are collected first, in order, so that a value is in the
@@ -285,10 +311,12 @@ LogicalResult flattenKernel(gpu::GPUFuncOp func, std::string &error) {
     if (op != func.getOperation())
       ops.push_back(op);
   });
-  // The casts are erased last: a cast's result is what the accesses after it
-  // were written against, so erasing it before they are rewritten would leave
-  // them pointing at freed storage.
-  SmallVector<memref::ReinterpretCastOp> casts;
+  // The casts and the metadata reads are erased last: their results are what
+  // the accesses after them were written against, so erasing one before they
+  // are rewritten would leave them pointing at freed storage. They go in
+  // reverse order, so a view built on another one (`strided_row` of a
+  // `strided_row`) loses its consumer before it is erased.
+  SmallVector<Operation *> deferred;
   for (Operation *op : ops) {
     auto found = [&](Value memref) -> const FlatView * {
       auto it = views.find(memref);
@@ -301,7 +329,7 @@ LogicalResult flattenKernel(gpu::GPUFuncOp func, std::string &error) {
         return failure();
       }
       lowerReinterpretCast(cast, *view, views);
-      casts.push_back(cast);
+      deferred.push_back(cast);
       continue;
     }
     if (auto load = dyn_cast<memref::LoadOp>(op)) {
@@ -324,6 +352,65 @@ LogicalResult flattenKernel(gpu::GPUFuncOp func, std::string &error) {
         return failure();
       continue;
     }
+    // A dimension read back by name (`memref.dim`, which the flat emitter
+    // writes for a `?`-shaped row): the size the ABI passed for it, or the
+    // size the view was made with.
+    if (auto dim = dyn_cast<memref::DimOp>(op)) {
+      const FlatView *view = found(dim.getSource());
+      if (!view) {
+        error = "a `memref.dim` of a memref the flattening does not know";
+        return failure();
+      }
+      std::optional<int64_t> which = dim.getConstantIndex();
+      if (!which || *which < 0 ||
+          static_cast<size_t>(*which) >= view->sizes.size()) {
+        error = "a `memref.dim` whose dimension is not one of the memref's";
+        return failure();
+      }
+      OpBuilder builder(dim);
+      dim.getResult().replaceAllUsesWith(
+          asIndex(builder, dim.getLoc(), view->sizes[*which]));
+      dim.erase();
+      continue;
+    }
+    // A view's offset, sizes and strides read back by name. The frontend
+    // writes one to build a row of a row (`strided_row`): the base buffer
+    // result is the same buffer as a zero-offset view, and the three value
+    // results are the source's own parts, so the cast that follows lands on
+    // the address it would have.
+    if (auto md = dyn_cast<memref::ExtractStridedMetadataOp>(op)) {
+      const FlatView *found_view = found(md.getSource());
+      if (!found_view) {
+        error = "an `extract_strided_metadata` of a memref the flattening "
+                "does not know";
+        return failure();
+      }
+      // Only the cast that follows reads the base buffer; anything else would
+      // be left pointing at a memref this rewrite has no value for.
+      for (Operation *user : md.getBaseBuffer().getUsers())
+        if (!isa<memref::ReinterpretCastOp>(user)) {
+          error = "an `extract_strided_metadata` whose base buffer reaches `" +
+                  user->getName().getStringRef().str() +
+                  "`, which the SPIR-V argument flattening does not lower";
+          return failure();
+        }
+      // Copied, because inserting the base buffer's view below may rehash the
+      // map and move the entry `found_view` points into.
+      FlatView source = *found_view;
+      OpBuilder builder(md);
+      Location loc = md.getLoc();
+      views.try_emplace(md.getBaseBuffer(),
+                        FlatView{source.base, constantI64(builder, loc, 0),
+                                 source.sizes, source.strides,
+                                 source.elementType});
+      md.getOffset().replaceAllUsesWith(asIndex(builder, loc, source.offset));
+      for (auto [result, size] : llvm::zip(md.getSizes(), source.sizes))
+        result.replaceAllUsesWith(asIndex(builder, loc, size));
+      for (auto [result, stride] : llvm::zip(md.getStrides(), source.strides))
+        result.replaceAllUsesWith(asIndex(builder, loc, stride));
+      deferred.push_back(md);
+      continue;
+    }
     if (mentionsMemref(op)) {
       error = "a memref reaches `" + op->getName().getStringRef().str() +
               "`, which the SPIR-V argument flattening does not lower";
@@ -331,8 +418,8 @@ LogicalResult flattenKernel(gpu::GPUFuncOp func, std::string &error) {
     }
   }
   // Consumers before producers, so nothing is left holding a freed result.
-  for (memref::ReinterpretCastOp cast : llvm::reverse(casts))
-    cast.erase();
+  for (Operation *op : llvm::reverse(deferred))
+    op->erase();
 
   // The memref arguments are unused now. Dropping them leaves the flat list in
   // the order built above, and the function type follows the block.
