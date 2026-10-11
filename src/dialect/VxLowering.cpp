@@ -1,7 +1,6 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include "VxDialect.h"
-#include "vx_hardware_runtime.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Pass.h"
@@ -37,6 +36,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Mem2Reg.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "vx_hardware_runtime.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -1158,8 +1158,8 @@ static void placeTransferFree(vx::TransferOp transfer) {
         continue;
       auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
           call, call.getCalleeAttr());
-      if (callee &&
-          placedTopology(callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
+      if (callee && placedTopology(
+                        callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
         return;
     }
 
@@ -1455,6 +1455,44 @@ static bool collectDeviceCallees(Operation *op, ModuleOp module, bool inCallee,
   return dialect && isDeviceLowerableDialect(dialect->getNamespace());
 }
 
+/// The device-image pipelines a kernel's declared `arch:` can select.
+///
+/// `None` is not an error -- `applegpu` reaches its device through the plugin
+/// ABI, so a topology Vx cannot compile for still type-checks. A row and its
+/// pipeline land together: a row without one would clone a body into a
+/// `gpu.module` that nothing compiles (docs/gpu_backends.md, item 1).
+enum class DevicePipeline { None, Nvptx };
+
+/// The pipeline a declared architecture names, `None` for one Vx has no
+/// pipeline for.
+static DevicePipeline pipelineForArch(StringRef arch) {
+  if (arch == "nvptx64")
+    return DevicePipeline::Nvptx;
+  return DevicePipeline::None;
+}
+
+/// The pipeline that compiles one outlined kernel: the declared architecture
+/// when the kernel carries one, and the dispatch-id band when it does not.
+///
+/// The band stays the fallback for kernels with no arch attribute: built-in
+/// topologies (whose descriptors declare no arch) and the AST-codegen path
+/// (which does not stamp). A declared arch with no row in the table --
+/// `applegpu` reaches its device through the plugin ABI, not through a device
+/// image -- answers `None`.
+///
+/// `materializeGpuKernels` asks this to decide whether a kernel gets a device
+/// twin; the device-image step asks it again to decide which pipeline compiles
+/// the twin. One answer, so a kernel cannot be admitted for one architecture
+/// and compiled for another.
+static DevicePipeline pipelineOfKernel(vx::KernelOp kernel) {
+  if (auto arch = kernel->getAttrOfType<StringAttr>("arch"))
+    return pipelineForArch(arch.getValue());
+  const int32_t id = static_cast<int32_t>(kernel.getTopology());
+  if (id >= 500 && id < 600)
+    return DevicePipeline::Nvptx;
+  return DevicePipeline::None;
+}
+
 // Turn each cell that holds a buffer into plain values. The AST code generator
 // keeps a tensor local in a cell (`memref<memref<..>>`), which the buffer
 // deallocation analysis cannot follow, and which stops being promotable once
@@ -1512,7 +1550,6 @@ static void freePlaced(OpBuilder &builder, Location loc, Value buffer,
   builder.create<vx::FreeOp>(loc, buffer, topology);
 }
 
-
 // Whether parameter `i` of the function `call` reaches is taken by value.
 static bool takesOwnership(func::CallOp call, unsigned i) {
   auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
@@ -1549,7 +1586,6 @@ static Value castSource(Value v) {
 
 static BufferOrigin originOf(Value v, llvm::SmallPtrSetImpl<void *> &seen,
                              std::optional<int32_t> &topology);
-
 
 // The origin of every value in `values`, when they all have the same one.
 static BufferOrigin commonOrigin(ArrayRef<Value> values,
@@ -2023,29 +2059,25 @@ struct ConvertVxToStandardPass
     SmallVector<vx::KernelOp> kernels;
     llvm::DenseMap<Operation *, DeviceCallees> callees;
     module.walk([&](vx::KernelOp k) {
-      const int32_t topo = static_cast<int32_t>(k.getTopology());
-      // Eligibility: the DECLARED arch when the kernel carries one, the
-      // dispatch-id band when it does not. A machine file that says `arch:
-      // nvptx64` has answered "what code do we emit for this topology" -- that
-      // is the field's documented meaning -- and this is the place that needed
-      // the answer; before the attribute existed the gate was the band alone,
-      // which a custom topology can never enter (declared ids start at 3000 by
+      // Eligibility: which device pipeline compiles this kernel, from the
+      // DECLARED arch when the kernel carries one and the dispatch-id band when
+      // it does not. A machine file that says `arch: nvptx64` has answered
+      // "what code do we emit for this topology" -- that is the field's
+      // documented meaning -- and this is the place that needed the answer;
+      // before the attribute existed the gate was the band alone, which a
+      // custom topology can never enter (declared ids start at 3000 by
       // construction), so no declaration could produce a device image (Vx#352).
       //
       // The band stays as the fallback for kernels with no arch attribute:
       // built-in topologies (whose descriptors declare no arch) and the
-      // AST-codegen path (which does not stamp). A declared arch we have no
-      // device pipeline for -- `applegpu` reaches its device through the plugin
-      // ABI, not NVVM -- is excluded here exactly like NPU/AccCore below.
-      if (auto arch = k->getAttrOfType<StringAttr>("arch")) {
-        if (arch.getValue() != "nvptx64")
-          return;
-      } else if (topo < 500 || topo >= 600) {
-        // The GPU band from `topology_dispatch_id`. NPU and AccCore outline the
-        // same way but reach their devices through a different backend, and
-        // giving them an NVVM twin would be claiming something untrue.
+      // AST-codegen path (which does not stamp). A declared arch with no row in
+      // the table -- `applegpu` reaches its device through the plugin ABI, not
+      // NVVM -- is excluded here exactly like NPU/AccCore below.
+      //
+      // No pipeline claims the kernel: it gets no twin, and stops here rather
+      // than being cloned into a `gpu.module` that nothing will compile.
+      if (pipelineOfKernel(k) == DevicePipeline::None)
         return;
-      }
       // A kernel that hands back a value writes it into a host stack slot,
       // which a GPU cannot address; the runtime runs it on the host instead.
       if (k->hasAttr("vx.result_slot"))
@@ -3540,10 +3572,55 @@ struct ConvertVxToLLVMPass
     getOperation().walk(
         [&](gpu::GPUModuleOp m) { deviceModules.push_back(m); });
 
+    // Which pipeline compiles which kernel, from the same answer the gate used
+    // to decide the kernel got a twin at all (`pipelineOfKernel`). Asking twice
+    // from one source is what keeps a kernel from being admitted for one
+    // architecture and compiled for another; the `vx.kernel` ops are still here
+    // at this point, and the `gpu.func` beside each carries its name.
+    llvm::StringMap<DevicePipeline> kernelPipelines;
+    getOperation().walk([&](vx::KernelOp k) {
+      kernelPipelines[k.getSymName()] = pipelineOfKernel(k);
+    });
+
     llvm::StringMap<std::string> deviceImages;
     for (gpu::GPUModuleOp m : deviceModules) {
+      // One image per module, and every kernel in it is an entry point: a
+      // loader takes the module and then asks for a function by name. So the
+      // module's kernels have to agree on the pipeline that produces that one
+      // image. They always do today -- the gate puts every admitted kernel in
+      // this module -- and a program that places kernels on two architectures
+      // with different pipelines must say so rather than get a module whose
+      // image is only right for some of its entry points.
+      DevicePipeline pipeline = DevicePipeline::None;
+      bool mixed = false;
+      m.walk([&](gpu::GPUFuncOp f) {
+        auto it = kernelPipelines.find(f.getName());
+        if (it == kernelPipelines.end())
+          return;
+        if (pipeline == DevicePipeline::None)
+          pipeline = it->second;
+        else if (pipeline != it->second)
+          mixed = true;
+      });
+      if (mixed) {
+        m.emitError("this device module holds kernels for more than one "
+                    "architecture; each needs a module of its own");
+        signalPassFailure();
+        return;
+      }
+
       std::string error;
-      std::string image = deviceImageOf(m, error);
+      std::string image;
+      switch (pipeline) {
+      case DevicePipeline::Nvptx:
+        image = deviceImageOf(m, error);
+        break;
+      case DevicePipeline::None:
+        // The gate gives a kernel with no pipeline no twin, so a module here
+        // with no pipeline is a bug rather than a program Vx should compile.
+        error = "no device pipeline answers for these kernels";
+        break;
+      }
       // Fatal rather than "emit nothing and carry on". Carrying on produces a
       // program that compiles, dispatches, and is then refused at the far end
       // for a reason that has nothing to do with the refusal -- the kernel is
