@@ -17,9 +17,12 @@
 // `spirv-dis` on the image shows exactly 28 `OpFunctionParameter`s. Nothing is
 // passed as an aggregate.
 //
-// Memory. The card is shared and this machine is unstable above 12 GiB of VRAM
-// in use, so this prints its footprint (four tensors, 512 bytes) and there is
-// no way for it to grow: the sizes are compile-time constants of this fixture.
+// Memory. The owner's machine is unstable above 12 GiB of VRAM in use, so this
+// prints its footprint and its ceiling and refuses to allocate past
+// `VX_VRAM_CEILING` (2 GiB by default, never more than 12 GiB), the same rule
+// every helper in this directory takes from `vram_ceiling.h`. It cannot grow:
+// the sizes are compile-time constants of this fixture, so what it checks
+// before `zeInit` is also what it will hold -- four tensors, 512 bytes.
 //
 // Build and run: scripts/tools/vx_spirv_run_spike.sh
 
@@ -32,6 +35,8 @@
 #include <cstring>
 #include <fstream>
 #include <vector>
+
+#include "vram_ceiling.h"
 
 #define L0_CHECK(call)                                                         \
   do {                                                                         \
@@ -98,6 +103,14 @@ int main(int argc, char **argv) {
   const bool shiftOffset = std::strcmp(mode, "shift-offset") == 0;
   const bool corruptImage = std::strcmp(mode, "corrupt-image") == 0;
 
+  // The footprint is the four tensors the kernel's arguments describe, and it
+  // is a compile-time constant. Checked against the ceiling before `zeInit` and
+  // before anything is allocated, and printed on every run.
+  requireWithinCeiling("vx_spirv_run_spike", kFootprint, vramCeiling());
+  std::printf("footprint: %llu bytes of device memory (%llu tensors of %llu)\n",
+              (unsigned long long)kFootprint, (unsigned long long)kOperands,
+              (unsigned long long)kBytes);
+
   std::vector<char> image = readFile(spvPath);
   if (image.size() < 4 ||
       std::memcmp(image.data(), "\x03\x02\x23\x07", 4) != 0) {
@@ -133,7 +146,7 @@ int main(int argc, char **argv) {
       if (props.type == ZE_DEVICE_TYPE_GPU) {
         driver = d;
         device = dev;
-        std::printf("device: %s  (%u compute units)\n", props.name,
+        std::printf("device: %s  (%u EUs)\n", props.name,
                     props.numEUsPerSubslice * props.numSubslicesPerSlice *
                         props.numSlices);
         break;
@@ -146,10 +159,6 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "no Level Zero GPU found\n");
     return 1;
   }
-
-  std::printf("footprint: %llu bytes of device memory (%llu tensors of %llu)\n",
-              (unsigned long long)kFootprint, (unsigned long long)kOperands,
-              (unsigned long long)kBytes);
 
   ze_context_desc_t contextDesc = {};
   contextDesc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;

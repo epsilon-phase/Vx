@@ -29,8 +29,13 @@
 #   - and the check can fail: the same launch with one argument changed, and
 #     with one byte of the image flipped, both come back wrong.
 #
-# Memory: four tensors of 128 bytes. The card is shared and this machine goes
-# unstable above 12 GiB of VRAM in use; the launcher prints its footprint.
+# Memory: four tensors of 128 bytes. The owner's machine goes unstable above
+# 12 GiB of VRAM in use, so the launcher prints its footprint and its ceiling
+# and refuses to allocate past `VX_VRAM_CEILING` -- 2 GiB by default, never more
+# than 12 GiB -- the same rule the other helper in this directory uses.
+#
+# Only one of these runs may touch the card at a time, so the whole script holds
+# a lock that every GPU helper in this directory takes.
 #
 #===----------------------------------------------------------------------===#
 
@@ -50,12 +55,18 @@ if [ -f "$ROOT/config.local" ]; then
   . "$ROOT/config.local"
 fi
 
-for tool in clang spirv-val spirv-dis; do
+for tool in clang spirv-val spirv-dis flock; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "error: $tool not on PATH (source config.local)" >&2
     exit 1
   }
 done
+
+# Serialise GPU access, for the whole run including the sabotage steps below.
+# The lock is held on file descriptor 9 until the script exits, so a second
+# helper waits rather than allocating beside this one.
+exec 9>"${TMPDIR:-/tmp}/vx-gpu.lock"
+flock 9
 
 VXC="${VXC:-$ROOT/target/release/vxc}"
 if [ ! -x "$VXC" ]; then
