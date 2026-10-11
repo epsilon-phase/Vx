@@ -10,19 +10,22 @@
  * code calls.
  *
  * `libmlir_runner_utils` exports printMemrefF32, F64, I32 and I64 both plainly
- * and packed as `_mlir_ciface_*`, but the half-precision printers ONLY packed --
- * `nm` on MLIR 22 shows `_mlir_ciface_printMemrefBF16` and no plain
+ * and packed as `_mlir_ciface_*`, but the half-precision printers ONLY packed
+ * -- `nm` on MLIR 22 shows `_mlir_ciface_printMemrefBF16` and no plain
  * `printMemrefBF16`. Codegen emits the plain call, so a bf16 program could not
- * link, run, or emit an object; its RUN line only emits MLIR, so nothing noticed.
+ * link, run, or emit an object; its RUN line only emits MLIR, so nothing
+ * noticed.
  *
- * `llvm.emit_c_interface` on the declaration does not fix it: MLIR then gives the
- * function a body and the ExecutionEngine wants `_mlir_printMemrefBF16` instead,
- * which no library exports either. Supplying the plain symbol here is what closes
- * it, and it belongs beside the runtime rather than in vx_std_core -- the standard
- * library has no MLIR dependency and should not gain one to print a tensor.
+ * `llvm.emit_c_interface` on the declaration does not fix it: MLIR then gives
+ * the function a body and the ExecutionEngine wants `_mlir_printMemrefBF16`
+ * instead, which no library exports either. Supplying the plain symbol here is
+ * what closes it, and it belongs beside the runtime rather than in vx_std_core
+ * -- the standard library has no MLIR dependency and should not gain one to
+ * print a tensor.
  *
- * MLIR's unpacked convention for `memref<*xT>` passes (rank, pointer to the ranked
- * descriptor); the packed entry point takes a pointer to exactly that pair.
+ * MLIR's unpacked convention for `memref<*xT>` passes (rank, pointer to the
+ * ranked descriptor); the packed entry point takes a pointer to exactly that
+ * pair.
  */
 
 #include <inttypes.h>
@@ -49,63 +52,63 @@ void printMemrefF16(int64_t rank, void *descriptor) {
   _mlir_ciface_printMemrefF16(&packed);
 }
 
-/* The byte and short printers are in the same position the half-precision ones
- * were: MLIR exports `_mlir_ciface_printMemrefI8`/`I16` and no plain
- * `printMemrefI8`/`I16`, and codegen emits the plain call. `nm` on MLIR 22 shows
- * plain exports for F32, F64, I32, I64, C32, C64 and Ind only.
- *
- * `printMemrefI16` goes through MLIR, which prints numbers. `printMemrefI8`
- * cannot: MLIR's I8 printer prints each element as a CHARACTER, so a tensor
- * holding 100 prints as `d` -- measured, and not what `print(t)` means in a
- * language whose scalar `i8` prints as a number (`scalar_print_narrow.vx`).
- * So the byte printer is ours: same header line MLIR writes, then the values as
- * signed decimals.
- *
- * Two things it does differently from MLIR's printers, and why:
- *
- *  - The layout is one line. MLIR breaks a rank-2 memref into one line per row
- *    and pads columns to a common width; matching that exactly is not worth
- *    reimplementing, and one line is what the tests can match.
- *  - It prints SIGNED values, and `u8` goes through it the way a `u32` tensor
- *    already goes through `printMemrefI32`. So a byte above 127 reads as its
- *    signed counterpart. That is how every unsigned tensor prints today;
- *    making one of them honest would be a change to all of them.
- *
- * The descriptor is MLIR's `StridedMemRefType`: two pointers (allocated, then
- * the aligned one the elements are addressed through), an offset, then `rank`
- * sizes and `rank` strides.
+/* MLIR exports the byte and short printers only packed, and codegen calls the
+ * plain name, so both wrappers live here. `printMemrefI16` goes through MLIR.
+ * `printMemrefI8` cannot: MLIR's I8 printer prints each element as a character
+ * (`100` prints as `d`), while a scalar `i8` prints as a number. The byte
+ * printer below prints decimals, in the same layout MLIR's printers use.
  */
 
-static void print_memref_i8_at(int8_t *data, const int64_t *sizes,
-                               const int64_t *strides, int64_t rank, int64_t dim,
-                               int64_t linear) {
-  if (dim == rank) {
-    printf("%d", (int)data[linear]);
+static void print_memref_i8_at(const int8_t *data, const int64_t *sizes,
+                               const int64_t *strides, int64_t rank,
+                               int64_t dim, int64_t offset) {
+  if (dim == 0) {
+    printf("%d", (int)data[offset]);
     return;
   }
   printf("[");
-  for (int64_t i = 0; i < sizes[dim]; ++i) {
-    if (i)
-      printf(", ");
-    print_memref_i8_at(data, sizes, strides, rank, dim + 1,
-                       linear + i * strides[dim]);
+  print_memref_i8_at(data, sizes + 1, strides + 1, rank, dim - 1, offset);
+  if (sizes[0] <= 1) {
+    printf("]");
+    return;
   }
+  printf(", ");
+  if (dim > 1)
+    printf("\n");
+  for (int64_t i = 1; i + 1 < sizes[0]; ++i) {
+    for (int64_t s = 0; s < rank - dim + 1; ++s)
+      printf(" ");
+    print_memref_i8_at(data, sizes + 1, strides + 1, rank, dim - 1,
+                       offset + i * strides[0]);
+    printf(", ");
+    if (dim > 1)
+      printf("\n");
+  }
+  for (int64_t s = 0; s < rank - dim + 1; ++s)
+    printf(" ");
+  print_memref_i8_at(data, sizes + 1, strides + 1, rank, dim - 1,
+                     offset + (sizes[0] - 1) * strides[0]);
   printf("]");
 }
 
 void printMemrefI8(int64_t rank, void *descriptor) {
   int8_t **ptrs = (int8_t **)descriptor;
-  int64_t *meta = (int64_t *)(ptrs + 2); /* the offset, then sizes, then strides */
+  /* The offset, then the sizes, then the strides. */
+  int64_t *meta = (int64_t *)(ptrs + 2);
   printf("Unranked Memref base@ = %p rank = %" PRId64 " offset = %" PRId64
          " sizes = [",
-         (void *)descriptor, rank, meta[0]);
+         (void *)ptrs[1], rank, meta[0]);
   for (int64_t i = 0; i < rank; ++i)
     printf("%s%" PRId64, i ? ", " : "", meta[1 + i]);
   printf("] strides = [");
   for (int64_t i = 0; i < rank; ++i)
     printf("%s%" PRId64, i ? ", " : "", meta[1 + rank + i]);
   printf("] data = \n");
-  print_memref_i8_at(ptrs[1], meta + 1, meta + 1 + rank, rank, 0, meta[0]);
+  if (rank == 0)
+    printf("[");
+  print_memref_i8_at(ptrs[1], meta + 1, meta + 1 + rank, rank, rank, meta[0]);
+  if (rank == 0)
+    printf("]");
   printf("\n");
 }
 
