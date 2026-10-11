@@ -96,8 +96,8 @@ Topology Device {
   // that is the edge's figure -- the card's own capability, as `capacity:` above
   // is the part's.
   //
-  // Measured on this machine instead: 10.8 GB/s outbound and 10.0 GB/s back on
-  // 2026-10-04, and 11.6-11.7 and 10.6-10.8 in two runs on 2026-10-11. The
+  // Measured on this machine instead: 10.8-11.7 GB/s outbound and 10.0-10.8 GB/s
+  // back over five runs, one on 2026-10-04 and four on 2026-10-11. The
   // platform is the limit, not the card: this CPU is a Ryzen 7 5700G (Cezanne)
   // and its lanes are PCIe 3.0, so the card runs at Gen3 x16 -- 15.75 GB/s of
   // theory, of which a copy through pinned host staging gets about two thirds.
