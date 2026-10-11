@@ -5,34 +5,23 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-// Printing a tensor of the narrow integers: i8, u8, i16, u16. Before this was
-// covered, such a program stopped with `ParseType("Unsupported MLIR element
-// type in: memref<?x?xi8>")` -- an internal message from the element-type
-// mapping in codegen, which knew seven types and not these six.
+// Printing a tensor of the narrow integers: i8, u8, i16, u16. Each type needs a
+// `printMemref*` helper, which is what the CHECK lines below assert.
 //
-// Two printers were needed, and they are not the same kind of thing:
-//
-//   - `printMemrefI16` is MLIR's. It prints numbers, so the shipped shim only
-//     supplies the plain name MLIR does not export (`runtime/vx_mlir_shims.c`).
-//   - `printMemrefI8` could not be. MLIR exports an I8 printer, and it prints
-//     each element as a CHARACTER: a tensor holding 100 prints as `d`. That is
-//     measured, and not what `print(t)` means here, where a scalar `i8` prints
-//     as a number (`scalar_print_narrow.vx`). So the byte printer is Vx's own,
-//     in the same file.
-//
-// The values stay inside the signed range of each type. Printing a value above
-// it reads as the signed counterpart -- a `u8` of 200 prints as -56, the way a
-// `u32` tensor prints today -- and that is recorded in the shim rather than
-// pinned here, so making unsigned tensors honest does not have to fight a test.
+// `printMemrefI16` is MLIR's. `printMemrefI8` is Vx's own
+// (`runtime/vx_mlir_shims.c`), because MLIR's I8 printer prints each element as
+// a character: a tensor holding 100 prints as `d`, not as the number a scalar
+// `i8` prints as. The OUT lines check that it still prints in MLIR's layout.
 //
 // RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
+// RUN: vxc %s --action run-jit 2>&1 | FileCheck %s --check-prefix=OUT
 // CHECK-DAG: func.func private @printMemrefI8(memref<*xi8>)
 // CHECK-DAG: func.func private @printMemrefI16(memref<*xi16>)
 // CHECK-LABEL: func.func @main() -> i32
-// The shape is a hole: the AST path emits a dynamic `memref<?x?xi8>` and the
-// flat path the static `memref<2x2xi8>`, and this file has to hold for the one
-// the RUN line reaches (the harness runs it with `--legacy-codegen`, the AST
-// path). What it asserts is the element type on both sides of the cast.
+// The shape is a hole: the AST path emits a dynamic `memref<?x?xi8>` and the flat
+// path the static `memref<2x2xi8>`, and this file has to hold for the one the RUN
+// line reaches (the harness runs it with `--legacy-codegen`, the AST path), so the
+// CHECK lines assert the element type on both sides of the cast.
 // CHECK: memref.cast %{{.*}} : memref<{{.*}}xi8> to memref<*xi8>
 // CHECK: call @printMemrefI8(%{{.*}}) : (memref<*xi8>) -> ()
 // CHECK: memref.cast %{{.*}} : memref<{{.*}}xi8> to memref<*xi8>
@@ -73,12 +62,31 @@ fn main() -> i32 {
   return 0;
 }
 
-// The byte lines are Vx's own printer, so their spacing is pinned. The short
-// ones come from MLIR, which pads columns to a common width: the holes keep this
-// from going red if that padding changes, without letting the values slide.
-// EXPECT: [[7, -3], [100, -128]]
-// EXPECT: [[7, 100], [3, 120]]
-// EXPECT: [[300,{{.*}}-3]
-// EXPECT: [100,{{.*}}-32768]]
-// EXPECT: [[300,{{.*}}120]
-// EXPECT: [100,{{.*}}5]]
+// All four print in MLIR's layout: one row per line, and a row after the first
+// indented by one space per level of nesting. `OUT-NEXT` is what makes the line
+// break part of the check -- a substring of one long line would satisfy an EXPECT
+// line just as well. `u8` goes through `printMemrefI8` and `u16` through
+// `printMemrefI16`, so the unsigned rows read as signed (#1612).
+// OUT: Unranked Memref base@ = 0x{{[0-9a-f]+}} rank = 2 offset = 0 sizes = [2, 2] strides = [2, 1] data =
+// OUT-NEXT: 7, -3],
+// OUT-NEXT: 100, -128]]
+// OUT: Unranked Memref base@ = 0x{{[0-9a-f]+}} rank = 2 offset = 0 sizes = [2, 2] strides = [2, 1] data =
+// OUT-NEXT: 7, 100],
+// OUT-NEXT: 3, 120]]
+// OUT: Unranked Memref base@ = 0x{{[0-9a-f]+}} rank = 2 offset = 0 sizes = [2, 2] strides = [2, 1] data =
+// OUT-NEXT: 300, -3],
+// OUT-NEXT: 100, -32768]]
+// OUT: Unranked Memref base@ = 0x{{[0-9a-f]+}} rank = 2 offset = 0 sizes = [2, 2] strides = [2, 1] data =
+// OUT-NEXT: 300, 120],
+// OUT-NEXT: 100, 5]]
+
+// The EXPECT lines are the flat code generator's check: it runs this program too
+// (flat_corpus_sweep), but it does not run the RUN lines.
+// EXPECT: [[7,   -3],
+// EXPECT: [100,   -128]]
+// EXPECT: [[7,   100],
+// EXPECT: [3,   120]]
+// EXPECT: [[300,   -3],
+// EXPECT: [100,   -32768]]
+// EXPECT: [[300,   120],
+// EXPECT: [100,   5]]

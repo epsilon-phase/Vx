@@ -978,6 +978,9 @@ const RUNTIME_HELPERS: [(&str, &str); 20] = [
     ("printMemrefI16", "(memref<*xi16>)"),
 ];
 
+// The helper mask is a `u64`, so the table must not grow past 64 entries.
+const _: () = assert!(RUNTIME_HELPERS.len() <= 64);
+
 /// Recover the declared memory sub-spaces from a compilation's env, in the shape
 /// [`emit_module_mlir`] wants.
 ///
@@ -1338,7 +1341,7 @@ pub fn emit_module_mlir(
         .map(|(name, _)| format!("@{name}("))
         .collect();
 
-    type FnEmission = (String, Vec<(String, Vec<String>, String)>, u32);
+    type FnEmission = (String, Vec<(String, Vec<String>, String)>, u64);
     // An inline block's wrapper is named from a module-wide base, so two functions' do not collide.
     let inline_bases: Vec<usize> = {
         let mut bases = Vec::with_capacity(funcs.len());
@@ -1366,9 +1369,9 @@ pub fn emit_module_mlir(
                 alias_tables.get(fi).copied().unwrap_or(&[]),
                 &mut distinct_ctr,
             )?;
-            let helpers = helper_pats.iter().enumerate().fold(0u32, |m, (i, pat)| {
+            let helpers = helper_pats.iter().enumerate().fold(0u64, |m, (i, pat)| {
                 if text.contains(pat.as_str()) {
-                    m | (1 << i)
+                    m | (1u64 << i)
                 } else {
                     m
                 }
@@ -1406,7 +1409,7 @@ pub fn emit_module_mlir(
     //
     // A decline is reported for the *first* declining function rather than whichever thread noticed
     // first, so `VX_FLAT_DBG` says the same thing it always did.
-    let mut helper_mask = 0u32;
+    let mut helper_mask = 0u64;
     for (fi, emission) in emitted.iter_mut().enumerate() {
         let (_, fn_calls, helpers) = match emission {
             Ok(e) => e,
