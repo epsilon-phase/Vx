@@ -19,24 +19,24 @@
 //
 // Device execution: none yet. `arch:` names the device-image target a backend
 // would emit (docs/gpu_backends.md, PR #1138); no such backend exists, so a
-// region spawned on this topology takes the host fallback, or the honest
-// refusal when its operands are in a space the host cannot read.
+// region spawned on this topology takes the host fallback, or E6003 -- the
+// refusal a read earns when the running topology cannot see the space the value
+// lives in -- when its operands are in a space the host cannot read.
 //
 // Figures measured on the card 2026-10-04 (Level Zero, OpenCL and Vulkan
 // queries) unless a `spec:` line names a published number.
 
-// spec: Intel Arc A770 (16 GB), DG2-512 / ACM-G10 -- 16 GB GDDR6 on a 256-bit
-// bus. The 16 GB card runs its memory at 17.5 Gbps, so the peak is
-// 256 bits x 17.5 Gbps / 8 = 560 GB/s. The 512 GB/s sometimes quoted for this
-// part is the 8 GB card, whose memory runs at 16 Gbps. The figure is from a
-// secondary source, not Intel's datasheet, whose rendered spec table did not
-// yield a readable number -- and a memory bandwidth is what derives every
-// transfer cost on this SKU's edges.
+// spec: Intel, "Introduction to the Xe-HPG Architecture" white paper, document
+// 758302 -- 16 GB of GDDR6 at up to 17.5 GT/s per pin over a maximum of 256
+// bits, "up to 560 GB/s of low-latency bandwidth". The 512 GB/s sometimes
+// quoted for this part is the 8 GB card, whose memory runs at 16 Gbps. A memory
+// bandwidth derives every transfer cost on this SKU's edges, so it is worth the
+// primary source rather than a second-hand figure.
 //
 // Measured: what the card reaches of it is a device-to-device copy at
-// 449 GB/s and a triad at 422 GB/s (scripts/tools/xpu_bandwidth_spike.sh). The
-// copy is about 80% of 560 GB/s, the fraction that traffic shape normally
-// carries.
+// 448-449 GB/s and a triad at 427-428 GB/s (scripts/tools/xpu_bandwidth_spike.sh,
+// two runs on 2026-10-11). The copy is about 80% of 560 GB/s, the fraction that
+// traffic shape normally carries.
 //
 // Measured: the driver reports 16225243136 bytes (15.11 GiB) of device memory,
 // about 0.9 GiB below the 16 GiB the part carries. Following fleet/README.md,
@@ -82,31 +82,36 @@ Topology Device {
   // cannot address this device's memory and a kernel here cannot address host
   // memory, so either direction is an explicit transfer and E6003 says so.
   visible: [Memory::HBM, Memory::L2, Memory::SMEM],
-  // spec: the XMX matrix units take INT2, INT4 and INT8 (TechPowerUp's DG2-512
-  // entry), and the scalar path is f32/f16 and integer. INT4 is therefore a
-  // matrix-unit format here, as it is on Ampere, and `i4`/`u4` are declared for
-  // the same reason a100-80 declares them. INT2 has no `ElementType` and is not
-  // listed, the way TF32 is absent from every file.
-  // bf16 is left out although the matrix units most likely take it: an element
-  // type lists what a machine file can cite, and omitting one rejects a bf16
-  // program that would probably have run, which is the safe direction. Adding
-  // it is one token once a source says so.
-  dtypes: [f32, f16, i4, u4, i8, u8, i16, u16, i32, u32, i64, u64, bool],
-  // Measured: 10.8 GB/s, and it is this platform's edge, not the card's. The
-  // A770 is a Gen4 x16 part, so the datasheet figure is 31.5 GB/s per
-  // direction, but this machine's CPU is a Ryzen 7 5700G (Cezanne) and its
-  // lanes are PCIe 3.0 only, so the card runs at Gen3 x16: 15.75 GB/s of
+  // spec: Intel, "Introduction to the Xe-HPG Architecture" white paper, document
+  // 758302 -- the XMX units "support FP16, BF16, INT8, INT4 and INT2 multiply,
+  // with either 16 or 32 bits accumulate", and the paper's throughput table
+  // lists XMX BF16, INT8 and INT4/INT2 rates. BF16 and INT4 are named in the
+  // same sentence by the same source, so both are declared; INT2 has no
+  // `ElementType` and is not listed, the way TF32 is absent from every file.
+  // The scalar path is f32/f16 and integer.
+  dtypes: [f32, bf16, f16, i4, u4, i8, u8, i16, u16, i32, u32, i64, u64, bool],
+  // spec: the A770 is a PCI Express 4.0 x16 part. Intel's Xe-HPG white paper
+  // (document 758302) gives "a maximum of 32 GB/s in each direction for a x16
+  // PCIe 4.0 slot", which is 31.5 GB/s after the link's 128b/130b encoding, so
+  // that is the edge's figure -- the card's own capability, as `capacity:` above
+  // is the part's.
+  //
+  // Measured on this machine instead: 10.8 GB/s outbound and 10.0 GB/s back on
+  // 2026-10-04, and 11.6-11.7 and 10.6-10.8 in two runs on 2026-10-11. The
+  // platform is the limit, not the card: this CPU is a Ryzen 7 5700G (Cezanne)
+  // and its lanes are PCIe 3.0, so the card runs at Gen3 x16 -- 15.75 GB/s of
   // theory, of which a copy through pinned host staging gets about two thirds.
   // Do not take the number back out of sysfs: `current_link_speed` and
   // `max_link_speed` at 0000:12:00.0 both report 2.5 GT/s x1 (Gen1 x1), which
   // cannot carry 10.8 GB/s, so this driver's link attributes are stale.
   // scripts/tools/xpu_bandwidth_spike.sh measures both directions.
-  transfer Memory::CPU_DRAM -> Memory::HBM : 10.8 GB/s,
-  // The way home, measured in the same run: 10.0 GB/s. Reading a placed tensor
-  // back is how a program says it still holds it; without the edge the model
-  // can only describe one direction, and fleet/mi300x.vx is the file that
-  // currently cannot serve admission because it declares only the outbound hop.
-  transfer Memory::HBM -> Memory::CPU_DRAM : 10.0 GB/s,
+  transfer Memory::CPU_DRAM -> Memory::HBM : 31.5 GB/s,
+  // The way home, declared from the same spec and measured in the same runs.
+  // Reading a placed tensor back is how a program says it still holds it;
+  // without the edge the model can only describe one direction, and
+  // fleet/mi300x.vx is the file that currently cannot serve admission because
+  // it declares only the outbound hop.
+  transfer Memory::HBM -> Memory::CPU_DRAM : 31.5 GB/s,
   // The on-die hops declare no cost: HBM and L2 nest via `within:`, so the
   // roofline derives what their bandwidths support (E6013 forbids a second
   // source on one edge). No `copy_engine` on the scratchpad hop: whether a
