@@ -1,29 +1,32 @@
 // Measure the Intel Arc A770's achieved memory bandwidth through Level Zero.
 //
-// Two numbers, both at a size large enough that the caches do not answer for
-// the memory:
+// Three measurements, all at a size large enough that the caches do not answer
+// for the memory:
 //
 //   - a device-to-device copy (`zeCommandListAppendMemoryCopy`), which moves
 //     twice the buffer's size -- one read and one write;
 //   - a triad kernel, x = a*y + b*z, which moves three times the buffer's size
-//     -- two reads and one write.
+//     -- two reads and one write;
+//   - a host-to-device and a device-to-host transfer through pinned host
+//     memory.
 //
-// Both are timed best-of-several after a warm-up. The result is checked against
-// the CPU: the copy against the source buffer, the triad against the same
-// formula computed on the host.
+// Each is timed best-of-several after a warm-up and each is checked: the copy
+// against the source buffer, the triad against the same formula computed on the
+// host, and the two transfer directions by clearing the host buffer first and
+// reading it back.
 //
-// Memory. The card is shared and this machine is unstable above 12 GiB of VRAM
-// in use, so the program prints its footprint and refuses to allocate past a
-// ceiling (`VX_VRAM_CEILING`, a decimal number of bytes, 12 GiB by default). At
-// the default 512 MiB per
-// buffer the copy phase holds 1 GiB and the triad phase 1.5 GiB.
+// Memory. The owner's machine is unstable above 12 GiB of VRAM in use, so the
+// program prints its footprint and refuses to allocate past a ceiling
+// (`VX_VRAM_CEILING`, a decimal number of bytes, 2 GiB by default and never
+// more than 12 GiB). At the default 512 MiB per buffer the copy phase holds
+// 1 GiB and the triad phase 1.5 GiB, so the default ceiling covers a default
+// run and a larger one has to be asked for on purpose.
 //
 // Build and run: scripts/tools/xpu_bandwidth_spike.sh [size in MiB]
 
 #include <level_zero/ze_api.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -31,6 +34,8 @@
 #include <cstring>
 #include <fstream>
 #include <vector>
+
+#include "vram_ceiling.h"
 
 #define L0_CHECK(call)                                                         \
   do {                                                                         \
@@ -47,27 +52,13 @@ static constexpr uint64_t kWorkgroup = 256;
 static constexpr uint64_t kGroups = 4096; // 1M work-items
 static constexpr int kWarmup = 2, kReps = 10;
 static constexpr float kA = 1.5f, kB = 2.0f;
+// The transfer phase's size per buffer, one on the device and one pinned on the
+// host. It is part of the peak, because it is allocated while the phase runs.
+static constexpr uint64_t kXfer = 256 * kMiB;
 
-/// The VRAM ceiling in bytes: `VX_VRAM_CEILING` when it is set, else 12 GiB.
-///
-/// A value that is not a decimal number of bytes is refused rather than turned
-/// into 0 by `strtoull`, which would make every run fail the ceiling check with
-/// a message that never mentions the variable.
-static uint64_t vramCeiling() {
-  const char *env = std::getenv("VX_VRAM_CEILING");
-  if (!env)
-    return 12ull * 1024 * 1024 * 1024;
-  char *end = nullptr;
-  errno = 0;
-  const unsigned long long value = std::strtoull(env, &end, 10);
-  if (end == env || *end != '\0' || errno == ERANGE) {
-    std::fprintf(stderr,
-                 "VX_VRAM_CEILING must be a decimal number of bytes, got \"%s\"\n",
-                 env);
-    std::exit(1);
-  }
-  return value;
-}
+/// The VRAM ceiling, its default and its maximum live in `vram_ceiling.h`, with
+/// the checked parse they share: one rule for every tool in this directory, so
+/// a second tool cannot grow its own weaker copy.
 
 static std::vector<char> readFile(const char *path) {
   std::ifstream f(path, std::ios::binary);
@@ -87,8 +78,18 @@ static double secondsSince(const std::chrono::steady_clock::time_point &t0) {
 int main(int argc, char **argv) {
   const char *spvPath = argc > 1 ? argv[1] : "triad.spv";
   const char *kernelName = argc > 2 ? argv[2] : "triad";
-  const uint64_t bytesPerBuffer =
-      (argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 512) * kMiB;
+  // Checked, because a size that is not a number used to become 0 here through
+  // `strtoull` with no `end` check: the run then failed a length check that
+  // never mentioned the argument. The number is MiB, so a value that would
+  // overflow the byte count is refused as well rather than wrapping.
+  const uint64_t sizeMiB =
+      argc > 3 ? parseByteCount("size in MiB", argv[3], UINT64_MAX / kMiB)
+               : 512;
+  if (sizeMiB == 0) {
+    std::fprintf(stderr, "size in MiB: 0 measures nothing\n");
+    return 1;
+  }
+  const uint64_t bytesPerBuffer = sizeMiB * kMiB;
   const uint64_t elems = bytesPerBuffer / sizeof(float);
   if (elems % 4 != 0) {
     std::fprintf(stderr, "the size must be a multiple of 16 bytes\n");
@@ -99,15 +100,15 @@ int main(int argc, char **argv) {
   const bool shortN = std::strcmp(sabotage, "short-n") == 0;
   const bool skipCopy = std::strcmp(sabotage, "skip-copy") == 0;
   const bool skipReadback = std::strcmp(sabotage, "skip-readback") == 0;
+  const bool skipUpload = std::strcmp(sabotage, "skip-upload") == 0;
+  const bool skipDownload = std::strcmp(sabotage, "skip-download") == 0;
 
-  const uint64_t peak = std::max(2 * bytesPerBuffer, 3 * bytesPerBuffer);
-  if (peak > vramCeiling()) {
-    std::fprintf(stderr,
-                 "refusing to run: %llu bytes needed, VX_VRAM_CEILING is %llu "
-                 "bytes\n",
-                 (unsigned long long)peak, (unsigned long long)vramCeiling());
-    return 1;
-  }
+  // The most device memory this run holds at one time: the triad phase's three
+  // buffers, or the transfer phase's one device buffer, whichever is larger.
+  // The phases free their buffers before the next phase starts, so this is a
+  // peak and not a sum. Checked before `zeInit` and before any allocation.
+  requireWithinCeiling("xpu_bandwidth_spike",
+                       std::max(3 * bytesPerBuffer, kXfer), vramCeiling());
 
   L0_CHECK(zeInit(ZE_INIT_FLAG_GPU_ONLY));
   uint32_t driverCount = 0;
@@ -129,7 +130,7 @@ int main(int argc, char **argv) {
       if (props.type == ZE_DEVICE_TYPE_GPU) {
         driver = d;
         device = dev;
-        std::printf("device: %s  (%u compute units)\n", props.name,
+        std::printf("device: %s  (%u EUs)\n", props.name,
                     props.numEUsPerSubslice * props.numSubslicesPerSlice *
                         props.numSlices);
         break;
@@ -180,10 +181,16 @@ int main(int argc, char **argv) {
     L0_CHECK(zeCommandQueueSynchronize(queue, UINT64_MAX));
     L0_CHECK(zeCommandListReset(list));
 
+    const char zero = 0;
     auto copy = [&]() {
-      // The sabotage skips the copy, so b keeps whatever it held and the
-      // readback below cannot match the source.
-      if (!skipCopy)
+      // The sabotage fills b with zeroes instead of copying a into it. Filling
+      // it, rather than leaving it alone, is what makes the failure belong to
+      // this check: fresh device memory could happen to hold the source's
+      // pattern, and then a readback that proves nothing would still pass.
+      if (skipCopy)
+        L0_CHECK(zeCommandListAppendMemoryFill(
+            list, b, &zero, 1, bytesPerBuffer, nullptr, 0, nullptr));
+      else
         L0_CHECK(zeCommandListAppendMemoryCopy(list, b, a, bytesPerBuffer,
                                                nullptr, 0, nullptr));
       L0_CHECK(zeCommandListClose(list));
@@ -338,7 +345,7 @@ int main(int argc, char **argv) {
 
   // --- host to device and back ---------------------------------------------
   {
-    const uint64_t xfer = 256 * kMiB;
+    const uint64_t xfer = kXfer;
     std::printf("transfer phase: 256 MiB pinned host + 256 MiB device\n");
     void *devbuf = nullptr, *hostbuf = nullptr;
     ze_host_mem_alloc_desc_t hostDesc = {};
@@ -376,8 +383,36 @@ int main(int argc, char **argv) {
       download();
       down = std::min(down, secondsSince(t0));
     }
-    std::printf("  host to device: %.1f GB/s\n", xfer / up / 1e9);
-    std::printf("  device to host: %.1f GB/s\n", xfer / down / 1e9);
+
+    // The timed loop above is not a check. Both directions are checked here,
+    // and the host buffer is cleared before each readback because it still
+    // holds the pattern that was just uploaded: a download that did nothing
+    // would leave that pattern in place and pass. The sabotage applies to this
+    // check alone, so a skipped upload leaves the device holding what the timed
+    // loop put there (3) rather than leaving it unwritten -- a check that
+    // cannot fail is worth nothing.
+    auto allBytesAre = [&](char want) {
+      const char *begin = static_cast<const char *>(hostbuf);
+      return std::all_of(begin, begin + xfer,
+                         [want](char c) { return c == want; });
+    };
+    auto check = [&](char want, bool doUpload, bool doDownload) {
+      std::memset(hostbuf, want, xfer);
+      if (doUpload)
+        upload();
+      std::memset(hostbuf, 0, xfer);
+      if (doDownload)
+        download();
+      return allBytesAre(want);
+    };
+    const bool upOk = check(9, !skipUpload, true);
+    const bool downOk = check(4, true, !skipDownload);
+    std::printf("  host to device: %.1f GB/s, %s\n", xfer / up / 1e9,
+                upOk ? "checked" : "WRONG");
+    std::printf("  device to host: %.1f GB/s, %s\n", xfer / down / 1e9,
+                downOk ? "checked" : "WRONG");
+    if (!upOk || !downOk)
+      return 1;
     L0_CHECK(zeMemFree(context, devbuf));
     L0_CHECK(zeMemFree(context, hostbuf));
   }
