@@ -75,11 +75,23 @@ static uint64_t vramCeiling() {
 // report a number for the wrong thing.
 static void requireWithinCeiling(const char *tool, uint64_t peak,
                                  uint64_t ceiling) {
-  std::printf(
-      "ceiling: %llu MiB%s\n", (unsigned long long)(ceiling / (1024 * 1024)),
-      std::getenv("VX_VRAM_CEILING") ? " (VX_VRAM_CEILING)" : " (default)");
-  std::printf("peak: %llu MiB of device memory at once\n",
-              (unsigned long long)(peak / (1024 * 1024)));
+  const uint64_t mib = 1024 * 1024;
+  // A helper whose footprint is a few hundred bytes would print "0 MiB" and
+  // read like a bug, so a size below a mebibyte is printed in bytes.
+  if (ceiling >= mib)
+    std::printf("ceiling: %llu MiB%s\n", (unsigned long long)(ceiling / mib),
+                std::getenv("VX_VRAM_CEILING") ? " (VX_VRAM_CEILING)"
+                                               : " (default)");
+  else
+    std::printf("ceiling: %llu bytes%s\n", (unsigned long long)ceiling,
+                std::getenv("VX_VRAM_CEILING") ? " (VX_VRAM_CEILING)"
+                                               : " (default)");
+  if (peak >= mib)
+    std::printf("peak: %llu MiB of device memory at once\n",
+                (unsigned long long)(peak / mib));
+  else
+    std::printf("peak: %llu bytes of device memory at once\n",
+                (unsigned long long)peak);
   if (peak > ceiling) {
     std::fflush(stdout);
     std::fprintf(stderr,
