@@ -3859,10 +3859,9 @@ struct ConvertVxToLLVMPass
       // One image per module, and every kernel in it is an entry point: a
       // loader takes the module and then asks for a function by name. So the
       // module's kernels have to agree on the pipeline that produces that one
-      // image. They always do today -- the gate puts every admitted kernel in
-      // this module -- and a program that places kernels on two architectures
-      // with different pipelines must say so rather than get a module whose
-      // image is only right for some of its entry points.
+      // image. Two architectures that have a pipeline each do not agree, and
+      // the program has to say so rather than get a module whose image is only
+      // right for some of its entry points.
       DevicePipeline pipeline = DevicePipeline::None;
       bool mixed = false;
       m.walk([&](gpu::GPUFuncOp f) {
