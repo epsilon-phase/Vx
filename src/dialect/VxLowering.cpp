@@ -1502,17 +1502,29 @@ static DevicePipeline pipelineForArch(StringRef arch) {
   return DevicePipeline::None;
 }
 
-/// The architecture a pipeline is the pipeline for: what a `gpu.module` it
-/// compiles records as its target, and what the image step reads back through
-/// `pipelineForArch`.
-static StringRef archOfPipeline(DevicePipeline pipeline) {
-  switch (pipeline) {
-  case DevicePipeline::Nvptx:
-    return "nvptx64";
-  case DevicePipeline::None:
-    return "";
-  }
-  return "";
+/// The pipeline that compiles the kernel placed on `topology`: the declared
+/// architecture when it carries one, and the dispatch-id band when it does not.
+///
+/// The band stays the fallback for kernels with no arch attribute: built-in
+/// topologies (whose descriptors declare no arch) and the AST-codegen path
+/// (which does not stamp). A declared arch with no row in the table --
+/// `applegpu` reaches its device through the plugin ABI, not through a device
+/// image -- answers `None`.
+///
+/// `materializeGpuKernels` asks this to decide whether a kernel gets a device
+/// twin, `spawnRunsOnDevice` asks it the same question about the `vx.spawn` the
+/// kernel is outlined from, and the device-image step asks it again to decide
+/// which pipeline compiles the twin. One answer, so a kernel cannot be admitted
+/// for one architecture and compiled for another.
+static DevicePipeline pipelineOfKernel(Operation *placed, int32_t topology) {
+  if (auto arch = placed->getAttrOfType<StringAttr>("arch"))
+    return pipelineForArch(arch.getValue());
+  // The GPU band from `topology_dispatch_id` in src/arch.rs, where `GPU[i]` is
+  // 500 + i. NPU and AccCore are below the band and outline the same way, but
+  // they reach their devices through a different backend.
+  if (topology >= 500 && topology < 600)
+    return DevicePipeline::Nvptx;
+  return DevicePipeline::None;
 }
 
 // Read a buffer cell once before a `vx.spawn` when the region only reads it.
@@ -1548,16 +1560,6 @@ static void readCellsBeforeSpawns(ModuleOp module) {
   });
 }
 
-/// Whether a kernel placed on `topology` gets a device twin: the declared
-/// `arch` when `placed` carries one, the GPU band of `topology_dispatch_id`
-/// when it does not. NPU, AccCore and a declared arch such as `applegpu` reach
-/// their devices through a different backend, so they get no NVVM twin.
-static bool hasDevicePipeline(Operation *placed, int32_t topology) {
-  if (auto arch = placed->getAttrOfType<StringAttr>("arch"))
-    return arch.getValue() == "nvptx64";
-  return topology >= 500 && topology < 600;
-}
-
 /// Whether `op`, in the body of a placed region, can run on the device.
 /// A call or a constant table is added to `callees` when it can come along.
 static bool runsOnDevice(Operation *op, ModuleOp module,
@@ -1590,7 +1592,8 @@ static bool runsOnDevice(Operation *op, ModuleOp module,
 /// Whether the kernel outlined from `spawn` will get a device twin, by the
 /// rules `materializeGpuKernels` applies to it later.
 static bool spawnRunsOnDevice(vx::SpawnOp spawn) {
-  if (!hasDevicePipeline(spawn, spawn.getTopology()))
+  // No pipeline compiles the region, so it gets no device twin.
+  if (pipelineOfKernel(spawn, spawn.getTopology()) == DevicePipeline::None)
     return false;
   auto module = spawn->getParentOfType<ModuleOp>();
   DeviceCallees callees;
@@ -2179,11 +2182,7 @@ struct ConvertVxToStandardPass
   void materializeGpuKernels(ModuleOp module) {
     SmallVector<vx::KernelOp> kernels;
     llvm::DenseMap<Operation *, DeviceCallees> callees;
-    // The pipeline the admitted kernels agreed on, recorded on the module
-    // below. Every kernel here passed the gate, so they share one.
-    DevicePipeline admittedPipeline = DevicePipeline::None;
     module.walk([&](vx::KernelOp k) {
-      const int32_t topo = static_cast<int32_t>(k.getTopology());
       // Eligibility: which device pipeline compiles this kernel, from the
       // DECLARED arch when the kernel carries one and the dispatch-id band when
       // it does not. A machine file that says `arch: nvptx64` has answered
@@ -2198,20 +2197,11 @@ struct ConvertVxToStandardPass
       // AST-codegen path (which does not stamp). A declared arch with no row in
       // the table -- `applegpu` reaches its device through the plugin ABI, not
       // NVVM -- is excluded here exactly like NPU/AccCore below.
-      DevicePipeline pipeline = DevicePipeline::None;
-      if (auto arch = k->getAttrOfType<StringAttr>("arch"))
-        pipeline = pipelineForArch(arch.getValue());
-      else if (topo >= 500 && topo < 600)
-        // The GPU band from `topology_dispatch_id`. NPU and AccCore outline the
-        // same way but reach their devices through a different backend, and
-        // giving them an NVVM twin would be claiming something untrue.
-        pipeline = DevicePipeline::Nvptx;
-      // No pipeline claims the kernel -- its declared arch has no row, or it
-      // carries no arch and is outside the GPU band -- so it gets no device
-      // twin.
-      if (pipeline == DevicePipeline::None)
+      //
+      // No pipeline claims the kernel: it gets no twin, and stops here rather
+      // than being cloned into a `gpu.module` that nothing will compile.
+      if (pipelineOfKernel(k, topo) == DevicePipeline::None)
         return;
-      admittedPipeline = pipeline;
       // A kernel that hands back a value writes it into a host stack slot,
       // which a GPU cannot address; the runtime runs it on the host instead.
       if (k->hasAttr("vx.result_slot"))
@@ -2266,10 +2256,6 @@ struct ConvertVxToStandardPass
     builder.setInsertionPointToEnd(module.getBody());
     auto gpuModule =
         builder.create<gpu::GPUModuleOp>(module.getLoc(), "vx_kernels");
-    // The module names its target, so the image step reads the pipeline the
-    // gate chose instead of asking again (docs/gpu_backends.md, item 1).
-    gpuModule->setAttr("vx.target",
-                       builder.getStringAttr(archOfPipeline(admittedPipeline)));
 
     // The kernels' callees and constant tables, copied once each. The host
     // keeps its own: only the device clone needs these.
@@ -3676,15 +3662,44 @@ struct ConvertVxToLLVMPass
     getOperation().walk(
         [&](gpu::GPUModuleOp m) { deviceModules.push_back(m); });
 
+    // Which pipeline compiles which kernel, from the same answer the gate used
+    // to decide the kernel got a twin at all (`pipelineOfKernel`). Asking twice
+    // from one source is what keeps a kernel from being admitted for one
+    // architecture and compiled for another; the `vx.kernel` ops are still here
+    // at this point, and the `gpu.func` beside each carries its name.
+    llvm::StringMap<DevicePipeline> kernelPipelines;
+    getOperation().walk([&](vx::KernelOp k) {
+      kernelPipelines[k.getSymName()] =
+          pipelineOfKernel(k, static_cast<int32_t>(k.getTopology()));
+    });
+
     llvm::StringMap<std::string> deviceImages;
     for (gpu::GPUModuleOp m : deviceModules) {
-      // Which pipeline compiles this module, from the target the gate recorded
-      // on it. A module with no target is a bug rather than a program Vx should
-      // compile: the gate gives a kernel with no pipeline no twin, so nothing
-      // reaches here without one.
-      auto target = m->getAttrOfType<StringAttr>("vx.target");
-      const DevicePipeline pipeline =
-          target ? pipelineForArch(target.getValue()) : DevicePipeline::None;
+      // One image per module, and every kernel in it is an entry point: a
+      // loader takes the module and then asks for a function by name. So the
+      // module's kernels have to agree on the pipeline that produces that one
+      // image. They always do today -- the gate puts every admitted kernel in
+      // this module -- and a program that places kernels on two architectures
+      // with different pipelines must say so rather than get a module whose
+      // image is only right for some of its entry points.
+      DevicePipeline pipeline = DevicePipeline::None;
+      bool mixed = false;
+      m.walk([&](gpu::GPUFuncOp f) {
+        auto it = kernelPipelines.find(f.getName());
+        if (it == kernelPipelines.end())
+          return;
+        if (pipeline == DevicePipeline::None)
+          pipeline = it->second;
+        else if (pipeline != it->second)
+          mixed = true;
+      });
+      if (mixed) {
+        m.emitError("this device module holds kernels for more than one "
+                    "architecture; each needs a module of its own");
+        signalPassFailure();
+        return;
+      }
+
       std::string error;
       std::string image;
       switch (pipeline) {
@@ -3692,7 +3707,9 @@ struct ConvertVxToLLVMPass
         image = deviceImageOf(m, error);
         break;
       case DevicePipeline::None:
-        error = "no device pipeline answers for this module";
+        // The gate gives a kernel with no pipeline no twin, so a module here
+        // with no pipeline is a bug rather than a program Vx should compile.
+        error = "no device pipeline answers for these kernels";
         break;
       }
       // Fatal rather than "emit nothing and carry on". Carrying on produces a
