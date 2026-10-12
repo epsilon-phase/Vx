@@ -43,6 +43,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -1168,8 +1169,8 @@ static void placeTransferFree(vx::TransferOp transfer) {
         continue;
       auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
           call, call.getCalleeAttr());
-      if (callee && placedTopology(
-                        callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
+      if (callee &&
+          placedTopology(callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
         return;
     }
 
@@ -1467,10 +1468,9 @@ static bool collectDeviceCallees(Operation *op, ModuleOp module, bool inCallee,
 
 /// The device-image pipelines a kernel's declared `arch:` can select.
 ///
-/// `None` is not an error -- `applegpu` reaches its device through the plugin
-/// ABI, so a topology Vx cannot compile for still type-checks. A row and its
-/// pipeline land together: a row without one would clone a body into a
-/// `gpu.module` that nothing compiles (docs/gpu_backends.md, item 1).
+/// `None` is not an error: a topology Vx cannot compile for still type-checks.
+/// A row and its pipeline land together: a row without one would clone a body
+/// into a `gpu.module` that nothing compiles (docs/gpu_backends.md, item 1).
 ///
 /// `nvptx64` selects the NVVM pipeline in `deviceImageOf` and `spirv64` the
 /// SPIR-V pipeline in `spirvImageOf`; the second is what the Intel Arc's
@@ -1579,6 +1579,7 @@ static void freePlaced(OpBuilder &builder, Location loc, Value buffer,
   builder.create<vx::FreeOp>(loc, buffer, topology);
 }
 
+
 // Whether parameter `i` of the function `call` reaches is taken by value.
 static bool takesOwnership(func::CallOp call, unsigned i) {
   auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
@@ -1615,6 +1616,7 @@ static Value castSource(Value v) {
 
 static BufferOrigin originOf(Value v, llvm::SmallPtrSetImpl<void *> &seen,
                              std::optional<int32_t> &topology);
+
 
 // The origin of every value in `values`, when they all have the same one.
 static BufferOrigin commonOrigin(ArrayRef<Value> values,
@@ -2088,22 +2090,7 @@ struct ConvertVxToStandardPass
     SmallVector<vx::KernelOp> kernels;
     llvm::DenseMap<Operation *, DeviceCallees> callees;
     module.walk([&](vx::KernelOp k) {
-      // Eligibility: which device pipeline compiles this kernel, from the
-      // DECLARED arch when the kernel carries one and the dispatch-id band when
-      // it does not. A machine file that says `arch: nvptx64` has answered
-      // "what code do we emit for this topology" -- that is the field's
-      // documented meaning -- and this is the place that needed the answer;
-      // before the attribute existed the gate was the band alone, which a
-      // custom topology can never enter (declared ids start at 3000 by
-      // construction), so no declaration could produce a device image (Vx#352).
-      //
-      // The band stays as the fallback for kernels with no arch attribute:
-      // built-in topologies (whose descriptors declare no arch) and the
-      // AST-codegen path (which does not stamp). A declared arch with no row in
-      // the table -- `applegpu` reaches its device through the plugin ABI, not
-      // NVVM -- is excluded here exactly like NPU/AccCore below.
-      //
-      // No pipeline claims the kernel: it gets no twin, and stops here rather
+      // A kernel no pipeline claims gets no device twin: it stops here rather
       // than being cloned into a `gpu.module` that nothing will compile.
       if (pipelineOfKernel(k) == DevicePipeline::None)
         return;
@@ -3874,8 +3861,8 @@ struct ConvertVxToLLVMPass
           mixed = true;
       });
       if (mixed) {
-        m.emitError("this device module holds kernels for more than one "
-                    "architecture; each needs a module of its own");
+        m.emitError("kernels for two GPU architectures in one program are not "
+                    "supported yet");
         signalPassFailure();
         return;
       }
@@ -3890,10 +3877,11 @@ struct ConvertVxToLLVMPass
         image = spirvImageOf(m, error);
         break;
       case DevicePipeline::None:
-        // The gate gives a kernel with no pipeline no twin, so a module here
-        // with no pipeline is a bug rather than a program Vx should compile.
-        error = "no device pipeline answers for these kernels";
-        break;
+        // The gate gives a kernel with no pipeline no device twin, so no
+        // module reaching the image step can lack one. This is a bug in the
+        // compiler, not a program to refuse.
+        llvm_unreachable(
+            "a device module reached the image step with no pipeline");
       }
       // Fatal rather than "emit nothing and carry on". Carrying on produces a
       // program that compiles, dispatches, and is then refused at the far end

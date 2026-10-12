@@ -16,8 +16,7 @@
 // the module's target (Vx#1368).
 //
 // RUN: not vxc %s --emit-llvm 2>&1 | FileCheck %s
-// CHECK: this device module holds kernels for more than one architecture
-// CHECK: each needs a module of its own
+// CHECK: kernels for two GPU architectures in one program are not supported yet
 
 Memory CPU_DRAM {}
 Memory GPU_HBM {
