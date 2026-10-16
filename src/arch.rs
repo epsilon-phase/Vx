@@ -490,39 +490,36 @@ impl AddressSpace {
 }
 
 /// The device target a machine file's `arch:` declares (`arch: nvptx64`), so each target's
-/// address-space numbers sit behind one table instead of being hardcoded at every use
-/// (docs/gpu_backends.md, "Shared work before a second backend").
+/// address-space numbers sit behind one table instead of being hardcoded at every use.
 ///
-/// Only NVPTX has a pipeline today, so only its arm carries that target's own numbers. Every
-/// other arm answers with the numbers the compiler has always emitted: a number guessed before
-/// the target's pipeline exists would land wrong code silently, which is the failure #258
-/// records.
+/// Every target here is one this compiler knows. Only NVPTX has a pipeline today, so only its
+/// arm carries that target's own numbers; the rest answer with the numbers the compiler has
+/// always emitted, because a number guessed before the target's pipeline exists would land
+/// wrong code silently, which is the failure #258 records. A name no target has is not one of
+/// these arms -- [`address_space_for_arch`] refuses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceTarget {
     X86_64,
     Aarch64,
     Nvptx64,
     AmdGcn,
-    /// The Intel XPU route (SPIR-V + Level Zero, docs/gpu_backends.md). Its storage-class
-    /// numbering comes from MLIR's `SPIRVTypeConverter` and is added with the pipeline, not
-    /// guessed here first.
+    /// The Intel XPU route (SPIR-V + Level Zero). Its storage-class numbering comes from
+    /// MLIR's `SPIRVTypeConverter` and is added with the pipeline, not guessed here first.
     Spirv64,
-    /// An `arch:` the compiler does not know: still an answer -- today's numbers -- rather
-    /// than a refusal in the middle of an emit.
-    Unknown,
 }
 
 impl DeviceTarget {
-    /// The target an `arch:` declaration names, [`DeviceTarget::Unknown`] for a name that
-    /// names none of them.
-    pub fn from_arch(name: &str) -> DeviceTarget {
+    /// The target an `arch:` declaration names, `None` for a name no target has: this compiler
+    /// has no address-space numbering for such a name, and [`address_space_for_arch`] refuses
+    /// it rather than answering with NVPTX's.
+    pub fn from_arch(name: &str) -> Option<DeviceTarget> {
         match name {
-            "x86_64" => DeviceTarget::X86_64,
-            "aarch64" => DeviceTarget::Aarch64,
-            "nvptx64" => DeviceTarget::Nvptx64,
-            "amdgcn" => DeviceTarget::AmdGcn,
-            "spirv64" => DeviceTarget::Spirv64,
-            _ => DeviceTarget::Unknown,
+            "x86_64" => Some(DeviceTarget::X86_64),
+            "aarch64" => Some(DeviceTarget::Aarch64),
+            "nvptx64" => Some(DeviceTarget::Nvptx64),
+            "amdgcn" => Some(DeviceTarget::AmdGcn),
+            "spirv64" => Some(DeviceTarget::Spirv64),
+            _ => None,
         }
     }
 
@@ -532,23 +529,35 @@ impl DeviceTarget {
             // NVPTX: 0 generic, 1 global, 3 shared, 5 local.
             DeviceTarget::Nvptx64 => space.nvptx_addrspace(),
             // No other target's pipeline exists yet, so today's numbers stand in until that
-            // target's own table replaces this arm.
+            // target's own table replaces this arm. An `arch:` naming nothing never becomes a
+            // `DeviceTarget`: `from_arch` returns `None` and the caller refuses it, so no arm
+            // here can answer for a target this compiler does not know.
             DeviceTarget::X86_64
             | DeviceTarget::Aarch64
             | DeviceTarget::AmdGcn
-            | DeviceTarget::Spirv64
-            | DeviceTarget::Unknown => space.nvptx_addrspace(),
+            | DeviceTarget::Spirv64 => space.nvptx_addrspace(),
         }
     }
 }
 
 /// The number for `space` under a declared `arch:`, for callers that may have no declaration
-/// in hand at all. No arch (a built-in topology declares none, and the flat path must keep
-/// emitting today's numbers for it) and an arch this compiler does not know both answer with
-/// today's numbers.
+/// in hand at all.
+///
+/// No arch (a built-in topology declares none, and the flat path must keep emitting today's
+/// numbers for it) answers with today's numbers. An `arch:` naming no target this compiler
+/// knows is a panic rather than an answer: NVPTX's numbers are the only ones it could hand
+/// back, and nothing downstream could tell that from a real mapping of the target the machine
+/// file meant.
 pub fn address_space_for_arch(arch: Option<&str>, space: AddressSpace) -> i32 {
     match arch {
-        Some(name) => DeviceTarget::from_arch(name).address_space(space),
+        Some(name) => DeviceTarget::from_arch(name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "machine file declares `arch: {name}`, which names no target this compiler \
+                     knows; it has no address-space numbering for that name"
+                )
+            })
+            .address_space(space),
         None => space.nvptx_addrspace(),
     }
 }
@@ -1570,10 +1579,10 @@ mod tests {
         assert_eq!(builtin_address_space(&MemorySpace::RemoteHbm), None);
     }
 
-    /// Work item 3 of docs/gpu_backends.md: one table, one entry per target. The NVPTX arm
-    /// carries the real numbering; a recognized arch without its own pipeline yet, an arch
-    /// the compiler does not know, and no arch at all each answer with today's numbers, so
-    /// the emit cannot change while the other arms are still unwritten.
+    /// One table, one entry per target. What this checks: the NVPTX arm carries that target's
+    /// real numbering; a target whose pipeline does not exist yet, and no declared arch at all,
+    /// answer with the numbers the compiler has always emitted, so the emit cannot change while
+    /// those arms are still unwritten.
     #[test]
     fn address_space_numbers_come_from_the_declared_arch() {
         let spaces = [
@@ -1590,28 +1599,51 @@ mod tests {
         }
 
         // The arch strings a machine file may declare.
-        assert_eq!(DeviceTarget::from_arch("x86_64"), DeviceTarget::X86_64);
-        assert_eq!(DeviceTarget::from_arch("aarch64"), DeviceTarget::Aarch64);
-        assert_eq!(DeviceTarget::from_arch("nvptx64"), DeviceTarget::Nvptx64);
-        assert_eq!(DeviceTarget::from_arch("amdgcn"), DeviceTarget::AmdGcn);
-        assert_eq!(DeviceTarget::from_arch("spirv64"), DeviceTarget::Spirv64);
-        assert_eq!(DeviceTarget::from_arch("riscv64"), DeviceTarget::Unknown);
+        assert_eq!(
+            DeviceTarget::from_arch("x86_64"),
+            Some(DeviceTarget::X86_64)
+        );
+        assert_eq!(
+            DeviceTarget::from_arch("aarch64"),
+            Some(DeviceTarget::Aarch64)
+        );
+        assert_eq!(
+            DeviceTarget::from_arch("nvptx64"),
+            Some(DeviceTarget::Nvptx64)
+        );
+        assert_eq!(
+            DeviceTarget::from_arch("amdgcn"),
+            Some(DeviceTarget::AmdGcn)
+        );
+        assert_eq!(
+            DeviceTarget::from_arch("spirv64"),
+            Some(DeviceTarget::Spirv64)
+        );
+        assert_eq!(DeviceTarget::from_arch("riscv64"), None);
 
-        // An arch with no declared target and an arch this compiler does not know both give
-        // today's numbers -- the flat path has no arch for a built-in topology and must not
-        // change because of it.
+        // No declared arch at all gives today's numbers -- the flat path has no arch for a
+        // built-in topology and must not change because of it.
         for (space, n) in spaces.iter().zip(today) {
             assert_eq!(address_space_for_arch(None, *space), n);
-            assert_eq!(address_space_for_arch(Some("riscv64"), *space), n);
         }
 
-        // Every recognized arch answers today's numbers too: the SPIR-V arm in particular
-        // gets its storage classes from the pipeline, not a constant guessed here.
+        // Every arch this compiler knows answers today's numbers too: the SPIR-V arm in
+        // particular gets its storage classes from the pipeline, not a constant guessed here.
         for arch in ["x86_64", "aarch64", "nvptx64", "amdgcn", "spirv64"] {
             for (space, n) in spaces.iter().zip(today) {
                 assert_eq!(address_space_for_arch(Some(arch), *space), n);
             }
         }
+    }
+
+    /// An `arch:` naming no target this compiler knows is refused instead of answered. The
+    /// fall-through here used to return `nvptx_addrspace` for it, so a machine file declaring
+    /// `arch: thumbv7em` -- which `fleet/cortex-m7.vx` does -- read as NVPTX global memory, and
+    /// no later pass could tell that from a real mapping.
+    #[test]
+    #[should_panic(expected = "arch: thumbv7em")]
+    fn an_arch_this_compiler_does_not_know_has_no_address_space() {
+        address_space_for_arch(Some("thumbv7em"), AddressSpace::Private);
     }
 
     /// #258's more serious defect: every user-declared space used to become address space 4.
