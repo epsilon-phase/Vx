@@ -636,6 +636,79 @@ fn a_strided_and_dynamic_row_kernel_gets_a_spirv_module_in_the_payload_section()
     }
 }
 
+/// A placed region whose body holds an `llvm.alloca` -- the slot the flat
+/// emitter gives a struct-valued local -- reaches no device image, and now says
+/// so out loud (#1137).
+///
+/// The device pipelines were measured on `arith`/`cf`/`gpu`/`math`/`memref`/
+/// `scf`/`vector`, so an `llvm` op in the body keeps the region on the host.
+/// The values are right -- the host clone computes them, one thread at a time
+/// -- which is exactly why silence is the wrong answer: nothing else tells the
+/// author the kernel never reached the card. Before this warning the payload
+/// simply carried no image and the output said nothing.
+#[test]
+fn a_kernel_with_a_struct_local_says_it_runs_on_the_host() {
+    let path = corpus("spirv_device_image_struct_local.vx");
+    let out = Command::new(env!("CARGO_BIN_EXE_vxc"))
+        .arg(&path)
+        .arg("--emit-llvm")
+        .output()
+        .unwrap_or_else(|e| panic!("could not run vxc: {e}"));
+    assert!(
+        out.status.success(),
+        "the flat path failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !ir.contains("format=spirv"),
+        "a kernel whose body holds an op the device pipeline does not lower \
+         must have no SPIR-V image rather than one that is wrong"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`llvm` dialect") && stderr.contains("run on the host"),
+        "the compiler dropped this kernel's device twin without saying why, so \
+         the author believes it runs on the card; stderr was:\n{stderr}"
+    );
+}
+
+/// A placed region that calls the runtime -- `print` inside the region -- also
+/// reaches no device image, and now says so, naming the callee it could not
+/// bring along (#1137).
+///
+/// A device kernel can call only what the device can run, and the runtime is
+/// not that, so the region keeps the host path. The message names the callee
+/// rather than the call, because that is the thing the author wrote.
+#[test]
+fn a_kernel_that_calls_the_runtime_says_it_runs_on_the_host() {
+    let path = corpus("spirv_device_image_runtime_call.vx");
+    let out = Command::new(env!("CARGO_BIN_EXE_vxc"))
+        .arg(&path)
+        .arg("--emit-llvm")
+        .output()
+        .unwrap_or_else(|e| panic!("could not run vxc: {e}"));
+    assert!(
+        out.status.success(),
+        "the flat path failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !ir.contains("format=spirv"),
+        "a kernel that calls the runtime must have no SPIR-V image rather than \
+         one that is wrong"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot compile `print_f32`") && stderr.contains("run on the host"),
+        "the compiler dropped this kernel's device twin without naming the \
+         callee that kept it at home; stderr was:\n{stderr}"
+    );
+}
+
 /// A `spirv64` region that yields a value gets no `format=spirv` image, and
 /// says why: the value is handed back through a host stack slot, which a device
 /// cannot address (#1137).
