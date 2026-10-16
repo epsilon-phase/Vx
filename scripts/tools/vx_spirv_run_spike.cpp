@@ -28,11 +28,9 @@
 // image with the same descriptors, without the library. It tells a wrong result
 // caused by the library apart from one caused by the image.
 //
-// Memory: four tensors of 128 bytes, allocated through the library. The owner's
-// machine goes unstable above 12 GiB of VRAM in use, so this prints its
-// footprint and its ceiling and refuses to allocate past `VX_VRAM_CEILING`
-// (2 GiB by default, never more than 12 GiB), the same rule the other helper in
-// this directory follows.
+// Memory: four tensors of 128 bytes, allocated through the library. This prints
+// its footprint and its ceiling and refuses to allocate past `VX_VRAM_CEILING`
+// (2 GiB by default), the same rule the other helper in this directory follows.
 //
 // Run with `VX_DISPATCH_VERBOSE=1` to see the target the library picked and the
 // format it accepted; the shell driver sets it.

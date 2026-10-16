@@ -32,10 +32,9 @@
 #     a changed `format=` string and a changed argument each come back refused
 #     or wrong.
 #
-# Memory: four tensors of 128 bytes. The owner's machine goes unstable above
-# 12 GiB of VRAM in use, so the launcher prints its footprint and its ceiling
-# and refuses to allocate past `VX_VRAM_CEILING` -- 2 GiB by default, never more
-# than 12 GiB -- the same rule the other helper in this directory uses.
+# Memory: four tensors of 128 bytes. The launcher prints its footprint and its
+# ceiling and refuses to allocate past `VX_VRAM_CEILING` -- 2 GiB by default --
+# the same rule the other helper in this directory uses.
 #
 # Only one of these runs may touch the card at a time, so the whole script holds
 # a lock that every GPU helper in this directory takes.
