@@ -17,9 +17,8 @@
 // the module's target (Vx#1368).
 //
 // RUN: not vxc %s --emit-llvm 2>&1 | FileCheck %s
-// CHECK-DAG: this kernel is compiled for {{nvptx64|spirv64}}
-// CHECK-DAG: another kernel in the same device module is compiled for {{nvptx64|spirv64}}
-// CHECK: one device module becomes one device image
+// CHECK: this kernel is compiled for {{nvptx64|spirv64}}, and another kernel is compiled for {{nvptx64|spirv64}}.
+// CHECK-SAME: Kernels for two GPU architectures in one program are not supported yet.
 
 Memory CPU_DRAM {}
 Memory GPU_HBM {
