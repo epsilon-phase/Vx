@@ -2197,12 +2197,35 @@ struct ConvertVxToStandardPass
           if (collectDeviceCallees(op, module, /*inCallee=*/false, callees[k],
                                    onStack))
             return WalkResult::advance();
+          // Say so rather than drop the twin in silence. `print` inside a
+          // placed region is this shape: the device cannot run the runtime, so
+          // the region runs at home, one thread at a time, while its author
+          // believes it runs on the card.
+          StringRef name = isa<func::CallOp>(op)
+                               ? cast<func::CallOp>(op).getCallee()
+                               : cast<memref::GetGlobalOp>(op).getName();
+          k.emitWarning()
+              << "this kernel cannot become a device image because the device "
+                 "cannot compile `"
+              << name << "`; the region will run on the host instead";
           deviceReady = false;
           return WalkResult::interrupt();
         }
         Dialect *dialect = op->getDialect();
         if (dialect && isDeviceLowerableDialect(dialect->getNamespace()))
           return WalkResult::advance();
+        // Say so rather than drop the twin in silence. The flat emitter gives
+        // a struct-valued local an `llvm.alloca` stack slot, and the `llvm`
+        // ops that come with it are not dialects the device pipelines were
+        // measured on, so the region runs at home while its author believes it
+        // runs on the card.
+        k.emitWarning()
+            << "this kernel cannot become a device image because its body "
+               "holds an op from the `"
+            << (dialect ? dialect->getNamespace()
+                        : op->getName().getStringRef())
+            << "` dialect, which the device pipeline does not lower; the "
+               "region will run on the host instead";
         deviceReady = false;
         return WalkResult::interrupt();
       });
