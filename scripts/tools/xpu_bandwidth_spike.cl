@@ -1,15 +1,11 @@
 // The triad kernel the bandwidth spike launches: x = a*y + b*z, one float4 per
 // work-item, grid-strided so any grid size is correct.
 //
-// Written by hand and compiled to SPIR-V with `clang -target
-// spirv64-unknown-unknown`, then loaded and launched through Level Zero with
-// the call sequence a device image uses (`zeModuleCreate`, `zeKernelCreate`,
-// `zeCommandListAppendLaunchKernel`), so the measurement takes the path a
-// Vx-compiled kernel takes. It works on float4 because a scalar triad on this
-// card measures the compiler's scalar code instead of the memory: the same
-// kernel with one float per work-item measured 337 GB/s, well under the copy's
-// 448-449 GB/s, while this one measures 427-428 GB/s -- close to the copy,
-// which is what says it is bandwidth-bound.
+// Compiled to SPIR-V and launched through Level Zero with the call sequence a
+// device image uses, so the measurement takes the path a Vx-compiled kernel
+// takes. It works on float4 because a float-per-work-item triad on this card
+// measures 337 GB/s against the copy's 448-449 GB/s, while this one measures
+// 427-428 GB/s.
 //
 // `n4` counts float4 vectors, so the buffer must hold a multiple of four
 // floats. The caller passes (elements / 4).

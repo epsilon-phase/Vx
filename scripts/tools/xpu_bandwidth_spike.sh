@@ -10,19 +10,17 @@
 # Measure the memory bandwidth this machine really gets from the Arc A770: a
 # device-to-device copy through Level Zero, a triad kernel (x = a*y + b*z), and
 # the two host-transfer directions through pinned host memory. The triad is
-# compiled to SPIR-V and loaded and launched with the call sequence a device
-# image uses (`zeModuleCreate`, `zeKernelCreate`, `zeCommandListAppendLaunchKernel`),
-# so the kernel goes through the same path a Vx-compiled kernel does. Every
-# measurement is timed best-of-several after a warm-up, and every one is checked
-# against the CPU.
+# compiled to SPIR-V and launched with the call sequence a device image uses
+# (`zeModuleCreate`, `zeKernelCreate`, `zeCommandListAppendLaunchKernel`), so it
+# takes the path a Vx-compiled kernel takes. Every measurement is timed
+# best-of-several after a warm-up, and every one is checked against the CPU.
 #
 #   ./scripts/tools/xpu_bandwidth_spike.sh [size in MiB, default 512]
 #
-# Memory: at the default size the copy phase holds 1 GiB of VRAM, the triad
-# phase 1.5 GiB and the transfer phase 256 MiB. The owner's machine is unstable
-# above 12 GiB of VRAM in use, so the program prints its footprint and its
-# ceiling and refuses to allocate past `VX_VRAM_CEILING` -- 2 GiB by default,
-# never more than 12 GiB. A larger run has to ask for more on purpose.
+# Memory: the program prints its footprint and its ceiling and refuses to
+# allocate past `VX_VRAM_CEILING` -- 2 GiB by default, never more than 12 GiB
+# (vram_ceiling.h). At the default size the triad phase holds 1.5 GiB, the copy
+# phase 1 GiB and the transfer phase 256 MiB.
 #
 # Only one of these runs may touch the card at a time, so the whole script holds
 # a lock that every GPU helper in this directory takes.

@@ -1,26 +1,14 @@
-// Measure the Intel Arc A770's achieved memory bandwidth through Level Zero.
+// Measure the Intel Arc A770's achieved memory bandwidth through Level Zero:
+// a device-to-device copy (twice the buffer, one read and one write), a triad
+// kernel x = a*y + b*z (three times the buffer, two reads and one write), and
+// the two host-transfer directions through pinned host memory. Each runs at a
+// size the caches cannot answer for, is timed best-of-several after a warm-up,
+// and is checked against the CPU or against the bytes that were written.
 //
-// Three measurements, all at a size large enough that the caches do not answer
-// for the memory:
-//
-//   - a device-to-device copy (`zeCommandListAppendMemoryCopy`), which moves
-//     twice the buffer's size -- one read and one write;
-//   - a triad kernel, x = a*y + b*z, which moves three times the buffer's size
-//     -- two reads and one write;
-//   - a host-to-device and a device-to-host transfer through pinned host
-//     memory.
-//
-// Each is timed best-of-several after a warm-up and each is checked: the copy
-// against the source buffer, the triad against the same formula computed on the
-// host, and the two transfer directions by clearing the host buffer first and
-// reading it back.
-//
-// Memory. The owner's machine is unstable above 12 GiB of VRAM in use, so the
-// program prints its footprint and refuses to allocate past a ceiling
-// (`VX_VRAM_CEILING`, a decimal number of bytes, 2 GiB by default and never
-// more than 12 GiB). At the default 512 MiB per buffer the copy phase holds
-// 1 GiB and the triad phase 1.5 GiB, so the default ceiling covers a default
-// run and a larger one has to be asked for on purpose.
+// Memory: the program prints its footprint and refuses to allocate past the
+// ceiling in `vram_ceiling.h` (`VX_VRAM_CEILING`, 2 GiB by default, never more
+// than 12 GiB). At the default 512 MiB per buffer the peak is the triad phase's
+// 1.5 GiB, so a larger run has to be asked for on purpose.
 //
 // Build and run: scripts/tools/xpu_bandwidth_spike.sh [size in MiB]
 
@@ -56,10 +44,6 @@ static constexpr float kA = 1.5f, kB = 2.0f;
 // host. It is part of the peak, because it is allocated while the phase runs.
 static constexpr uint64_t kXfer = 256 * kMiB;
 
-/// The VRAM ceiling, its default and its maximum live in `vram_ceiling.h`, with
-/// the checked parse they share: one rule for every tool in this directory, so
-/// a second tool cannot grow its own weaker copy.
-
 static std::vector<char> readFile(const char *path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) {
@@ -78,13 +62,12 @@ static double secondsSince(const std::chrono::steady_clock::time_point &t0) {
 int main(int argc, char **argv) {
   const char *spvPath = argc > 1 ? argv[1] : "triad.spv";
   const char *kernelName = argc > 2 ? argv[2] : "triad";
-  // Checked, because a size that is not a number used to become 0 here through
-  // `strtoull` with no `end` check: the run then failed a length check that
-  // never mentioned the argument. The number is MiB, so a value that would
-  // overflow the byte count is refused as well rather than wrapping.
-  const uint64_t sizeMiB =
-      argc > 3 ? parseByteCount("size in MiB", argv[3], UINT64_MAX / kMiB)
-               : 512;
+  // The number is MiB per buffer. It is capped so that the three-buffer peak
+  // below cannot wrap a 64-bit count, and a size that is not a number is
+  // refused rather than read as 0.
+  const uint64_t sizeMiB = argc > 3 ? parseCount("size in MiB", argv[3], "MiB",
+                                                 kVramCeilingMaxSizeMiB)
+                                    : 512;
   if (sizeMiB == 0) {
     std::fprintf(stderr, "size in MiB: 0 measures nothing\n");
     return 1;
@@ -106,9 +89,12 @@ int main(int argc, char **argv) {
   // The most device memory this run holds at one time: the triad phase's three
   // buffers, or the transfer phase's one device buffer, whichever is larger.
   // The phases free their buffers before the next phase starts, so this is a
-  // peak and not a sum. Checked before `zeInit` and before any allocation.
-  requireWithinCeiling("xpu_bandwidth_spike",
-                       std::max(3 * bytesPerBuffer, kXfer), vramCeiling());
+  // peak and not a sum. `sizeMiB` is capped above, so the three-buffer product
+  // cannot wrap a 64-bit count. Checked before `zeInit` and before any
+  // allocation.
+  const uint64_t triadPeak = 3 * bytesPerBuffer;
+  requireWithinCeiling("xpu_bandwidth_spike", std::max(triadPeak, kXfer),
+                       vramCeiling());
 
   L0_CHECK(zeInit(ZE_INIT_FLAG_GPU_ONLY));
   uint32_t driverCount = 0;
@@ -183,10 +169,8 @@ int main(int argc, char **argv) {
 
     const char zero = 0;
     auto copy = [&]() {
-      // The sabotage fills b with zeroes instead of copying a into it. Filling
-      // it, rather than leaving it alone, is what makes the failure belong to
-      // this check: fresh device memory could happen to hold the source's
-      // pattern, and then a readback that proves nothing would still pass.
+      // The sabotage fills b with zeroes rather than leaving it alone, so a
+      // fresh buffer cannot pass by happening to hold the source's pattern.
       if (skipCopy)
         L0_CHECK(zeCommandListAppendMemoryFill(
             list, b, &zero, 1, bytesPerBuffer, nullptr, 0, nullptr));
@@ -208,10 +192,9 @@ int main(int argc, char **argv) {
       best = std::min(best, secondsSince(t0));
     }
 
-    // Read the destination back and check it matches the source, so the number
-    // is a copy that happened and not one that was dropped. Clear the staging
-    // buffer first: it still holds the source's bytes from the upload above, so
-    // a readback that did nothing would leave them there and still pass.
+    // Read the destination back and check it matches the source. Clear the
+    // staging buffer first: it still holds the source's bytes from the upload
+    // above, so a readback that did nothing would leave them and still pass.
     std::fill(host.begin(), host.end(), 0);
     if (!skipReadback)
       L0_CHECK(zeCommandListAppendMemoryCopy(
@@ -385,12 +368,9 @@ int main(int argc, char **argv) {
     }
 
     // The timed loop above is not a check. Both directions are checked here,
-    // and the host buffer is cleared before each readback because it still
-    // holds the pattern that was just uploaded: a download that did nothing
-    // would leave that pattern in place and pass. The sabotage applies to this
-    // check alone, so a skipped upload leaves the device holding what the timed
-    // loop put there (3) rather than leaving it unwritten -- a check that
-    // cannot fail is worth nothing.
+    // and the host buffer is cleared before each readback so a download that
+    // did nothing cannot pass on the pattern just uploaded. A skipped upload
+    // leaves the device holding what the timed loop put there, not nothing.
     auto allBytesAre = [&](char want) {
       const char *begin = static_cast<const char *>(hostbuf);
       return std::all_of(begin, begin + xfer,
