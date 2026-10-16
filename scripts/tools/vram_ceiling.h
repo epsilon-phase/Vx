@@ -5,11 +5,6 @@
 // deciding for itself, because the failure it prevents is the machine's: the
 // owner's machine becomes unstable above 12 GiB of VRAM in use, and a run that
 // asks for more can take the driver down with it.
-//
-// Two mistakes are worth refusing by name. A size that is not a number used to
-// become 0 through `strtoull`, and the run then failed a length check that
-// never mentioned the argument that caused it. A size that is a number can
-// still be larger than the card can safely give.
 #pragma once
 
 #include <cerrno>
@@ -21,35 +16,41 @@
 // setting `VX_VRAM_CEILING`, so the larger allocation is always deliberate.
 static constexpr uint64_t kVramCeilingDefault = 2ull * 1024 * 1024 * 1024;
 
-// The most `VX_VRAM_CEILING` may be set to. This machine is unstable above
-// 12 GiB of VRAM in use, so the variable cannot be used to walk past that
-// point: a value above this is refused instead of honoured.
+// The most `VX_VRAM_CEILING` may be set to, so the variable cannot walk a run
+// past the ceiling.
 static constexpr uint64_t kVramCeilingMax = 12ull * 1024 * 1024 * 1024;
 
-// Parse `text` as a decimal byte count and return it, or print why `name` is
-// not usable and exit. An empty string, a `-`, a trailing character, a value
+// The largest per-buffer size in MiB a helper may be asked for when its peak is
+// three buffers of that size: `3 * size * MiB` is then at most
+// `kVramCeilingMax`, so the peak cannot wrap a 64-bit count before
+// `requireWithinCeiling` sees it.
+static constexpr uint64_t kVramCeilingMaxSizeMiB =
+    kVramCeilingMax / 3 / (1024 * 1024);
+
+// Parse `text` as a decimal count of `unit` and return it, or print why `name`
+// is not usable and exit. An empty string, a `-`, a trailing character, a value
 // too large for 64 bits and a value above `max` are all refused, so no caller
-// has to guess what a bad argument meant.
-static uint64_t parseByteCount(const char *name, const char *text,
-                               uint64_t max) {
+// has to guess what a bad argument meant. `unit` names what is counted, so a
+// value that is in MiB is not reported as a number of bytes.
+static uint64_t parseCount(const char *name, const char *text, const char *unit,
+                           uint64_t max) {
   if (text[0] == '\0' || text[0] == '-') {
-    std::fprintf(stderr, "%s: \"%s\" is not a decimal number of bytes\n", name,
-                 text);
+    std::fprintf(stderr, "%s: \"%s\" is not a decimal number of %s\n", name,
+                 text, unit);
     std::exit(1);
   }
   char *end = nullptr;
   errno = 0;
   const unsigned long long value = std::strtoull(text, &end, 10);
   if (end == text || *end != '\0' || errno == ERANGE) {
-    std::fprintf(stderr, "%s: \"%s\" is not a decimal number of bytes\n", name,
-                 text);
+    std::fprintf(stderr, "%s: \"%s\" is not a decimal number of %s\n", name,
+                 text, unit);
     std::exit(1);
   }
   if (value > max) {
     std::fprintf(stderr,
-                 "%s: \"%s\" is %llu bytes, more than the %llu bytes "
-                 "allowed\n",
-                 name, text, value, (unsigned long long)max);
+                 "%s: \"%s\" is %llu %s, more than the %llu %s allowed\n", name,
+                 text, value, unit, (unsigned long long)max, unit);
     std::exit(1);
   }
   return value;
@@ -62,7 +63,7 @@ static uint64_t vramCeiling() {
   const char *env = std::getenv("VX_VRAM_CEILING");
   if (!env || env[0] == '\0')
     return kVramCeilingDefault;
-  return parseByteCount("VX_VRAM_CEILING", env, kVramCeilingMax);
+  return parseCount("VX_VRAM_CEILING", env, "bytes", kVramCeilingMax);
 }
 
 // Print the ceiling and the peak this run needs, then refuse if the peak is
