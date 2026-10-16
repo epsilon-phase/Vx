@@ -21,10 +21,12 @@ impl FnEmit<'_> {
     /// spawn (host code), or a topology that declares none (every built-in), names no
     /// target, and the answer is today's NVPTX 3 so the emitted MLIR does not change.
     fn shared_addrspace(&self) -> i32 {
+        // A spawn's frame carries more than this lookup needs, so read its first field by name
+        // rather than matching the frame's whole shape.
         let arch = self
             .spawn_stack
             .last()
-            .and_then(|(topo, _)| self.ctx.topo_archs.get(topo))
+            .and_then(|open| self.ctx.topo_archs.get(&open.0))
             .map(|a| a.as_str());
         crate::arch::address_space_for_arch(arch, crate::arch::AddressSpace::Workgroup)
     }
