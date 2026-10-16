@@ -6,7 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 // A program whose two placed kernels declare different architectures is refused
-// by name.
+// by name: the message sits on the kernel that disagrees and names both
+// architectures, so it points at a `spawn` rather than at the top of the file.
 //
 // Every admitted kernel goes into one `gpu.module`, and each module becomes one
 // device image -- a loader takes the module and then asks for a function by
@@ -16,7 +17,9 @@
 // the module's target (Vx#1368).
 //
 // RUN: not vxc %s --emit-llvm 2>&1 | FileCheck %s
-// CHECK: kernels for two GPU architectures in one program are not supported yet
+// CHECK-DAG: this kernel is compiled for {{nvptx64|spirv64}}
+// CHECK-DAG: another kernel in the same device module is compiled for {{nvptx64|spirv64}}
+// CHECK: one device module becomes one device image
 
 Memory CPU_DRAM {}
 Memory GPU_HBM {
