@@ -495,8 +495,8 @@ impl AddressSpace {
 /// Every target here is one this compiler knows. Only NVPTX has a pipeline today, so only its
 /// arm carries that target's own numbers; the rest answer with the numbers the compiler has
 /// always emitted, because a number guessed before the target's pipeline exists would land
-/// wrong code silently, which is the failure #258 records. A name no target has is not one of
-/// these arms -- [`address_space_for_arch`] refuses it.
+/// wrong code silently. A name no target has is not one of these arms --
+/// [`address_space_for_arch`] refuses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceTarget {
     X86_64,
