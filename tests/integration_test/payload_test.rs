@@ -45,8 +45,8 @@ fn emitted_ir(program: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// The compiler stamps the version, and the version is the one the header
-/// defines.
+/// The compiler stamps the version, and names the image's format before the
+/// image, with the version the header defines.
 ///
 /// The number is written literally here on purpose. `VX_PAYLOAD_ABI` is what the
 /// compiler emits and what every dispatch library reads; if it moves, this
@@ -63,10 +63,13 @@ fn the_compiler_stamps_the_payload_version() {
         "the dispatch payload carries no `abi=1` entry, so a dispatch library \
          has nothing to check the format against"
     );
+    // The fixture has an image, and its format entry comes first: a library that
+    // meets a format it does not know refuses instead of reading the bytes, and
+    // it can only do that if the format is there to read before the image is.
     assert!(
-        ir.contains("image="),
-        "the payload this checks has no device image in it, so it is not \
-         exercising the shape the version key exists for"
+        ir.contains("format=ptx\\00image="),
+        "the payload does not name `format=ptx` right before its `image=`, so a \
+         dispatch library cannot tell what the image is"
     );
 }
 
