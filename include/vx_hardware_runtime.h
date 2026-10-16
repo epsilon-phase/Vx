@@ -228,21 +228,6 @@ static inline void vx_memref_write_desc(void *desc, void *data, int32_t rank,
   }
 }
 
-/// Look up a `key=` entry in a dispatch payload.
-///
-/// The payload is a NUL-separated blob, bounded by the `payload_size` argument
-/// of vx_plugin_dispatch_async: the first entry is the kernel name, and any
-/// further entries are `key=value`. Reading the payload as a `const char *`
-/// therefore still yields the kernel name, so a consumer that ignores this
-/// function behaves as it always did.
-///
-/// `key` includes the `=` (e.g. "kind="). Returns a pointer to the value, still
-/// within the blob and NUL-terminated, or NULL when absent. An entry whose
-/// value is empty (the entry is exactly the key, like `abi=`) returns a pointer
-/// to its terminating NUL rather than NULL, so a caller can tell present from
-/// absent. A zero size means a producer that predates the extension: report
-/// absence rather than reading a length that was never written.
-///
 /// Where the text part of a payload ends: the offset of the first byte that is
 /// not part of a NUL-terminated entry.
 ///
@@ -281,19 +266,38 @@ static inline size_t vx_payload_text_end(const void *payload,
   return payload_size;
 }
 
+/// Look up a `key=` entry in a dispatch payload.
+///
+/// The payload is a NUL-separated blob, bounded by the `payload_size` argument
+/// of vx_plugin_dispatch_async: the first entry is the kernel name, and any
+/// further entries are `key=value`. Reading the payload as a `const char *`
+/// therefore still yields the kernel name, so a consumer that ignores this
+/// function behaves as it always did.
+///
+/// `key` includes the `=` (e.g. "kind="). Returns a pointer to the value, still
+/// within the blob and NUL-terminated, or NULL when absent. An entry whose
+/// value is empty (the entry is exactly the key, like `abi=`) returns a pointer
+/// to its terminating NUL rather than NULL, so a caller can tell present from
+/// absent. A zero size means a producer that predates the extension: report
+/// absence rather than reading a length that was never written.
+///
 /// The entries the compiler writes today, in the order it writes them: `abi=`
 /// (the payload format version, see `VX_PAYLOAD_ABI`), `kind=` (what the kernel
 /// computes, "matmul", so a plugin can route it to a vendor library instead of
 /// guessing from buffer shapes -- which cannot be done for square operands,
 /// where every operand assignment conforms), `roles=`, `outkind=`, `topo=` (the
 /// dispatch id, decoded by vx_payload_topology), `toponame=`, `launch=`,
-/// `coop=`, `format=` (`ptx` or `spirv`, what the image is), and one of
-/// `image=` (a device image that is text, which today means PTX) or a section
-/// after the entries (one that is not, read by vx_payload_section).
+/// `coop=`, `format=` (`ptx`, what the image is), and `image=` (a device image
+/// that is text, which today means PTX).
 ///
 /// Every entry is optional to a reader, and that is what let each of them land
 /// without breaking a consumer that predates it. `kind=` absent means
 /// unclassified, which is not an error: the kernel takes the ordinary path.
+///
+/// A payload may also carry a binary device image in a section after the
+/// entries, which vx_payload_section reads. Nothing writes one yet: the
+/// compiler writes the text `image=` entry only, and the section is there for
+/// the image a text entry cannot carry.
 static inline const char *
 vx_payload_field(const void *payload, size_t payload_size, const char *key) {
   if (!payload || payload_size == 0 || !key) {
