@@ -44,7 +44,6 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 
 #include <atomic>
@@ -1505,9 +1504,11 @@ static DevicePipeline pipelineForArch(StringRef arch) {
 /// The pipeline that compiles the kernel placed on `topology`: the declared
 /// architecture when it carries one, and the dispatch-id band when it does not.
 ///
-/// The band stays the fallback for kernels with no arch attribute: built-in
-/// topologies (whose descriptors declare no arch) and the AST-codegen path
-/// (which does not stamp). A declared arch with no row in the table --
+/// The band is the fallback for a kernel with no arch attribute: a built-in
+/// topology, whose descriptor declares no arch. The AST code generator stamps
+/// the attribute too, for a topology that declares one
+/// (src/codegen/lower/tensors.rs), so both code generators agree on which
+/// kernels ride the band. A declared arch with no row in the table --
 /// `applegpu` reaches its device through the plugin ABI, not through a device
 /// image -- answers `None`.
 ///
@@ -1525,6 +1526,18 @@ static DevicePipeline pipelineOfKernel(Operation *placed, int32_t topology) {
   if (topology >= 500 && topology < 600)
     return DevicePipeline::Nvptx;
   return DevicePipeline::None;
+}
+
+/// The architecture a pipeline compiles for, as a machine file's `arch:` line
+/// spells it: the words a refusal has to name when two kernels disagree.
+static StringRef archNameOfPipeline(DevicePipeline pipeline) {
+  switch (pipeline) {
+  case DevicePipeline::Nvptx:
+    return "nvptx64";
+  case DevicePipeline::None:
+    // A kernel with no pipeline gets no device twin, so nothing reaches here.
+    return "no architecture";
+  }
 }
 
 // Read a buffer cell once before a `vx.spawn` when the region only reads it.
@@ -2185,8 +2198,16 @@ struct ConvertVxToStandardPass
     SmallVector<vx::KernelOp> kernels;
     llvm::DenseMap<Operation *, DeviceCallees> callees;
     module.walk([&](vx::KernelOp k) {
+      const int32_t topo = static_cast<int32_t>(k.getTopology());
       // A kernel no pipeline claims gets no device twin: it stops here rather
       // than being cloned into a `gpu.module` that nothing will compile.
+      //
+      // What a body may contain is checked below the same way for every
+      // pipeline, and those checks describe what NVVM can compile. So a second
+      // row in the table takes more than a row: a kernel NVVM can compile and
+      // the new pipeline cannot is admitted here, and then fails at the image
+      // step, which is fatal -- where without the row it would have run on the
+      // host.
       if (pipelineOfKernel(k, topo) == DevicePipeline::None)
         return;
       // A kernel that hands back a value writes it into a host stack slot,
@@ -3649,56 +3670,90 @@ struct ConvertVxToLLVMPass
     getOperation().walk(
         [&](gpu::GPUModuleOp m) { deviceModules.push_back(m); });
 
-    // Which pipeline compiles which kernel, from the same answer the gate used
-    // to decide the kernel got a twin at all (`pipelineOfKernel`). Asking twice
-    // from one source is what keeps a kernel from being admitted for one
-    // architecture and compiled for another; the `vx.kernel` ops are still here
-    // at this point, and the `gpu.func` beside each carries its name.
-    llvm::StringMap<DevicePipeline> kernelPipelines;
-    getOperation().walk([&](vx::KernelOp k) {
-      kernelPipelines[k.getSymName()] =
-          pipelineOfKernel(k, static_cast<int32_t>(k.getTopology()));
-    });
+    // Which kernel each `gpu.func` is the twin of, and so which pipeline
+    // compiles it: the same answer the gate used to decide the kernel got a
+    // twin at all (`pipelineOfKernel`). Asking twice from one source is what
+    // keeps a kernel from being admitted for one architecture and compiled for
+    // another; the `vx.kernel` ops are still here at this point, and the
+    // `gpu.func` beside each carries its name.
+    //
+    // Only when there is a device module to compile: this walks the whole
+    // program, and most programs have nothing placed on a device.
+    llvm::StringMap<vx::KernelOp> kernelsByName;
+    if (!deviceModules.empty())
+      getOperation().walk(
+          [&](vx::KernelOp k) { kernelsByName[k.getSymName()] = k; });
 
     llvm::StringMap<std::string> deviceImages;
     for (gpu::GPUModuleOp m : deviceModules) {
       // One image per module, and every kernel in it is an entry point: a
       // loader takes the module and then asks for a function by name. So the
       // module's kernels have to agree on the pipeline that produces that one
-      // image. They always do today -- the gate puts every admitted kernel in
-      // this module -- and a program that places kernels on two architectures
-      // with different pipelines must say so rather than get a module whose
+      // image -- and putting every admitted kernel in one module is what lets
+      // them disagree. They agree today only because `nvptx64` is the only row
+      // in the table; a second row makes this live, and a program that places
+      // kernels on two architectures must say so rather than get a module whose
       // image is only right for some of its entry points.
-      DevicePipeline pipeline = DevicePipeline::None;
-      bool mixed = false;
+      std::optional<DevicePipeline> pipeline;
+      vx::KernelOp disagrees; // the first kernel that asks for another pipeline
       m.walk([&](gpu::GPUFuncOp f) {
-        auto it = kernelPipelines.find(f.getName());
-        if (it == kernelPipelines.end())
+        auto it = kernelsByName.find(f.getName());
+        // A `gpu.func` here is the twin of a `vx.kernel` of the same name: the
+        // outliner leaves the kernel behind when it makes one. A name that is
+        // not here means the two have come apart -- and the func would then be
+        // compiled with whatever pipeline a *different* kernel chose.
+        assert(it != kernelsByName.end() &&
+               "a gpu.func has no vx.kernel of the same name");
+        if (it == kernelsByName.end())
           return;
-        if (pipeline == DevicePipeline::None)
-          pipeline = it->second;
-        else if (pipeline != it->second)
-          mixed = true;
+        const DevicePipeline p =
+            pipelineOfKernel(it->second,
+                             static_cast<int32_t>(it->second.getTopology()));
+        // The gate gives a kernel with no pipeline no device twin, so a twin
+        // whose kernel answers `None` means the two answers have disagreed.
+        assert(p != DevicePipeline::None &&
+               "a kernel with no device pipeline got a device twin");
+        if (!pipeline)
+          pipeline = p;
+        else if (*pipeline != p && !disagrees)
+          disagrees = it->second;
       });
-      if (mixed) {
-        m.emitError("kernels for two GPU architectures in one program are not "
-                    "supported yet");
+      if (disagrees) {
+        const DevicePipeline other =
+            pipelineOfKernel(disagrees,
+                             static_cast<int32_t>(disagrees.getTopology()));
+        // On the `vx.kernel` rather than on the module: the module's location
+        // is the whole program, the kernel's is the `spawn` that asked for the
+        // other architecture.
+        disagrees.emitError()
+            << "this kernel is compiled for " << archNameOfPipeline(other)
+            << " and another kernel in the same device module is compiled for "
+            << archNameOfPipeline(*pipeline)
+            << "; one device module becomes one device image, and an image can "
+               "be compiled for one architecture only";
+        signalPassFailure();
+        return;
+      }
+      if (!pipeline) {
+        // No `gpu.func` in this module is the twin of a kernel Vx compiled for
+        // a device. Hand-written IR reaches this pass with a device module of
+        // its own (`vx-opt --vx-to-llvm`), so this is refused rather than
+        // asserted on.
+        m.emitError("this device module holds no kernel that Vx compiled for a "
+                    "device, so there is no pipeline to compile it with");
         signalPassFailure();
         return;
       }
 
       std::string error;
       std::string image;
-      switch (pipeline) {
+      switch (*pipeline) {
       case DevicePipeline::Nvptx:
         image = deviceImageOf(m, error);
         break;
       case DevicePipeline::None:
-        // The gate gives a kernel with no pipeline no device twin, so no
-        // module reaching the image step can lack one. This is a bug in the
-        // compiler, not a program to refuse.
-        llvm_unreachable(
-            "a device module reached the image step with no pipeline");
+        // Refused above: no kernel of ours is in this module.
+        break;
       }
       // Fatal rather than "emit nothing and carry on". Carrying on produces a
       // program that compiles, dispatches, and is then refused at the far end
@@ -3710,10 +3765,8 @@ struct ConvertVxToLLVMPass
         signalPassFailure();
         return;
       }
-      // One image per module, and every kernel in it is an entry point: a
-      // loader takes the module and then asks for a function by name. So each
-      // `gpu.func` maps to the same image, and the kernel name -- already the
-      // payload blob's first field -- is what selects the entry.
+      // Each `gpu.func` maps to the same image, and the kernel name -- already
+      // the payload blob's first field -- is what selects the entry.
       m.walk([&](gpu::GPUFuncOp f) { deviceImages[f.getName()] = image; });
     }
 
