@@ -40,9 +40,10 @@ Topology Local {
 }
 
 fn main() -> i32 {
-  let mut a = Tensor<f32, [4, 4]>::uninit();
-  let mut b = Tensor<f32, [4, 4]>::uninit();
-  let mut o = Tensor<f32, [4, 4]>::uninit();
+  // Every element is written below before anything reads it.
+  let mut a = unsafe { Tensor<f32, [4, 4]>::uninit() };
+  let mut b = unsafe { Tensor<f32, [4, 4]>::uninit() };
+  let mut o = unsafe { Tensor<f32, [4, 4]>::uninit() };
   for i in 0..4 {
     for j in 0..4 {
       a[i][j] = ((i + j) as f32);
