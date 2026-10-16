@@ -2038,8 +2038,8 @@ impl<'c> MeliorGenerator<'c> {
                         Some(m) => crate::arch::declared_address_space(m, self.memories.get(m))
                             .ok_or_else(|| LowerError::from(unmappable_space_message(m)))?,
                     };
-                    // Placement is erased into the C ABI, so no `arch:` is in hand here: the
-                    // unknown-target answer (today's numbers) is the honest one.
+                    // Placement is erased into the C ABI, so no `arch:` is in hand here: `None`
+                    // means nothing was declared, not a target this compiler does not know.
                     format!(
                         "!llvm.ptr<{}>",
                         crate::arch::address_space_for_arch(None, addr_space)
