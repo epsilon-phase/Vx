@@ -1162,8 +1162,8 @@ static void placeTransferFree(vx::TransferOp transfer) {
         continue;
       auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
           call, call.getCalleeAttr());
-      if (callee &&
-          placedTopology(callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
+      if (callee && placedTopology(
+                        callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
         return;
     }
 
@@ -1535,8 +1535,9 @@ static StringRef archNameOfPipeline(DevicePipeline pipeline) {
   case DevicePipeline::Nvptx:
     return "nvptx64";
   case DevicePipeline::None:
-    // A kernel with no pipeline gets no device twin, so nothing reaches here.
-    return "no architecture";
+    // A kernel with no pipeline gets no device twin, so no refusal names it as
+    // one of the architectures a program compiled for.
+    llvm_unreachable("a kernel with no device pipeline has no architecture");
   }
 }
 
@@ -1687,7 +1688,6 @@ static void freePlaced(OpBuilder &builder, Location loc, Value buffer,
   builder.create<vx::FreeOp>(loc, buffer, topology);
 }
 
-
 // Whether parameter `i` of the function `call` reaches is taken by value.
 static bool takesOwnership(func::CallOp call, unsigned i) {
   auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
@@ -1724,7 +1724,6 @@ static Value castSource(Value v) {
 
 static BufferOrigin originOf(Value v, llvm::SmallPtrSetImpl<void *> &seen,
                              std::optional<int32_t> &topology);
-
 
 // The origin of every value in `values`, when they all have the same one.
 static BufferOrigin commonOrigin(ArrayRef<Value> values,
@@ -3706,9 +3705,8 @@ struct ConvertVxToLLVMPass
                "a gpu.func has no vx.kernel of the same name");
         if (it == kernelsByName.end())
           return;
-        const DevicePipeline p =
-            pipelineOfKernel(it->second,
-                             static_cast<int32_t>(it->second.getTopology()));
+        const DevicePipeline p = pipelineOfKernel(
+            it->second, static_cast<int32_t>(it->second.getTopology()));
         // The gate gives a kernel with no pipeline no device twin, so a twin
         // whose kernel answers `None` means the two answers have disagreed.
         assert(p != DevicePipeline::None &&
@@ -3719,18 +3717,17 @@ struct ConvertVxToLLVMPass
           disagrees = it->second;
       });
       if (disagrees) {
-        const DevicePipeline other =
-            pipelineOfKernel(disagrees,
-                             static_cast<int32_t>(disagrees.getTopology()));
+        const DevicePipeline other = pipelineOfKernel(
+            disagrees, static_cast<int32_t>(disagrees.getTopology()));
         // On the `vx.kernel` rather than on the module: the module's location
         // is the whole program, the kernel's is the `spawn` that asked for the
         // other architecture.
         disagrees.emitError()
             << "this kernel is compiled for " << archNameOfPipeline(other)
-            << " and another kernel in the same device module is compiled for "
+            << ", and another kernel is compiled for "
             << archNameOfPipeline(*pipeline)
-            << "; one device module becomes one device image, and an image can "
-               "be compiled for one architecture only";
+            << ". Kernels for two GPU architectures in one program are not "
+               "supported yet.";
         signalPassFailure();
         return;
       }
