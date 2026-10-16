@@ -17,12 +17,11 @@
 // `spirv-dis` on the image shows exactly 28 `OpFunctionParameter`s. Nothing is
 // passed as an aggregate.
 //
-// Memory. The owner's machine is unstable above 12 GiB of VRAM in use, so this
-// prints its footprint and its ceiling and refuses to allocate past
-// `VX_VRAM_CEILING` (2 GiB by default, never more than 12 GiB), the same rule
-// every helper in this directory takes from `vram_ceiling.h`. It cannot grow:
-// the sizes are compile-time constants of this fixture, so what it checks
-// before `zeInit` is also what it will hold -- four tensors, 512 bytes.
+// Memory. This prints its footprint and its ceiling and refuses to allocate
+// past `VX_VRAM_CEILING` (2 GiB by default), the same rule every helper in this
+// directory takes from `vram_ceiling.h`. It cannot grow: the sizes are
+// compile-time constants of this fixture, so what it checks before `zeInit` is
+// also what it will hold -- four tensors, 512 bytes.
 //
 // Build and run: scripts/tools/vx_spirv_run_spike.sh
 
