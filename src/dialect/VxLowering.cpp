@@ -1157,8 +1157,8 @@ static void placeTransferFree(vx::TransferOp transfer) {
         continue;
       auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
           call, call.getCalleeAttr());
-      if (callee &&
-          placedTopology(callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
+      if (callee && placedTopology(
+                        callee.getArgAttr(use.getOperandNumber(), "vx.placed")))
         return;
     }
 
@@ -1503,8 +1503,9 @@ static StringRef archNameOfPipeline(DevicePipeline pipeline) {
   case DevicePipeline::Nvptx:
     return "nvptx64";
   case DevicePipeline::None:
-    // A kernel with no pipeline gets no device twin, so nothing reaches here.
-    return "no architecture";
+    // A kernel with no pipeline gets no device twin, so no refusal names it as
+    // one of the architectures a program compiled for.
+    llvm_unreachable("a kernel with no device pipeline has no architecture");
   }
 }
 
@@ -1565,7 +1566,6 @@ static void freePlaced(OpBuilder &builder, Location loc, Value buffer,
   builder.create<vx::FreeOp>(loc, buffer, topology);
 }
 
-
 // Whether parameter `i` of the function `call` reaches is taken by value.
 static bool takesOwnership(func::CallOp call, unsigned i) {
   auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
@@ -1602,7 +1602,6 @@ static Value castSource(Value v) {
 
 static BufferOrigin originOf(Value v, llvm::SmallPtrSetImpl<void *> &seen,
                              std::optional<int32_t> &topology);
-
 
 // The origin of every value in `values`, when they all have the same one.
 static BufferOrigin commonOrigin(ArrayRef<Value> values,
@@ -3621,10 +3620,10 @@ struct ConvertVxToLLVMPass
         // other architecture.
         disagrees.emitError()
             << "this kernel is compiled for " << archNameOfPipeline(other)
-            << " and another kernel in the same device module is compiled for "
+            << ", and another kernel is compiled for "
             << archNameOfPipeline(*pipeline)
-            << "; one device module becomes one device image, and an image can "
-               "be compiled for one architecture only";
+            << ". Kernels for two GPU architectures in one program are not "
+               "supported yet.";
         signalPassFailure();
         return;
       }
