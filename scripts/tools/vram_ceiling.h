@@ -2,9 +2,10 @@
 // the command line or set in the environment becomes a number.
 //
 // Every tool in this directory that touches the card includes this rather than
-// deciding for itself, because the failure it prevents is the machine's: the
-// owner's machine becomes unstable above 12 GiB of VRAM in use, and a run that
-// asks for more can take the driver down with it.
+// deciding for itself. A run starts at a conservative ceiling and raises it
+// deliberately through `VX_VRAM_CEILING`; a size or ceiling too large for the
+// peak arithmetic to carry is refused, and a requested size is never silently
+// clamped down to fit.
 #pragma once
 
 #include <cerrno>
