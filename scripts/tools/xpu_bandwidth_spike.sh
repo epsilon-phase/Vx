@@ -15,9 +15,9 @@
 #   ./scripts/tools/xpu_bandwidth_spike.sh [size in MiB, default 512]
 #
 # Memory: at the default size the copy phase holds 1 GiB of VRAM and the triad
-# phase 1.5 GiB. The card is shared and this machine is unstable above 12 GiB in
-# use, so the program prints its footprint and refuses to go past
-# `VX_VRAM_CEILING` (12 GiB by default).
+# phase 1.5 GiB. The card is shared, so the program prints its footprint and
+# refuses to go past `VX_VRAM_CEILING` (2 GiB by default, and whatever the
+# operator sets above that; vram_ceiling.h).
 #
 #===----------------------------------------------------------------------===#
 
