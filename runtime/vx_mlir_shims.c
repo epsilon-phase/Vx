@@ -28,6 +28,7 @@
  * pair.
  */
 
+#include <assert.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,12 +53,15 @@ void printMemrefF16(int64_t rank, void *descriptor) {
   _mlir_ciface_printMemrefF16(&packed);
 }
 
-/* The unsigned tensor printers. MLIR has no unsigned integer type, so a `u32`
- * or `u64` tensor is a `memref` of `i32` or `i64`, and MLIR's
- * printMemrefI32/I64 read the bits as signed: 4000000000 printed as -294967296.
- * These print the same text MLIR's do -- the header line, then the brackets,
- * spaces and commas of MemRefDataPrinter in MemRefUtils.h -- with each element
- * read unsigned.
+/* The integer tensor printers MLIR does not supply in the form codegen calls,
+ * or prints wrongly. MLIR has no unsigned integer type: a `u32` tensor is a
+ * memref of `i32`, and MLIR's printMemrefI32 reads 4000000000 as -294967296.
+ * printMemrefU8/U16/U32/U64 read the elements unsigned. printMemrefI8 cannot
+ * use MLIR's printer at all -- it prints each element as a character (`100`
+ * prints as `d`) -- so it is ours, reading the bytes signed like a scalar
+ * `i8`. All of them print the header line and the brackets, spaces and commas
+ * of MemRefDataPrinter in MemRefUtils.h, so the text does not depend on which
+ * printer a type chose.
  */
 
 typedef struct {
@@ -72,22 +76,42 @@ static void vx_print_spaces(int64_t count) {
     putchar(' ');
 }
 
-static void vx_print_unsigned(const void *base, int64_t at, int wide) {
-  if (wide)
-    printf("%" PRIu64, ((const uint64_t *)base)[at]);
-  else
+/* `bytes` is the element size. The signed branch is only for `i8`: MLIR prints
+ * `i16` itself, and the wide signed types keep MLIR's own printers. */
+static void vx_print_element(const void *base, int64_t at, int bytes,
+                             int is_signed) {
+  if (is_signed) {
+    assert(bytes == 1 && "only a byte prints signed here");
+    printf("%d", (int)((const int8_t *)base)[at]);
+    return;
+  }
+  switch (bytes) {
+  case 1:
+    printf("%u", (unsigned)((const uint8_t *)base)[at]);
+    return;
+  case 2:
+    printf("%u", (unsigned)((const uint16_t *)base)[at]);
+    return;
+  case 4:
     printf("%" PRIu32, ((const uint32_t *)base)[at]);
+    return;
+  case 8:
+    printf("%" PRIu64, ((const uint64_t *)base)[at]);
+    return;
+  }
+  assert(0 && "no such element size");
 }
 
-static void vx_print_data(const void *base, int wide, int64_t dim, int64_t rank,
-                          int64_t offset, const int64_t *sizes,
-                          const int64_t *strides) {
+static void vx_print_data(const void *base, int bytes, int is_signed,
+                          int64_t dim, int64_t rank, int64_t offset,
+                          const int64_t *sizes, const int64_t *strides) {
   if (dim == 0) {
-    vx_print_unsigned(base, offset, wide);
+    vx_print_element(base, offset, bytes, is_signed);
     return;
   }
   printf("[");
-  vx_print_data(base, wide, dim - 1, rank, offset, sizes + 1, strides + 1);
+  vx_print_data(base, bytes, is_signed, dim - 1, rank, offset, sizes + 1,
+                strides + 1);
   if (sizes[0] <= 1) {
     printf("]");
     return;
@@ -97,19 +121,20 @@ static void vx_print_data(const void *base, int wide, int64_t dim, int64_t rank,
     printf("\n");
   for (int64_t i = 1; i + 1 < sizes[0]; ++i) {
     vx_print_spaces(rank - dim + 1);
-    vx_print_data(base, wide, dim - 1, rank, offset + i * strides[0], sizes + 1,
-                  strides + 1);
+    vx_print_data(base, bytes, is_signed, dim - 1, rank,
+                  offset + i * strides[0], sizes + 1, strides + 1);
     printf(", ");
     if (dim > 1)
       printf("\n");
   }
   vx_print_spaces(rank - dim + 1);
-  vx_print_data(base, wide, dim - 1, rank, offset + strides[0] * (sizes[0] - 1),
-                sizes + 1, strides + 1);
+  vx_print_data(base, bytes, is_signed, dim - 1, rank,
+                offset + strides[0] * (sizes[0] - 1), sizes + 1, strides + 1);
   printf("]");
 }
 
-static void vx_print_memref_unsigned(int64_t rank, void *descriptor, int wide) {
+static void vx_print_memref(int64_t rank, void *descriptor, int bytes,
+                            int is_signed) {
   const VxRankedMemRef *m = (const VxRankedMemRef *)descriptor;
   const int64_t *sizes = m->sizes_and_strides;
   const int64_t *strides = m->sizes_and_strides + rank;
@@ -124,82 +149,35 @@ static void vx_print_memref_unsigned(int64_t rank, void *descriptor, int wide) {
   printf("] data = \n");
   if (rank == 0)
     printf("[");
-  vx_print_data(m->aligned, wide, rank, rank, m->offset, sizes, strides);
+  vx_print_data(m->aligned, bytes, is_signed, rank, rank, m->offset, sizes,
+                strides);
   if (rank == 0)
     printf("]");
   printf("\n");
   fflush(stdout);
 }
 
-void printMemrefU32(int64_t rank, void *descriptor) {
-  vx_print_memref_unsigned(rank, descriptor, 0);
-}
-
-void printMemrefU64(int64_t rank, void *descriptor) {
-  vx_print_memref_unsigned(rank, descriptor, 1);
-}
-
-/* MLIR exports the byte and short printers only packed, and codegen calls the
- * plain name, so both wrappers live here. `printMemrefI16` goes through MLIR.
- * `printMemrefI8` cannot: MLIR's I8 printer prints each element as a character
- * (`100` prints as `d`), while a scalar `i8` prints as a number. The byte
- * printer below prints decimals, in the same layout MLIR's printers use.
- */
-
-static void print_memref_i8_at(const int8_t *data, const int64_t *sizes,
-                               const int64_t *strides, int64_t rank,
-                               int64_t dim, int64_t offset) {
-  if (dim == 0) {
-    printf("%d", (int)data[offset]);
-    return;
-  }
-  printf("[");
-  print_memref_i8_at(data, sizes + 1, strides + 1, rank, dim - 1, offset);
-  if (sizes[0] <= 1) {
-    printf("]");
-    return;
-  }
-  printf(", ");
-  if (dim > 1)
-    printf("\n");
-  for (int64_t i = 1; i + 1 < sizes[0]; ++i) {
-    for (int64_t s = 0; s < rank - dim + 1; ++s)
-      printf(" ");
-    print_memref_i8_at(data, sizes + 1, strides + 1, rank, dim - 1,
-                       offset + i * strides[0]);
-    printf(", ");
-    if (dim > 1)
-      printf("\n");
-  }
-  for (int64_t s = 0; s < rank - dim + 1; ++s)
-    printf(" ");
-  print_memref_i8_at(data, sizes + 1, strides + 1, rank, dim - 1,
-                     offset + (sizes[0] - 1) * strides[0]);
-  printf("]");
-}
-
 void printMemrefI8(int64_t rank, void *descriptor) {
-  int8_t **ptrs = (int8_t **)descriptor;
-  /* The offset, then the sizes, then the strides. */
-  int64_t *meta = (int64_t *)(ptrs + 2);
-  printf("Unranked Memref base@ = %p rank = %" PRId64 " offset = %" PRId64
-         " sizes = [",
-         (void *)ptrs[1], rank, meta[0]);
-  for (int64_t i = 0; i < rank; ++i)
-    printf("%s%" PRId64, i ? ", " : "", meta[1 + i]);
-  printf("] strides = [");
-  for (int64_t i = 0; i < rank; ++i)
-    printf("%s%" PRId64, i ? ", " : "", meta[1 + rank + i]);
-  printf("] data = \n");
-  if (rank == 0)
-    printf("[");
-  print_memref_i8_at(ptrs[1], meta + 1, meta + 1 + rank, rank, rank, meta[0]);
-  if (rank == 0)
-    printf("]");
-  printf("\n");
+  vx_print_memref(rank, descriptor, 1, 1);
 }
 
 void printMemrefI16(int64_t rank, void *descriptor) {
   VxUnrankedMemRef packed = {rank, descriptor};
   _mlir_ciface_printMemrefI16(&packed);
+}
+
+void printMemrefU8(int64_t rank, void *descriptor) {
+  vx_print_memref(rank, descriptor, 1, 0);
+}
+
+void printMemrefU16(int64_t rank, void *descriptor) {
+  vx_print_memref(rank, descriptor, 2, 0);
+}
+
+void printMemrefU32(int64_t rank, void *descriptor) {
+  vx_print_memref(rank, descriptor, 4, 0);
+}
+
+void printMemrefU64(int64_t rank, void *descriptor) {
+  vx_print_memref(rank, descriptor, 8, 0);
 }

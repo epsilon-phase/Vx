@@ -952,7 +952,7 @@ pub struct SubspaceInfo {
 /// `func.func private` declaration prepended. Order is load-bearing — the emit records which of
 /// these a function called as a bitmask over this array's indices, so inserting in the middle
 /// renumbers existing entries.
-const RUNTIME_HELPERS: [(&str, &str); 20] = [
+const RUNTIME_HELPERS: [(&str, &str); 22] = [
     ("printMemrefF32", "(memref<*xf32>)"),
     ("printMemrefF64", "(memref<*xf64>)"),
     ("printMemrefI32", "(memref<*xi32>)"),
@@ -976,6 +976,8 @@ const RUNTIME_HELPERS: [(&str, &str); 20] = [
     // renumbers the entries after it.
     ("printMemrefI8", "(memref<*xi8>)"),
     ("printMemrefI16", "(memref<*xi16>)"),
+    ("printMemrefU8", "(memref<*xi8>)"),
+    ("printMemrefU16", "(memref<*xi16>)"),
 ];
 
 // The helper mask is a `u64`, so the table must not grow past 64 entries.
