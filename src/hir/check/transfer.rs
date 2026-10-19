@@ -480,6 +480,7 @@ impl<'a> TypeChecker<'a> {
 
     /// The declared fields of the struct `ty` names, from this module, a generated
     /// instantiation, or an import -- the same three places a struct literal is resolved.
+    #[allow(clippy::type_complexity)]
     fn struct_fields_of(
         &self,
         ty: &Type,
