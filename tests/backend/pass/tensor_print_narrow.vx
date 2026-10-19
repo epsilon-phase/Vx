@@ -31,28 +31,28 @@
 // CHECK: memref.cast %{{.*}} : memref<{{.*}}xi16> to memref<*xi16>
 // CHECK: call @printMemrefI16(%{{.*}}) : (memref<*xi16>) -> ()
 fn main() -> i32 {
-  let mut bytes = Tensor<i8, [2, 2]>::uninit();
+  let mut bytes = unsafe { Tensor<i8, [2, 2]>::uninit() };
   bytes[0][0] = 7;
   bytes[0][1] = -3;
   bytes[1][0] = 100;
   bytes[1][1] = -128;
   print(bytes);
 
-  let mut ubytes = Tensor<u8, [2, 2]>::uninit();
+  let mut ubytes = unsafe { Tensor<u8, [2, 2]>::uninit() };
   ubytes[0][0] = 7;
   ubytes[0][1] = 100;
   ubytes[1][0] = 3;
   ubytes[1][1] = 120;
   print(ubytes);
 
-  let mut shorts = Tensor<i16, [2, 2]>::uninit();
+  let mut shorts = unsafe { Tensor<i16, [2, 2]>::uninit() };
   shorts[0][0] = 300;
   shorts[0][1] = -3;
   shorts[1][0] = 100;
   shorts[1][1] = -32768;
   print(shorts);
 
-  let mut ushorts = Tensor<u16, [2, 2]>::uninit();
+  let mut ushorts = unsafe { Tensor<u16, [2, 2]>::uninit() };
   ushorts[0][0] = 300;
   ushorts[0][1] = 120;
   ushorts[1][0] = 100;
