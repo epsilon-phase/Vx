@@ -397,6 +397,16 @@ pub struct TypeChecker<'a> {
     pub(crate) in_unsafe_block: bool,
     pub(crate) active_topology: Topology,
     pub(crate) active_memory: MemorySpace,
+    /// Whether the device that owns `active_memory` declares `dtypes:`. Set whenever the
+    /// space changes, so the per-expression check costs a bool read outside a region.
+    pub(crate) active_space_declares_dtypes: bool,
+    /// Statements already reported for an element type inside a device region, as
+    /// `(line, column, element type)`.
+    pub(crate) region_element_reports:
+        std::collections::HashSet<(usize, usize, crate::syntax::ElementType)>,
+    /// The statement being checked. Most expression nodes carry no span of their own, so a
+    /// diagnostic about one has to point at the statement that contains it.
+    pub(crate) current_statement_span: crate::syntax::Span,
     pub transfer_cost_graph: &'a crate::arch::TransferCostGraph,
     /// Borrow-checking state (active records + NLL liveness), encapsulated so a conflict-check read
     /// cannot bypass the dead-borrow sweep (frontend_refactoring_borrow_checker.md R1; the #276 bug class). Replaces
@@ -459,6 +469,12 @@ impl<'a> TypeChecker<'a> {
         // lock-free carrier the parallel pipeline shares by `&`.
         let transfer_cost_graph = &env.transfer_cost_graph;
         let active_memory = transfer_cost_graph.default_memory_for(&Topology::CPU);
+        let active_space_declares_dtypes = transfer_cost_graph
+            .owning_topology(&active_memory)
+            .ok()
+            .and_then(|top| transfer_cost_graph.descriptor(&top.kind()))
+            .and_then(|desc| desc.dtypes.as_ref())
+            .is_some();
         Self {
             env,
             worker,
@@ -468,6 +484,9 @@ impl<'a> TypeChecker<'a> {
             allow_cross_topology: false,
             active_topology: Topology::CPU,
             active_memory,
+            active_space_declares_dtypes,
+            region_element_reports: std::collections::HashSet::new(),
+            current_statement_span: crate::syntax::Span::default(),
             transfer_cost_graph,
             borrow: crate::hir::borrow_cx::BorrowCx::default(),
             speculating: false,
@@ -486,6 +505,13 @@ impl<'a> TypeChecker<'a> {
             seam: Default::default(),
             traffic: Default::default(),
         }
+    }
+
+    /// Change the space the code being checked runs in, keeping the derived `dtypes:` flag
+    /// in step with it.
+    pub(crate) fn set_active_memory(&mut self, space: MemorySpace) {
+        self.active_space_declares_dtypes = self.space_declares_dtypes(&space);
+        self.active_memory = space;
     }
 
     pub fn push_scope(&mut self) {
@@ -1477,9 +1503,10 @@ impl<'a> TypeChecker<'a> {
         let prev_top = self.active_topology.clone();
         let prev_mem = self.active_memory.clone();
         self.active_topology = func.topology.clone();
-        self.active_memory = self
+        let mem = self
             .transfer_cost_graph
             .default_memory_for(&self.active_topology);
+        self.set_active_memory(mem);
 
         // Record the parameter set and clear per-function provenance state for the
         // return-escape analysis (#243). Saved/restored so nested checks (closures) don't
@@ -1593,7 +1620,7 @@ impl<'a> TypeChecker<'a> {
         self.current_function = prev_fn;
         self.consteval.constraints = prev_constraints;
         self.active_topology = prev_top;
-        self.active_memory = prev_mem;
+        self.set_active_memory(prev_mem);
         self.borrow.current_params = prev_params;
         self.borrow.ref_provenance = prev_provenance;
         self.borrow.views = prev_views;

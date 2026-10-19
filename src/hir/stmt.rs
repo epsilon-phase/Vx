@@ -205,6 +205,7 @@ impl<'a> TypeChecker<'a> {
         return_type: &Type,
         consume: bool,
     ) {
+        let prev_statement_span = std::mem::replace(&mut self.current_statement_span, stmt.span());
         match stmt {
             Statement::LetDecl(decl) => self.check_let_decl_stmt(decl, consume),
             Statement::ForLoop(floop) => self.check_for_loop_stmt(floop, consume, return_type),
@@ -260,6 +261,7 @@ impl<'a> TypeChecker<'a> {
             Statement::Drop(_) | Statement::Error(_) => {}
         }
         self.check_frame_escape(stmt);
+        self.current_statement_span = prev_statement_span;
     }
 
     /// Check a `let` binding: type the initializer, bind the name (annotation wins), record the
@@ -348,18 +350,11 @@ impl<'a> TypeChecker<'a> {
             ty
         };
 
-        // The device this region is placed on has to be able to represent what the body builds
-        // (docs/gpu_backends.md, "Shared work before a second backend", item 4). The placement
-        // check above asks the same question of a *space*, which is exactly why it only sees
-        // values that were placed: a scalar or a vector built here reaches no space at all.
-        // Outside a region the active space is host DRAM, whose descriptor declares no
-        // `dtypes:` and so constrains nothing -- so this is silent there by construction, not by
-        // a condition that could drift.
-        //
-        // Bindings only. A value that appears solely as the region's result -- never bound to a
-        // name -- is still unchecked, which is recorded rather than left to be rediscovered.
-        for elem in Self::element_types_of(&binding_ty) {
-            self.check_element_type_in_active_region(&elem, &context, span);
+        // The region's device has to represent what the body builds. A type annotation, or a
+        // type inferred from an untyped literal, has no expression that carries it, so the
+        // binding is checked here; expression types are checked as they are typed.
+        if self.active_space_declares_dtypes {
+            self.check_type_element_types_in_active_region(&binding_ty, &context, span, span);
         }
 
         self.bind_view(name.as_ref(), *_is_mut, expr, &binding_ty, span);

@@ -430,11 +430,8 @@ impl<'a> TypeChecker<'a> {
 
     /// E6026 for an element type used *inside* the active region, asked of that region's device.
     ///
-    /// The placement and transfer checks ask this question of a *space* -- that is how they know
-    /// which device to ask about, and it is why they only ever see values that were placed or
-    /// moved. A value built inside a region has no space yet, so nothing asked: `let t : f64 =
-    /// ...` in a kernel passed the checker and failed on the device instead, a machine away from
-    /// the mistake (docs/gpu_backends.md, "Shared work before a second backend", item 4).
+    /// The placement checks ask this of a space, so they only see values that were placed. A
+    /// value built inside a region reaches no space; this asks the region's device instead.
     pub(crate) fn check_element_type_in_active_region(
         &mut self,
         elem: &ElementType,
@@ -450,24 +447,107 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
+    /// E6026 for every element type `ty` names, reported at `span`.
+    ///
+    /// One report per statement and element type: the same expression is checked more than
+    /// once (a probe, a second look at a loop's iterable), and one mistake in one statement
+    /// should not arrive as several errors.
+    pub(crate) fn check_type_element_types_in_active_region(
+        &mut self,
+        ty: &Type,
+        context: &str,
+        span: &crate::syntax::Span,
+        statement: &crate::syntax::Span,
+    ) {
+        for elem in self.element_types_of(ty) {
+            let key = (statement.line, statement.column, elem.clone());
+            if self.region_element_reports.insert(key) {
+                self.check_element_type_in_active_region(&elem, context, span);
+            }
+        }
+    }
+
+    /// Whether the space the code being checked runs in belongs to a device that declares
+    /// `dtypes:`. The expression check skips its work otherwise.
+    pub(crate) fn space_declares_dtypes(&self, space: &MemorySpace) -> bool {
+        self.transfer_cost_graph
+            .owning_topology(space)
+            .ok()
+            .and_then(|top| self.transfer_cost_graph.descriptor(&top.kind()))
+            .and_then(|desc| desc.dtypes.as_ref())
+            .is_some()
+    }
+
+    /// The declared fields of the struct `ty` names, from this module, a generated
+    /// instantiation, or an import -- the same three places a struct literal is resolved.
+    fn struct_fields_of(
+        &self,
+        ty: &Type,
+    ) -> Option<(
+        Vec<crate::symbol::Symbol>,
+        Vec<(crate::symbol::Symbol, Type)>,
+    )> {
+        let name = match ty {
+            Type::Struct(name, _) => name,
+            Type::GenericInstance(base, _) => match &**base {
+                Type::Struct(name, _) => name,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if let Some(decl) = self.env.structs.get(name) {
+            let generics = decl.generics.iter().map(|g| g.name().into()).collect();
+            return Some((generics, decl.fields.clone()));
+        }
+        if let Some(decl) = self.mono.generated_structs.iter().find(|s| &s.name == name) {
+            let generics = decl.generics.iter().map(|g| g.name().into()).collect();
+            return Some((generics, decl.fields.clone()));
+        }
+        self.worker
+            .global
+            .registry
+            .struct_fields_of(ty)
+            .map(|fields| (fields.generics.clone(), fields.fields.clone()))
+    }
+
     /// The element types a type names: its own when it is a scalar, its element when it is a
-    /// tensor or a vector, and whatever the wrappers around it name. Nominal types are not
-    /// entered -- a struct's fields are declared elsewhere, and whether an instance of one is
-    /// placed is a question the placement checks already own.
-    pub(crate) fn element_types_of(ty: &Type) -> Vec<ElementType> {
+    /// tensor or vector, the types its wrappers hold, the arguments of a generic instance, and
+    /// the fields of a struct. A struct built in a region is not placed, so no placement check
+    /// sees its fields; the fields are followed here instead.
+    pub(crate) fn element_types_of(&self, ty: &Type) -> Vec<ElementType> {
         let mut out = Vec::new();
-        let mut stack = vec![ty];
+        let mut stack = vec![ty.clone()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(t) = stack.pop() {
             match t {
-                Type::Scalar(e) | Type::Tensor(e, _, _) | Type::Simd(e, _) => out.push(e.clone()),
+                Type::Scalar(e) | Type::Simd(e, _) | Type::Tensor(e, _, None) => out.push(e),
+                // These name the device that holds the value, and the placement checks ask
+                // that device. Asking the region's device instead would report against a
+                // machine the value never touches.
+                Type::Tensor(_, _, Some(_)) | Type::Pinned(..) => {}
                 Type::Ref(inner, _)
                 | Type::Verified(inner)
-                | Type::Pinned(inner, _)
                 | Type::Borrow { inner, .. }
-                | Type::Pointer(inner, _, _) => stack.push(inner),
-                Type::GenericInstance(inner, args) => {
-                    stack.push(inner);
-                    stack.extend(args.iter());
+                | Type::Pointer(inner, _, _) => stack.push(*inner),
+                Type::Struct(..) | Type::GenericInstance(..) => {
+                    let args = match &t {
+                        Type::GenericInstance(_, args) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    if seen.insert(t.to_string()) {
+                        if let Some((generics, fields)) = self.struct_fields_of(&t) {
+                            let mapping: std::collections::HashMap<_, Type> =
+                                generics.into_iter().zip(args.iter().cloned()).collect();
+                            stack
+                                .extend(fields.iter().map(|(_, field)| field.substitute(&mapping)));
+                        }
+                    }
+                    if let Type::GenericInstance(base, args) = t {
+                        if !matches!(base.as_ref(), Type::Struct(..)) {
+                            stack.push(*base);
+                        }
+                        stack.extend(args);
+                    }
                 }
                 _ => {}
             }
@@ -2116,7 +2196,8 @@ impl<'a> TypeChecker<'a> {
                 let prev_top = self.active_topology.clone();
                 let prev_mem = self.active_memory.clone();
                 self.active_topology = actual_top.clone();
-                self.active_memory = self.transfer_cost_graph.default_memory_for(&actual_top);
+                let region_mem = self.transfer_cost_graph.default_memory_for(&actual_top);
+                self.set_active_memory(region_mem);
 
                 *top = actual_top;
 
@@ -2167,11 +2248,32 @@ impl<'a> TypeChecker<'a> {
 
                 let mut ret_ty = Type::Struct("void".into(), None); // default void-like type
                 let has_ret = ret.is_some();
+                let ret_span = ret.as_deref().map(|r| r.span());
                 if let Some(r) = ret {
                     // The parser reads a trailing `if` as the region's value; a region used as
                     // a statement does not use it.
                     self.value_unused = unused;
                     ret_ty = self.check_expr_type_flag(r, consume);
+                }
+                // The result may be a value that was never bound to a name, and an untyped
+                // literal there was skipped by the expression check.
+                if self.active_space_declares_dtypes {
+                    if let Some(ret_span) = ret_span {
+                        let statement = self.current_statement_span;
+                        let span = if ret_span.line != 0 {
+                            ret_span
+                        } else {
+                            statement
+                        };
+                        if span.line != 0 {
+                            self.check_type_element_types_in_active_region(
+                                &ret_ty,
+                                "this region's result",
+                                &span,
+                                &statement,
+                            );
+                        }
+                    }
                 }
                 // A variable from outside the region is handed out as the same buffer.
                 let hands_out_outside =
@@ -2224,7 +2326,7 @@ impl<'a> TypeChecker<'a> {
                 self.pop_scope();
 
                 self.active_topology = prev_top;
-                self.active_memory = prev_mem;
+                self.set_active_memory(prev_mem);
 
                 // The result of a device kernel is located ON that device: return
                 // `Pinned<ret_ty, d>` so reading it on another topology re-triggers the USE
