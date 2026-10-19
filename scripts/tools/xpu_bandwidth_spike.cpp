@@ -6,9 +6,11 @@
 // and is checked against the CPU or against the bytes that were written.
 //
 // Memory: the program prints its footprint and refuses to allocate past the
-// ceiling in `vram_ceiling.h` (`VX_VRAM_CEILING`, 2 GiB by default, never more
-// than 12 GiB). At the default 512 MiB per buffer the peak is the triad phase's
-// 1.5 GiB, so a larger run has to be asked for on purpose.
+// ceiling in `vram_ceiling.h` (`VX_VRAM_CEILING`, 2 GiB by default). The
+// ceiling is whatever the operator sets; only the arithmetic bound in that
+// header limits it, so the peak cannot wrap. At the default 512 MiB per buffer
+// the peak is the triad phase's 1.5 GiB, so a larger run has to be asked for on
+// purpose.
 //
 // Build and run: scripts/tools/xpu_bandwidth_spike.sh [size in MiB]
 
