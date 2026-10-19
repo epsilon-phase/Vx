@@ -178,8 +178,12 @@ void the_section_is_read_back() {
   // parts of that are deliberate: the header is why the section exists at all
   // (NUL bytes cannot ride in a NUL-terminated entry), and the entry-shaped
   // tail is what a reader that walked into the section would pick up.
-  const std::string image =
-      std::string("\x03\x02\x23\x07", 4) + "\x00" + std::string("evil=1\0", 7);
+  // `std::string(1, '\0')`, not `"\x00"`: a string literal built from that
+  // escape is empty, so the NUL that separates the two never reached the image
+  // and the walk saw one entry, `\x03\x02\x23\x07evil=1`, rather than a key.
+  const std::string image = std::string("\x03\x02\x23\x07", 4) +
+                            std::string(1, '\0') +
+                            std::string("evil=1\0", 7);
   std::string payload = with_section(
       make_payload("vx_npu_kernel_7", "1",
                    {{"format=", "spirv"}, {"topo=", "500"}}),
