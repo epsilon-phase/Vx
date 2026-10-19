@@ -242,25 +242,26 @@ static inline size_t vx_payload_text_end(const void *payload,
     return 0;
   }
   const char *base = (const char *)payload;
-  size_t pos = 0;
 
-  while (pos < payload_size && base[pos] != '\0') {
-    ++pos; /* the kernel name */
+  /* memchr rather than a byte loop, for the reason vx_payload_field uses it: an
+     `image=` entry holds a whole module's PTX, and every lookup in the payload
+     crosses this walk first. */
+  const char *name_end = (const char *)memchr(base, '\0', payload_size);
+  if (!name_end) {
+    return payload_size; /* unterminated: there is no section to find */
   }
-  ++pos;
+  size_t pos = (size_t)(name_end - base) + 1;
 
   while (pos < payload_size) {
-    size_t len = 0;
-    while (pos + len < payload_size && base[pos + len] != '\0') {
-      ++len;
-    }
-    if (pos + len == payload_size) {
+    const char *entry = base + pos;
+    const char *end = (const char *)memchr(entry, '\0', payload_size - pos);
+    if (!end) {
       return payload_size; /* unterminated: there is no section to find */
     }
-    if (len == 0) {
+    if (end == entry) {
       return pos + 1; /* the empty entry: the section starts after it */
     }
-    pos += len + 1;
+    pos = (size_t)(end - base) + 1;
   }
 
   return payload_size;
