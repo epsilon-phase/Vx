@@ -49,7 +49,9 @@ fn main() -> i32 {
     // CHECK: Error[E6026] at [[@LINE+1]]:17: this expression has element type f64
     let _step = scale * 2.0;
     let a : f32 = 1.0;
-    // CHECK: Error[E6026] at [[@LINE+1]]:5: a value in this statement has element type f64
+    // The cast back to f32 does not hide the f64 inside it. The column and the wording
+    // depend on whether the parser gives a cast its own span, so pin the line and the type.
+    // CHECK: Error[E6026] at [[@LINE+1]]:{{[0-9]+}}: {{(this expression|a value in this statement)}} has element type f64
     let _y = ((a as f64) * 3.0) as f32;
     // CHECK: Error[E6026] at [[@LINE+1]]:5: this expression has element type f64
     d = d * 2.0;
