@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 typedef struct {
   int64_t rank;
@@ -99,7 +100,10 @@ static void vx_print_element(const void *base, int64_t at, int bytes,
     printf("%" PRIu64, ((const uint64_t *)base)[at]);
     return;
   }
-  assert(0 && "no such element size");
+  /* An element size the switch does not know must stop the program here. An
+   * `assert` is compiled out when NDEBUG is set, and the tensor would then
+   * print its brackets with no values inside. */
+  abort();
 }
 
 static void vx_print_data(const void *base, int bytes, int is_signed,
