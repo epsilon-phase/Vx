@@ -974,9 +974,6 @@ const RUNTIME_HELPERS: [(&str, &str); 22] = [
     ("print_bool", "(i32) -> i32"),
     ("printMemrefU32", "(memref<*xi32>)"),
     ("printMemrefU64", "(memref<*xi64>)"),
-    // Appended rather than put beside the other `printMemref` entries: the index
-    // into this array is part of an emitted record, so inserting in the middle
-    // renumbers the entries after it.
     ("printMemrefI8", "(memref<*xi8>)"),
     ("printMemrefI16", "(memref<*xi16>)"),
     ("printMemrefU8", "(memref<*xi8>)"),
