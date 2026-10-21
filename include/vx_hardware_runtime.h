@@ -244,8 +244,8 @@ static inline size_t vx_payload_text_end(const void *payload,
   const char *base = (const char *)payload;
 
   /* memchr rather than a byte loop, for the reason vx_payload_field uses it: an
-     `image=` entry holds a whole module's PTX, and every lookup in the payload
-     crosses this walk first. */
+     `image=` entry holds a whole module's PTX, and a text-only payload has to
+     walk past all of it to find out there is no section. */
   const char *name_end = (const char *)memchr(base, '\0', payload_size);
   if (!name_end) {
     return payload_size; /* unterminated: there is no section to find */
@@ -298,7 +298,11 @@ static inline size_t vx_payload_text_end(const void *payload,
 /// A payload may also carry a binary device image in a section after the
 /// entries, which vx_payload_section reads. Nothing writes one yet: the
 /// compiler writes the text `image=` entry only, and the section is there for
-/// the image a text entry cannot carry.
+/// the image a text entry cannot carry. The empty entry just before the section
+/// ends this walk, so a lookup never reads an image byte as the start of a key.
+///
+/// One more key is read but not written yet: `chip=`, the PTX target, which
+/// cuda_dispatch.cpp takes `sm_80` for when it is absent.
 static inline const char *
 vx_payload_field(const void *payload, size_t payload_size, const char *key) {
   if (!payload || payload_size == 0 || !key) {
@@ -307,18 +311,17 @@ vx_payload_field(const void *payload, size_t payload_size, const char *key) {
 
   const char *base = (const char *)payload;
   size_t key_len = strlen(key);
-  size_t text_end = vx_payload_text_end(payload, payload_size);
 
   /* Skip the kernel name, then walk the remaining NUL-terminated entries. memchr rather
      than a byte loop: an `image=` entry holds a whole module's PTX, and looking up a field
      that is absent walks all of it, on every launch. */
-  const char *name_end = (const char *)memchr(base, '\0', text_end);
+  const char *name_end = (const char *)memchr(base, '\0', payload_size);
   if (!name_end) {
     return NULL;
   }
   size_t pos = (size_t)(name_end - base) + 1;
 
-  while (pos < text_end) {
+  while (pos < payload_size) {
     const char *entry = base + pos;
     size_t remaining = payload_size - pos;
     const char *end = (const char *)memchr(entry, '\0', remaining);
@@ -327,6 +330,12 @@ vx_payload_field(const void *payload, size_t payload_size, const char *key) {
       return NULL;
     }
     size_t len = (size_t)(end - entry);
+    if (len == 0) {
+      /* The empty entry that ends the text part. Stop here rather than walk on:
+         what follows is the section's bytes, not entries, so reading them as
+         keys would make an answer depend on the image. */
+      return NULL;
+    }
     /* `len >= key_len`, not `>`: an entry that is exactly the key (an empty
        value, like `abi=`) still matches, so a consumer can tell "present but
        empty" from "absent" -- the promise vx_payload_abi makes. */
@@ -392,6 +401,10 @@ static inline int32_t vx_payload_abi(const void *payload, size_t payload_size) {
 ///
 /// The image's format is the `format=` entry, not a property of the section: a
 /// consumer that meets a format it does not know refuses instead of guessing.
+///
+/// The section starts wherever the text part ended, so it need not be aligned.
+/// A consumer that reads the image as `uint32_t` words -- SPIR-V's header -- has
+/// to copy it to an aligned buffer rather than cast `out`.
 static inline int64_t vx_payload_section(const void *payload,
                                          size_t payload_size,
                                          const void **out) {

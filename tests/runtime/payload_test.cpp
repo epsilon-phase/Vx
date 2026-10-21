@@ -159,6 +159,20 @@ void entries_still_walk_with_one_more() {
         "a key before the damage is still found");
 }
 
+/// An entry whose value is empty (`key=` and nothing after it) is not the empty
+/// entry that ends the text part: it has a key, so it must be found, and the
+/// entries after it stay reachable.
+void an_empty_value_does_not_end_the_walk() {
+  const std::string payload =
+      make_payload("vx_npu_kernel_3", "1", {{"coop=", ""}, {"topo=", "500"}});
+
+  const char *coop = vx_payload_field(payload.data(), payload.size(), "coop=");
+  check(coop != nullptr && coop[0] == '\0',
+        "a `key=` with no value is present, with an empty value");
+  check(vx_payload_field(payload.data(), payload.size(), "topo=") != nullptr,
+        "and the entry after it is still found");
+}
+
 /// A section appended to a text payload: the empty entry that ends the text
 /// part, then a little-endian 64-bit length, then the bytes. This is the layout
 /// the reader must agree with, written out rather than built by a helper the
@@ -253,6 +267,7 @@ void refusals() {
 int main() {
   the_version_key_is_read();
   entries_still_walk_with_one_more();
+  an_empty_value_does_not_end_the_walk();
   the_section_is_read_back();
   a_text_only_payload_carries_no_section();
   refusals();
