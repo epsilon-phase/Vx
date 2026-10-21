@@ -3,9 +3,9 @@
 //
 // Every tool in this directory that touches the card includes this rather than
 // deciding for itself. A run starts at a conservative ceiling and raises it
-// deliberately through `VX_VRAM_CEILING`; a size or ceiling too large for the
-// peak arithmetic to carry is refused, and a requested size is never silently
-// clamped down to fit.
+// deliberately through `VX_VRAM_CEILING`; the upper limit below stops a
+// mistyped or absurd ceiling from making a tool try to allocate more than the
+// card holds. Raise that limit only after checking the card can hold more.
 #pragma once
 
 #include <cerrno>
@@ -17,17 +17,15 @@
 // setting `VX_VRAM_CEILING`, so the larger allocation is always deliberate.
 static constexpr uint64_t kVramCeilingDefault = 2ull * 1024 * 1024 * 1024;
 
-// The most `VX_VRAM_CEILING` may be set to. This is arithmetic, not a fact
-// about any card: it is the largest ceiling under which three buffers sized
-// from it still fit a 64-bit count, so no ceiling the variable accepts can make
-// a helper's peak arithmetic wrap. The ceiling itself belongs to the operator,
-// who may set it as high as this bound allows.
-static constexpr uint64_t kVramCeilingMax = UINT64_MAX / 3;
+// The most `VX_VRAM_CEILING` may be set to. The upper limit protects the
+// measurement machine: it refuses a mistyped or absurd value before anything is
+// allocated. Change it only after checking that the card can hold more.
+static constexpr uint64_t kVramCeilingMax = 12ull * 1024 * 1024 * 1024;
 
 // The largest per-buffer size in MiB a helper may be asked for when its peak is
 // three buffers of that size: `3 * size * MiB` is then at most
-// `kVramCeilingMax`, which is at most a third of the 64-bit range, so the peak
-// cannot wrap a 64-bit count before `requireWithinCeiling` sees it.
+// `kVramCeilingMax`, far below a 64-bit count. This size cap, not the ceiling
+// bound, is what keeps the peak arithmetic from wrapping.
 static constexpr uint64_t kVramCeilingMaxSizeMiB =
     kVramCeilingMax / 3 / (1024 * 1024);
 
@@ -62,7 +60,7 @@ static uint64_t parseCount(const char *name, const char *text, const char *unit,
 
 // The VRAM ceiling in bytes: `VX_VRAM_CEILING` when it is set, else
 // `kVramCeilingDefault`. The variable cannot raise the ceiling past
-// `kVramCeilingMax`, so the peak arithmetic above cannot wrap.
+// `kVramCeilingMax`.
 static uint64_t vramCeiling() {
   const char *env = std::getenv("VX_VRAM_CEILING");
   if (!env || env[0] == '\0')
@@ -102,8 +100,9 @@ static void requireWithinCeiling(const char *tool, uint64_t peak,
     std::fprintf(stderr,
                  "%s: refusing to allocate %llu bytes (requested); the VRAM "
                  "ceiling is %llu bytes (permitted). Raise VX_VRAM_CEILING to "
-                 "permit more.\n",
-                 tool, (unsigned long long)peak, (unsigned long long)ceiling);
+                 "at most %llu bytes deliberately.\n",
+                 tool, (unsigned long long)peak, (unsigned long long)ceiling,
+                 (unsigned long long)kVramCeilingMax);
     std::exit(1);
   }
 }
