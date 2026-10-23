@@ -3,7 +3,7 @@
 //
 // Every tool in this directory that touches the card includes this rather than
 // deciding for itself. A run starts at a conservative ceiling and raises it
-// deliberately through `VX_VRAM_CEILING`; the upper limit below stops a
+// deliberately through `VX_VRAM_CEILING`. The upper limit below stops a
 // mistyped or absurd ceiling from making a tool try to allocate more than the
 // card holds. Raise that limit only after checking the card can hold more.
 #pragma once
