@@ -18,6 +18,9 @@ use std::process::Command;
 /// Programs the flat path declines today, relative to `tests/backend/pass/`.
 /// A worklist, not an exemption list: shrinking it is Vx#383.
 const KNOWN_DECLINES: &[&str] = &[
+    // A `match` through a reference to an enum, one of them with a payload: the flat path does
+    // not lower a match over a borrowed enum or an enum that carries a payload.
+    "backend/pass/match_on_a_reference_to_an_enum.vx",
     // `c as ||->i32`: the flat path declines a cast to the built-in closure type ("a cast to a
     // non-scalar"); the AST path compiles it.
     "backend/pass/returning_a_closure_that_uses_nothing.vx",
@@ -38,9 +41,18 @@ const KNOWN_DECLINES: &[&str] = &[
     // `let u = if c { ..; };`: the flat path declines a `let` of a `void` value, with or
     // without `: void` ("a let with no type annotation"). The file is about the AST path.
     "backend/pass/if_else_with_no_value_bound_by_let.vx",
-    // `Duration`'s `+` and `-` go through `Option<Duration>`, and the flat path declines its
-    // `unwrap` ("a non-scalar default return").
-    "backend/pass/operators_on_user_types.vx",
+    // A `match` that gives a `bool`: the flat path declines a match used as a value. The file
+    // is about the AST path.
+    "optimizations/pass/match_that_gives_a_bool.vx",
+    // A struct passed to `grad`: the flat path declines it ("an autodiff argument that is not a
+    // scalar"). The file is about the AST path.
+    "backend/pass/autodiff/autodiff_for_variable_argument.vx",
+    // `&mut arr[0]`: the flat path declines any borrow of a tensor element ("a borrow of
+    // something that is not a tensor").
+    "frontend/pass/two_mutable_borrows_one_after_the_other.vx",
+    // A function returning `Result<void, E>`: the flat path has no layout for a payload of type
+    // `void` ("a callee return type").
+    "backend/pass/result_with_a_void_success_type.vx",
     // `Result<void, i32>`: the flat path has no layout for a `void` payload ("an enum payload
     // type that is not modelled").
     "backend/pass/result_of_void.vx",
@@ -53,6 +65,9 @@ const KNOWN_DECLINES: &[&str] = &[
     "backend/pass/cast_a_borrow_to_a_raw_pointer.vx",
     "backend/pass/write_through_a_borrow_of_a_tensor_element.vx",
     "backend/pass/borrow_element_through_pointer.vx",
+    // A raw pointer held in a `let` ("a place-bound reference in value position"): the flat
+    // path has no pointer values yet.
+    "backend/pass/raw_pointers_compare_by_address.vx",
     // "A store to a nested nominal field": `self.inner = x` puts a struct into a struct's
     // field, which the flat path does not model. The file is about the AST path anyway.
     "backend/pass/assign_field_of_struct_local.vx",
@@ -61,10 +76,8 @@ const KNOWN_DECLINES: &[&str] = &[
     "backend/pass/closure_literal_as_closure_value.vx",
     // "A store to a nested nominal field": `out.f = f` puts a closure into a struct's field.
     "backend/pass/closure_using_a_local_stays_in_its_function.vx",
-    // `Option::or` and its neighbours, which answer with an `Option<T>`. The flat path
-    // declines them as "a non-scalar default return" -- the same shape as the file below,
-    // and the AST path handles both. The module's other methods answer with a `T` or a
-    // `bool` and compile through the flat path; adding these three is what moved the file.
+    // `Option::take` writes through `&mut Option<T>`, which the flat path declines as "a
+    // pointer element type that is not modelled". The answers come from the AST path.
     "backend/pass/core_option.vx",
     // An `Option` of an `Option` and of a pair: the flat path declines `main` as "an enum
     // with no modelled instance layout". The answers come from the AST path.
@@ -120,10 +133,8 @@ const KNOWN_DECLINES: &[&str] = &[
     // The flat path declines `main` as "a callee return type", since `wrap` and `some_pair`
     // answer with a generic struct and a generic enum. The answers come from the AST path.
     "backend/pass/nested_generic_names_in_generic_fns.vx",
-    // `ok`, `err`, `map`, `map_err` and `and_then` all answer with an `Option` or a
-    // `Result`, which the flat path declines as "a non-scalar default return" -- the same
-    // shape as the file above. The AST path handles them, and that is where the answers
-    // come from.
+    // `and_then` calls a closure that answers a `Result`, which the flat path declines as "an
+    // indirect callee returning a non-scalar". The answers come from the AST path.
     "backend/pass/core_result.vx",
     // `partial_cmp` answers with an `Option<Ordering>`, and `then_with` and `max_by` take
     // closures that answer with an `Ordering`. The flat path declines the first as "a
@@ -131,31 +142,10 @@ const KNOWN_DECLINES: &[&str] = &[
     // These live apart from `core_cmp.vx` so that file keeps compiling through the flat
     // path; putting them together would have moved it here instead.
     "backend/pass/core_cmp_partial.vx",
-    // `checked_add` and the other checked methods answer with an `Option<Duration>`, which
-    // the flat path declines as "a callee return type". The answers come from the AST path.
-    "backend/pass/core_time_duration.vx",
-    // `right_opt` and `left_opt` answer with an `Option<T>`, which the flat path declines
-    // as "a non-scalar default return" -- the same shape as the file above. Those two
-    // methods are the point of the file: a parameter only reaches the code that binds it
-    // when it is handed to another generic type, so the AST path is where it is asked.
-    "backend/pass/enum_binds_every_type_parameter.vx",
-    // A generic enum returned from a match whose arms each return. The flat path declines it
-    // as "a non-scalar default return" -- the same shape the AST path used to mis-lower, and
-    // the reason that file exists. Its answers come from the AST path, and it states no
-    // directive about emitted IR for that reason.
-    "backend/pass/generic_enum_returned_from_match.vx",
     // A generic struct, which the flat path declines as "a struct with no GID". The file
     // exists to pin that `>>` still closes two generics now that it is also the right
     // shift, and that question is settled in the parser, so the decline costs it nothing.
     // It states no directive about emitted IR, precisely because it is on the AST path.
-    // Indexing the result of a rank-1 elementwise operator. The rank-1 lowering
-    // reads both operands as one `vector.load` and writes the result with one
-    // arithmetic op, and records no memref type for the value it produced, so
-    // `op_tensor_index` has nothing to load from and declines. The operator
-    // itself lowers fine; only reading an element back does not. Rank 2 keeps
-    // its buffer and is unaffected, which is why the rank-2 half of these
-    // checks lives in `tensor_arithmetic_run.vx` and still runs here.
-    "backend/pass/tensor_arithmetic_rank1_run.vx",
     "backend/pass/user_lowering_name_collisions.vx",
     "backend/pass/user_lowering_uncountable.vx",
     "backend/pass/user_lowering_waste.vx",
@@ -175,17 +165,17 @@ const KNOWN_DECLINES: &[&str] = &[
     // operand ("a matmul assignment whose destination may be one of its operands").
     "frontend/pass/tensor_drop_points_reassigned.vx",
     // The `vxc -j` fallback fixture: a program the flat path declines, chosen so the parallel
-    // frontend has something to hand back to the sequential driver. Same shape as
-    // generic_enum_returned_from_match.vx, and it declines for the same reason.
+    // frontend has something to hand back to the sequential driver. It declines "a match in
+    // value position".
     "frontend/pass/jobs_falls_back_outside_the_flat_subset.vx",
     // The same shape again, with a warning added: it states that a program checked by both
     // frontends has its warnings reported once, which needs a program that declines.
     "frontend/pass/jobs_warns_once_when_it_falls_back.vx",
-    // Same decline as `backend/pass/iterator_over_structs.vx`, through `vxc -j`.
-    "frontend/pass/jobs_iterator_over_structs.vx",
     "frontend/pass/trait_topologies.vx",
     // A `for` loop over `v.iter()`: the flat path declines `Vec` iteration by reference.
     "frontend/pass/vec_iterator_borrow_ends_at_last_use.vx",
+    // `&&x` borrows a borrow, and the flat path declines a borrow of anything but a tensor.
+    "frontend/pass/warning_for_a_borrow_of_a_borrow.vx",
     // A parameter with run-time extents (Vx#409). It used to compile through the flat path
     // while the dims-less spelling let it read as rank-0: `topology.vx` got a `memref<f32>`
     // signature where the AST oracle gives `memref<?x?xf32>`, two ABIs for one function, plus
@@ -198,6 +188,16 @@ const KNOWN_DECLINES: &[&str] = &[
     // A call through a pointer to a `void` function: the flat path declines it ("an indirect
     // callee returning a non-scalar").
     "backend/pass/generic_call_of_a_void_function.vx",
+    // `a && b` in a `print!` argument: the flat path declines it ("a logical operator lowers only
+    // in memory mode"). The file is about the AST path.
+    "frontend/pass/print_argument_with_and_or.vx",
+    // `p.v = o` stores a `Vec` into a struct field: the flat path declines "a store to a nested
+    // nominal field".
+    "frontend/pass/moved_variable_given_a_new_value.vx",
+    // `c = a.clone()` inside a `spawn`: the flat path declines it ("a tensor given a new value
+    // inside a branch or loop"). The kernel has to write `c` for `c` to be passed as a slot,
+    // which is what the file checks.
+    "optimizations/pass/dispatch_abi_tags.vx",
 ];
 
 /// Every `.vx` file under `dir`, recursively, sorted for a stable report.
@@ -342,6 +342,13 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
             "optimizations/pass/numa_peer_node_is_priced.vx",  // needs --host and --machine
             // needs --host and --machine
             "optimizations/pass/dtcm_tiles_in_sibling_blocks_fit_a_cortex_m7.vx",
+            "optimizations/pass/gpu_kernel_in_main_on_the_ast_code_generator.vx", // needs --machine
+            "optimizations/pass/gpu_register_tensor_stays_in_registers.vx",       // needs --machine
+            "optimizations/pass/register_tensor_loops_are_unrolled.vx",           // needs --machine
+            "optimizations/pass/gpu_kernel_stack_slots_keep_their_order.vx",      // needs --machine
+            "optimizations/pass/across_loops_run_in_order_on_the_cpu.vx",         // needs --machine
+            "optimizations/pass/across_kernels_that_pass_the_checks.vx",          // needs --machine
+            "frontend/pass/packages/import_from_a_package.vx",                    // needs --package
         ];
         if NOT_STANDALONE.contains(&name.as_str()) {
             continue;
@@ -499,12 +506,12 @@ fn flat_path_answers_match_the_backend_expectations() {
     let mut checked = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
-    // `read_dir` rather than the recursive `corpus_programs` above, because this must be
-    // the SAME corpus `run_backend_test` runs, and that walks the directory without
-    // descending. Subdirectories like backend/pass/autodiff/ are reached by their own RUN
-    // lines instead, and their `// EXPECT:` lines assert on emitted IR rather than on what
-    // the program printed -- recursing would quietly test a different thing against
-    // assertions that were never about program output.
+    // `read_dir` rather than the recursive `corpus_programs` above, because this must be the
+    // SAME corpus `run_expect_lines_on_the_ast_code_generator` runs, and that walks the
+    // directory without descending. Subdirectories like backend/pass/autodiff/ are reached by
+    // their own RUN lines instead, and their `// EXPECT:` lines assert on emitted IR rather
+    // than on what the program printed -- recursing would quietly test a different thing
+    // against assertions that were never about program output.
     let backend_dir = tests.join("backend/pass");
     let mut programs: Vec<PathBuf> = std::fs::read_dir(&backend_dir)
         .expect("tests/backend/pass is missing")
@@ -524,13 +531,14 @@ fn flat_path_answers_match_the_backend_expectations() {
         }
         let source = std::fs::read_to_string(&program).unwrap_or_default();
 
-        // The same gates `run_backend_test` applies, so the two harnesses agree on what a
-        // fixture has opted out of -- all but `// REQUIRES: flat-codegen`, which says the
-        // legacy path gets the answers wrong and is therefore a reason to run a file here,
-        // not to skip it. Every other `// REQUIRES:` is about which codegen path a
-        // program takes, which is this file's other test, not a reason to skip running one.
-        // `NO_EXEC` was the gate this loop first left out: a fixture that has never been run
-        // can carry EXPECT lines nothing has ever compared, and `matmul_bf16.vx` did.
+        // The same gates `run_expect_lines_on_the_ast_code_generator` applies, so the two
+        // harnesses agree on what a fixture has opted out of -- all but
+        // `// REQUIRES: flat-codegen`, which says the legacy path gets the answers wrong and is
+        // therefore a reason to run a file here, not to skip it. Every other `// REQUIRES:` is
+        // about which codegen path a program takes, which is this file's other test, not a
+        // reason to skip running one. `NO_EXEC` was the gate this loop first left out: a
+        // fixture that has never been run can carry EXPECT lines nothing has ever compared,
+        // and `matmul_bf16.vx` did.
         if source.contains("// NO_EXEC") {
             continue;
         }
@@ -579,8 +587,9 @@ fn flat_path_answers_match_the_backend_expectations() {
 
         // Both streams, because a fixture's expected output is not always on stdout --
         // ffi_stdio.vx writes deliberately to stderr, and an unwind message goes there too.
-        // `run_backend_test` sees one combined string from the in-process JIT, so checking
-        // only stdout here would fail programs the legacy path passes for no real reason.
+        // `run_expect_lines_on_the_ast_code_generator` sees one combined string from the
+        // in-process JIT, so checking only stdout here would fail programs the legacy path
+        // passes for no real reason.
         let out = format!("{}{}", String::from_utf8_lossy(&output.stdout), log);
         for expect in &expects {
             if !crate::integration_test::compile_test::expect_matches(&out, expect) {

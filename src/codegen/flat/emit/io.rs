@@ -22,12 +22,30 @@ impl FnEmit<'_> {
             .clone()
         {
             let et = memref_elem(&memty).ok_or(crate::emitter_gap!())?;
-            let helper = match et {
-                "f32" => "printMemrefF32",
-                "f64" => "printMemrefF64",
-                "i32" => "printMemrefI32",
-                "i64" => "printMemrefI64",
-                "bf16" => "printMemrefBF16",
+            // MLIR integers carry no sign, so the tensor's own element type says whether an
+            // `i8` memref holds `u8`s.
+            let unsigned = self
+                .types
+                .get(ins.type_idx.0 as usize)
+                .and_then(|gid| self.ctx.tensors.get(gid))
+                .is_some_and(|(elem, _)| {
+                    matches!(
+                        elem,
+                        ElementType::U8 | ElementType::U16 | ElementType::U32 | ElementType::U64
+                    )
+                });
+            let helper = match (et, unsigned) {
+                ("f32", _) => "printMemrefF32",
+                ("f64", _) => "printMemrefF64",
+                ("i32", true) => "printMemrefU32",
+                ("i64", true) => "printMemrefU64",
+                ("i32", false) => "printMemrefI32",
+                ("i64", false) => "printMemrefI64",
+                ("bf16", _) => "printMemrefBF16",
+                ("i8", true) => "printMemrefU8",
+                ("i16", true) => "printMemrefU16",
+                ("i8", false) => "printMemrefI8",
+                ("i16", false) => "printMemrefI16",
                 _ => return Err(crate::emitter_gap!()),
             };
             let c = format!("%pc{idx}");
@@ -47,7 +65,15 @@ impl FnEmit<'_> {
             // The narrow *signed* scalars have none, so they widen to one that does -- the same
             // widening the AST path applies, so a program prints the same text either way.
             let (arg, et) = match et {
-                "f16" | "bf16" => {
+                // A `bool` goes to `print_bool` as an `i32`, the width C passes reliably.
+                "i1" => {
+                    let w = format!("%pw{idx}");
+                    self.body += &format!("  {w} = arith.extui {arg} : i1 to i32\n");
+                    let n = format!("%v{idx}");
+                    self.body += &format!("  {n} = func.call @print_bool({w}) : (i32) -> i32\n");
+                    return Ok(());
+                }
+                "f4E2M1FN" | "f8E4M3FN" | "f8E5M2" | "f16" | "bf16" => {
                     let w = format!("%pw{idx}");
                     self.body += &format!("  {w} = arith.extf {arg} : {et} to f32\n");
                     (w, "f32")

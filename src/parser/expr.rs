@@ -148,6 +148,14 @@ impl<'a> Parser<'a> {
             if self.shift_assign_at().is_some() {
                 break;
             }
+            // The operator's own token, so a diagnostic about the operation points at it
+            // rather than at 0:0.
+            let op_span = Span {
+                line: self.peek().line,
+                column: self.peek().column,
+                length: self.peek().length,
+                expansion: self.expansion(),
+            };
             // A shift is checked first: on its own, the leading `<` or `>` would read as
             // a comparison, which binds looser and would take the second bracket as the
             // start of its right operand.
@@ -170,7 +178,7 @@ impl<'a> Parser<'a> {
                     lhs: Box::new(left),
                     op,
                     rhs: Box::new(right),
-                    span: Span::default(),
+                    span: op_span,
                     operand_ty: None,
                 });
                 continue;
@@ -183,7 +191,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: LogicalOp::Or,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                     });
                 }
                 TokenType::AndAnd => {
@@ -192,7 +200,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: LogicalOp::And,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                     });
                 }
                 TokenType::EqEq => {
@@ -201,7 +209,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: RelationalOp::Eq,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -211,7 +219,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: RelationalOp::NotEq,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -221,7 +229,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: RelationalOp::Le,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -231,7 +239,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: RelationalOp::Ge,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -241,7 +249,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: RelationalOp::Lt,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -251,7 +259,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: RelationalOp::Gt,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -261,7 +269,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::Add,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -271,7 +279,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::Sub,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -281,7 +289,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::Mul,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -291,7 +299,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::MatMul,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -301,7 +309,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::Div,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -311,7 +319,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::Rem,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -321,7 +329,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::BitAnd,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -331,7 +339,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::BitOr,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -341,7 +349,7 @@ impl<'a> Parser<'a> {
                         lhs: Box::new(left),
                         op: BinaryOp::BitXor,
                         rhs: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                         operand_ty: None,
                     });
                 }
@@ -350,7 +358,7 @@ impl<'a> Parser<'a> {
                     left = Expr::Range(RangeExpr {
                         start: Box::new(left),
                         end: Box::new(right),
-                        span: Span::default(),
+                        span: op_span,
                     });
                 }
                 _ => return Err(self.error("Unknown binary operator")),
@@ -394,11 +402,16 @@ impl<'a> Parser<'a> {
         match token.kind {
             TokenType::Number(_) | TokenType::StringLiteral(_) => {
                 let expr = self.parse_primary_expr()?; // parses number or string
-                Ok(Pattern::Literal(expr))
+                Ok(Pattern::Literal(Box::new(expr)))
             }
             TokenType::Identifier(s) => {
                 let mut enum_name = s.to_string();
                 self.advance();
+                if enum_name == "Self" {
+                    if let Some(target) = &self.impl_self {
+                        enum_name = target.to_string();
+                    }
+                }
                 if self.check(&TokenType::LeftAngle) {
                     // A list, not one argument: `Result<T, E>::Ok(v)` has two. Each is a whole
                     // type, so `Option<Pair<i64, i64>>::Some(p)` parses; it is printed back the
@@ -446,11 +459,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// After a name, `::Item::` follows when the name owns an associated type.
+    fn is_associated_type_path(&self) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.pos).map(|t| &t.kind),
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+            ),
+            (
+                Some(TokenType::DoubleColon),
+                Some(TokenType::Identifier(_)),
+                Some(TokenType::DoubleColon)
+            )
+        )
+    }
+
     pub(crate) fn parse_identifier_expr(
         &mut self,
         mut call_name: String,
         span: Span,
     ) -> ParseResult<'a, Expr> {
+        // In an impl, `Self { .. }`, `Self::new()` and `Self::Variant` name the impl's type,
+        // spelled as the type prints: `Pair<T>`. `Self::Item::default()` keeps its `Self`.
+        if call_name == "Self" && !self.is_associated_type_path() {
+            if let Some(target) = &self.impl_self {
+                call_name = target.to_string();
+            }
+        }
         if call_name == "sizeof" {
             self.consume(&TokenType::LeftAngle, "Expected '<' after sizeof")?;
             let target_ty = self.parse_type()?;
@@ -477,6 +513,21 @@ impl<'a> Parser<'a> {
             match self.parse_named_type() {
                 Ok(ty) if self.check(&TokenType::DoubleColon) => {
                     return self.parse_tensor_constructor(ty, span);
+                }
+                // `Tensor<f32, [2, 2]>()` would fall through to the older spelling, which takes
+                // the shape from the arguments and so built a tensor with no dimensions.
+                Ok(ty) if self.check(&TokenType::LeftParen) => {
+                    return Err(self.error(&format!(
+                        "`{ty}` is built with `{ty}::new()` for zeroed storage, or \
+                         `unsafe {{ {ty}::uninit() }}` for storage left as it was found"
+                    )));
+                }
+                // The older spelling has no `aligned(N)`, so its error is the one to give.
+                Err(e @ ParserError::Custom { .. })
+                    if matches!(&e, ParserError::Custom { message, .. }
+                        if message.contains("`aligned(N)`")) =>
+                {
+                    return Err(e);
                 }
                 _ => self.pos = saved,
             }
@@ -658,8 +709,8 @@ impl<'a> Parser<'a> {
         let ctor = self.expect_identifier("Expected a constructor after a tensor type")?;
         if ctor != "new" && ctor != "uninit" && ctor != "fill" {
             return Err(self.error(
-                "A tensor type is built with `::new()` for zeroed storage or `::uninit()` for \
-                 storage left as it was found",
+                "A tensor type is built with `::new()` for zeroed storage, or with `::uninit()` \
+                 inside `unsafe` for storage left as it was found",
             ));
         }
         let head = "Tensor";
@@ -730,6 +781,7 @@ impl<'a> Parser<'a> {
                 line: variant_line,
                 column: variant_column,
                 length: 0,
+                expansion: self.expansion(),
             },
         }))
     }
@@ -746,6 +798,7 @@ impl<'a> Parser<'a> {
                     line: bang_line,
                     column: bang_column,
                     length: 1,
+                    expansion: self.expansion(),
                 },
             }));
         } else if self.match_token(&TokenType::Minus) {
@@ -757,6 +810,7 @@ impl<'a> Parser<'a> {
                     line: bang_line,
                     column: bang_column,
                     length: 1,
+                    expansion: self.expansion(),
                 },
             }));
         } else if self.check(&TokenType::Ampersand) {
@@ -765,6 +819,7 @@ impl<'a> Parser<'a> {
                 line: self.peek().line,
                 column: self.peek().column,
                 length: self.peek().length,
+                expansion: self.expansion(),
             };
             self.advance();
             let is_mut = self.match_token(&TokenType::Mut);
@@ -774,18 +829,31 @@ impl<'a> Parser<'a> {
                 is_mut,
                 span: amp_span,
             }));
-        } else if self.match_token(&TokenType::AndAnd) {
-            // `&&x` borrows a borrow; the lexer made the two `&`s one token.
+        } else if self.check(&TokenType::AndAnd) {
+            // `&&x` borrows a borrow; the lexer made the two `&`s one token. The outer borrow is
+            // the first `&` and the inner one the second.
+            let (line, column) = (self.peek().line, self.peek().column);
+            self.advance();
             let is_mut = self.match_token(&TokenType::Mut);
             let inner = self.parse_primary_expr()?;
             return Ok(Expr::Borrow(BorrowExpr {
                 expr: Box::new(Expr::Borrow(BorrowExpr {
                     expr: Box::new(inner),
                     is_mut,
-                    span: Span::default(),
+                    span: Span {
+                        line,
+                        column: column + 1,
+                        length: 1,
+                        expansion: self.expansion(),
+                    },
                 })),
                 is_mut: false,
-                span: Span::default(),
+                span: Span {
+                    line,
+                    column,
+                    length: 1,
+                    expansion: self.expansion(),
+                },
             }));
         } else if self.check(&TokenType::Star) {
             // The `*` token, so a diagnostic about the dereference points at it.
@@ -793,6 +861,7 @@ impl<'a> Parser<'a> {
                 line: self.peek().line,
                 column: self.peek().column,
                 length: self.peek().length,
+                expansion: self.expansion(),
             };
             self.advance();
             let inner = self.parse_primary_expr()?;
@@ -801,7 +870,15 @@ impl<'a> Parser<'a> {
                 ty: None,
                 span: star_span,
             }));
-        } else if self.match_token(&TokenType::Unsafe) {
+        } else if self.check(&TokenType::Unsafe) {
+            // The `unsafe` token, so a warning about the block points at it.
+            let unsafe_span = crate::syntax::Span {
+                line: self.peek().line,
+                column: self.peek().column,
+                length: self.peek().length,
+                expansion: self.expansion(),
+            };
+            self.advance();
             self.consume(&TokenType::LeftBrace, "Expected '{' after unsafe")?;
             let mut stmts = Vec::new();
             while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
@@ -820,10 +897,14 @@ impl<'a> Parser<'a> {
                 }
             }
             self.consume(&TokenType::RightBrace, "Expected '}'")?;
-            return Ok(Expr::UnsafeBlock(UnsafeBlockExpr {
+            // Only `as` may follow the block: a `(` or `[` on the next line starts a new
+            // statement, and `as` cannot.
+            return self.parse_as_casts(Expr::UnsafeBlock(UnsafeBlockExpr {
                 stmts,
                 ret,
-                span: Span::default(),
+                span: unsafe_span,
+                generated: false,
+                task: None,
             }));
         } else if self.check(&TokenType::If) {
             // The `if` token, so a diagnostic about the `if` points at it.
@@ -831,6 +912,7 @@ impl<'a> Parser<'a> {
                 line: self.peek().line,
                 column: self.peek().column,
                 length: self.peek().length,
+                expansion: self.expansion(),
             };
             self.advance();
             let is_comptime = self.match_token(&TokenType::Comptime);
@@ -899,13 +981,19 @@ impl<'a> Parser<'a> {
             {
                 return self.lower_tuple_match(expr, tuple_arms, at_statement);
             }
-            for (pattern, body, _) in tuple_arms {
+            for (pattern, body, arm_token) in tuple_arms {
                 let tuple_match::ArmPattern::Plain(pattern) = pattern else {
                     unreachable!("a tuple pattern is lowered above")
                 };
                 arms.push(MatchArm {
                     pattern: *pattern,
                     body,
+                    span: Span {
+                        line: arm_token.line,
+                        column: arm_token.column,
+                        length: arm_token.length,
+                        expansion: self.expansion(),
+                    },
                 });
             }
             return Ok(Expr::Match(MatchExpr {
@@ -929,11 +1017,22 @@ impl<'a> Parser<'a> {
                     space: mem,
                     cost: None,
                     lowering: None,
-                    span: Span::default(),
+                    span: Span {
+                        line: peeked_token.line,
+                        column: peeked_token.column,
+                        length: peeked_token.length,
+                        expansion: self.expansion(),
+                    },
                 })
             }
             TokenType::LeftBracket => {
                 self.advance();
+                let span = Span {
+                    line: peeked_token.line,
+                    column: peeked_token.column,
+                    length: peeked_token.length,
+                    expansion: self.expansion(),
+                };
                 let mut elements = Vec::new();
                 if !self.check(&TokenType::RightBracket) {
                     loop {
@@ -944,10 +1043,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.consume(&TokenType::RightBracket, "Expected ']'")?;
-                Expr::Array(ArrayExpr {
-                    elements,
-                    span: Span::default(),
-                })
+                Expr::Array(ArrayExpr { elements, span })
             }
             TokenType::Memory => Expr::MemorySpace(MemorySpaceExpr {
                 space: self.parse_memory_space()?,
@@ -1126,6 +1222,7 @@ impl<'a> Parser<'a> {
                                 line: token.line,
                                 column: token.column,
                                 length: token.length,
+                                expansion: self.expansion(),
                             };
                             self.parse_identifier_expr(s.to_string(), span)?
                         }
@@ -1136,6 +1233,7 @@ impl<'a> Parser<'a> {
                             line: token.line,
                             column: token.column,
                             length: token.length,
+                            expansion: self.expansion(),
                         },
                     )?,
                     TokenType::Number(s) => {
@@ -1159,16 +1257,16 @@ impl<'a> Parser<'a> {
                         let mut ret_expr = None;
                         while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
                             let stmt = self.parse_statement()?;
+                            // Only a last expression with no `;` is the block's value. A last
+                            // statement that ends with `;` stays one of the block's statements.
                             if self.check(&TokenType::RightBrace) {
                                 if let Statement::ExprStmt(ExprStmtStmt {
                                     expr: e,
-                                    has_semi,
+                                    has_semi: false,
                                     span: _,
                                 }) = stmt
                                 {
-                                    if !has_semi {
-                                        ret_expr = Some(Box::new(e));
-                                    }
+                                    ret_expr = Some(Box::new(e));
                                     break;
                                 }
                             }
@@ -1183,6 +1281,7 @@ impl<'a> Parser<'a> {
                                 line: token.line,
                                 column: token.column,
                                 length: token.length,
+                                expansion: self.expansion(),
                             },
                         })
                     }
@@ -1221,8 +1320,12 @@ impl<'a> Parser<'a> {
                             span: Span::default(),
                         })
                     }
+                    TokenType::Tasks => self.parse_task_block(TaskBlockKind::Tasks, &token)?,
+                    TokenType::Spawn if self.check(&TokenType::LeftBrace) => {
+                        self.parse_task_block(TaskBlockKind::Spawn, &token)?
+                    }
                     TokenType::Spawn => {
-                        self.consume(&TokenType::On, "Expected 'on' after 'spawn'")?;
+                        self.consume(&TokenType::On, "Expected 'on' or '{' after 'spawn'")?;
                         self.consume(&TokenType::LeftParen, "Expected '('")?;
                         let top = self.parse_topology()?;
                         self.consume(&TokenType::RightParen, "Expected ')'")?;
@@ -1252,8 +1355,16 @@ impl<'a> Parser<'a> {
                             top,
                             stmts,
                             ret: ret_expr,
-                            span: Span::default(),
+                            span: Span {
+                                line: token.line,
+                                column: token.column,
+                                length: token.length,
+                                expansion: self.expansion(),
+                            },
                         })
+                    }
+                    TokenType::Unknown('"') => {
+                        return Err(self.error_at(&token, super::UNCLOSED_STRING))
                     }
                     _ => {
                         return Err(self.error_at(
@@ -1273,6 +1384,7 @@ impl<'a> Parser<'a> {
                     line: self.peek().line,
                     column: self.peek().column,
                     length: self.peek().length,
+                    expansion: self.expansion(),
                 };
                 let ident = match self.advance().kind.clone() {
                     TokenType::Identifier(s) => s.to_string(),
@@ -1340,6 +1452,7 @@ impl<'a> Parser<'a> {
                     line: self.peek().line,
                     column: self.peek().column,
                     length: self.peek().length,
+                    expansion: self.expansion(),
                 };
                 self.advance();
                 let index = self.parse_expr()?;
@@ -1349,19 +1462,71 @@ impl<'a> Parser<'a> {
                     index: Box::new(index),
                     span: ix_span,
                 });
-            } else if self.match_token(&TokenType::As) {
-                let target_ty = self.parse_type()?;
-                expr = Expr::AsCast(AsCastExpr {
-                    expr: Box::new(expr),
-                    target_ty,
-                    source_ty: None,
-                    span: Span::default(),
-                });
+            } else if self.check(&TokenType::As) {
+                expr = self.parse_as_casts(expr)?;
             } else {
                 break;
             }
         }
 
+        Ok(expr)
+    }
+
+    /// The body of `tasks { .. }` or `spawn { .. }`, after the keyword `token`. A last
+    /// expression with no `;` is the value of the block.
+    fn parse_task_block(
+        &mut self,
+        kind: TaskBlockKind,
+        token: &Token<'a>,
+    ) -> ParseResult<'a, Expr> {
+        self.consume(&TokenType::LeftBrace, "Expected '{'")?;
+        let mut stmts = Vec::new();
+        while !self.check(&TokenType::RightBrace) && !self.check(&TokenType::Eof) {
+            self.parse_statement_into(&mut stmts)?;
+        }
+        let mut ret = None;
+        if let Some(Statement::ExprStmt(ExprStmtStmt {
+            expr,
+            has_semi: false,
+            span: _,
+        })) = stmts.last().cloned()
+        {
+            stmts.pop();
+            ret = Some(Box::new(expr));
+        }
+        self.consume(&TokenType::RightBrace, "Expected '}'")?;
+        Ok(Expr::TaskBlock(TaskBlockExpr {
+            kind,
+            stmts,
+            ret,
+            span: Span {
+                line: token.line,
+                column: token.column,
+                length: token.length,
+                expansion: self.expansion(),
+            },
+        }))
+    }
+
+    /// `expr as T`, any number of times.
+    fn parse_as_casts(&mut self, mut expr: Expr) -> ParseResult<'a, Expr> {
+        while self.check(&TokenType::As) {
+            // The `as` token, so a diagnostic about the cast points at it.
+            let as_span = Span {
+                line: self.peek().line,
+                column: self.peek().column,
+                length: self.peek().length,
+                expansion: self.expansion(),
+            };
+            self.advance();
+            let target_ty = self.parse_type()?;
+            expr = Expr::AsCast(AsCastExpr {
+                expr: Box::new(expr),
+                target_ty,
+                source_ty: None,
+                span: as_span,
+            });
+        }
         Ok(expr)
     }
 }
@@ -1911,7 +2076,7 @@ mod tests {
             assert_eq!(arms.len(), 2);
             assert!(matches!(
                 &arms[0].pattern,
-                Pattern::Literal(Expr::Number(_))
+                Pattern::Literal(lit) if matches!(**lit, Expr::Number(_))
             ));
             assert!(matches!(&arms[1].pattern, Pattern::Identifier(_)));
         } else {

@@ -68,9 +68,10 @@ pub enum Opcode {
     /// Marks the entry of basic block `imm`. Branch targets are block ids; codegen turns each
     /// `BlockStart` into an MLIR block.
     BlockStart = 19,
-    /// Opens a `vx.spawn` region on the topology whose dispatch id is `imm`
-    /// (`arch::topology_dispatch_id`). The instructions up to the matching `SpawnEnd` form the
-    /// spawned kernel body.
+    /// Opens a `vx.spawn` region on the topology whose dispatch id is the low 32 bits of `imm`
+    /// (`arch::topology_dispatch_id`). The high 32 bits are one more than the index of the
+    /// topology's name in the function's string table, since the id alone cannot give the name
+    /// back. The instructions up to the matching `SpawnEnd` form the spawned kernel body.
     Spawn = 20,
     /// Closes the `vx.spawn` region opened by the nearest preceding `Spawn` (maps to `vx.yield`).
     /// A region with a value yields `operand1` and is typed with it; this instruction's register
@@ -110,9 +111,11 @@ pub enum Opcode {
     /// slice (`o[i] = <slice>`); a scalar-element place (a `TensorIndex` with `imm = 1`) takes a
     /// scalar (`q[i][j] = <scalar>`).
     TensorStore = 27,
-    /// Move a tensor to a memory space: `operand1` is the source, `imm` the target space's dispatch
-    /// id (`arch::memory_space_dispatch_id`), `type_idx` the result tensor (same element + shape, so
-    /// the destination is sized to hold it). Backs `transfer(src, Memory::X)`.
+    /// Move a tensor to a memory space: `operand1` is the source, `type_idx` the result tensor (same
+    /// element + shape, so the destination is sized to hold it). The low 32 bits of `imm` are the
+    /// target space's dispatch id (`arch::memory_space_dispatch_id`); the high 32 bits are the
+    /// topology id of where the source is now, when its type is `Pinned`, and 0 otherwise. Backs
+    /// `transfer(src, Memory::X)`.
     Transfer = 28,
     /// One argument of the following `Call`: `operand1` is the argument's value register. The N-ary
     /// argument list a fixed two-operand instruction can't hold is spelled as N `Arg`s immediately
@@ -283,7 +286,42 @@ pub enum Opcode {
     /// elements in row order and then zeros. With `TENSOR_PAD_EACH_AXIS` in `imm` it is
     /// `t.pad(shape)` instead: each element keeps its index, and the zeros follow on every axis.
     TensorPad = 63,
+    /// The first instructions of a `spawn` region with `across` loops (#252): one for each grid
+    /// axis, `imm` 0 to 2, then one for the block, `imm` 3. `operand1` is the value, which the
+    /// host computed before the region. The region takes it, and the runtime reads it to launch
+    /// the kernel.
+    LaunchDim = 64,
+    /// Where this lane is in the launch, an `i32`: one of the `ACROSS_*` kinds in the low two
+    /// bits of `imm`, and the grid axis or the lanes in `imm >> 2`. On the CPU copy of the region
+    /// an index is 0 and a count is 1.
+    AcrossId = 65,
+    /// The first instruction of a region with `across` loops, after `Spawn`. The stack slots of
+    /// the region go in its first block, so that code that lane 0 alone runs can declare a value
+    /// that later code reads.
+    AcrossRegion = 66,
+    /// Opens a counted loop that the code generator writes as `affine.for`, from `operand1` to
+    /// `operand2` with step 1. The result is the loop variable, of the range's type. With
+    /// `AFFINE_FOR_BRANCHES` in `imm`, the body has blocks of its own. `AffineForEnd` closes it.
+    AffineFor = 67,
+    /// Closes the innermost open `AffineFor`.
+    AffineForEnd = 68,
 }
+
+/// `Opcode::AffineFor`'s `imm`: the body branches, so it goes in an `scf.execute_region`.
+pub const AFFINE_FOR_BRANCHES: u64 = 1;
+
+/// `Opcode::AcrossId`: the index of this lane in its block.
+pub const ACROSS_LANE: u64 = 0;
+/// `Opcode::AcrossId`: the step of a lane loop that shares its passes among the `imm >> 2` lanes:
+/// that number on the GPU, and 1 on the CPU copy, which has one lane.
+pub const ACROSS_STRIDE: u64 = 1;
+/// `Opcode::AcrossId`: the index of this block on a grid axis.
+pub const ACROSS_BLOCK: u64 = 2;
+/// `Opcode::AcrossId`: the blocks on a grid axis.
+pub const ACROSS_BLOCKS: u64 = 3;
+
+/// `Opcode::Barrier`'s `imm`: the lanes of one subgroup wait for each other, not the block.
+pub const BARRIER_SUBGROUP: u64 = 1;
 
 /// `Opcode::TensorPad`'s `imm`: pad each axis (`t.pad(shape)`), not the flat row order.
 pub const TENSOR_PAD_EACH_AXIS: u64 = 1;
@@ -326,6 +364,11 @@ impl Opcode {
             60 => ConstTable,
             61 => TensorDataPtr,
             62 => TensorDrop,
+            64 => LaunchDim,
+            65 => AcrossId,
+            66 => AcrossRegion,
+            67 => AffineFor,
+            68 => AffineForEnd,
             8 => Call,
             9 => Ret,
             10 => Matmul,

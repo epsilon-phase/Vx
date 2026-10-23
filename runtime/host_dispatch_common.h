@@ -133,7 +133,8 @@ inline void vx_describe_arg(int64_t i, int32_t tag, void *arg) {
   int32_t elem = VX_ABI_ELEM(tag);
   if (rank == 0 && elem == VX_DTYPE_UNKNOWN) {
     // Kind 0 covers both a ranked memref and the pointer fallback in
-    // abiTagForType; only the latter carries no element type or rank.
+    // dtypeCode in VxLowering.cpp; only the latter carries no element type or
+    // rank.
     fprintf(stderr, "  arg %lld: opaque ptr\n", (long long)i);
     return;
   }
@@ -710,6 +711,11 @@ void *vx_plugin_transfer_peer(void *src_device_ptr, uint32_t src_topology_id,
 }
 
 void vx_plugin_release_future(uint64_t future_id) { (void)future_id; }
+
+/// A build without CUDA has no streams. The call exists so that a host program
+/// links against every build (#1986).
+void vx_cuda_set_stream(void *stream) { (void)stream; }
+void *vx_cuda_get_stream(void) { return nullptr; }
 
 int32_t vx_plugin_control(uint32_t opcode, void *payload) {
   (void)payload;

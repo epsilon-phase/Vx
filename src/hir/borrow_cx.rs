@@ -1,6 +1,6 @@
 //! Borrow-checking state whose coherence the frontend depends on: the active borrow records and the
-//! per-block liveness that decides which of them are dead (NLL). This is the chokepoint the frontend
-//! previously lacked (frontend_refactoring_borrow_checker.md, R1; #279).
+//! per-block liveness that decides which of them are dead (NLL). The rest of the frontend reads
+//! borrow records only through this module.
 //!
 //! The point of the module boundary is that `active_borrows` is **private** — no code outside this file
 //! can read it. The only conflict-check read path is [`BorrowCx::live_borrows`], which sweeps dead
@@ -22,8 +22,8 @@ pub(crate) struct BorrowCx {
     /// `variable -> its borrow records`. **Private**: readable for a conflict check only via
     /// [`Self::live_borrows`], which sweeps dead borrows before returning.
     active_borrows: HashMap<Symbol, Vec<BorrowRecord>>,
-    /// Per-block last-use index of each local (NLL). The innermost block is `.last()`.
-    block_liveness: Vec<HashMap<Symbol, usize>>,
+    /// What each open block names and declares (NLL). The innermost block is `.last()`.
+    block_liveness: Vec<BlockUses>,
     /// The statement index currently being checked, one entry per open block. Innermost is `.last()`.
     current_stmt_idx: Vec<usize>,
     /// Whether borrow-conflict checks are suppressed (e.g. while typing a member-access receiver,
@@ -39,6 +39,13 @@ pub(crate) struct BorrowCx {
     /// Provenance of each reference-typed *local* binding (#243): does it root in caller memory
     /// (`External`) or a function-local slot (`Local`)? Reset per function.
     pub(crate) ref_provenance: HashMap<Symbol, RefProvenance>,
+    /// For each local that holds a `&mut` to something that can hold a reference: where a
+    /// write through it lands. `Local(depth)` is the block of the variable it points at, and
+    /// `External` is memory the caller owns. Reset per function.
+    pub(crate) store_targets: HashMap<Symbol, RefProvenance>,
+    /// For each local bound to `&mut v`: the variable `v`, and the block depth of the local.
+    /// A store through the local is then a store into `v`. Reset per function.
+    pub(crate) store_target_vars: HashMap<Symbol, (Symbol, usize)>,
     /// Parameters (name -> declared type) of the function currently being checked (#243). Reset per
     /// function; lets the return-escape analysis tell a caller-owned reference parameter apart from a
     /// local binding of the same reference type.
@@ -48,10 +55,30 @@ pub(crate) struct BorrowCx {
     /// Every borrower each variable has had in the function, kept after the borrow ends: a
     /// drop point is after the last use of all of them.
     borrowers_ever: HashMap<String, HashSet<String>>,
+    /// The borrows of variables that a newer `let` of the same name hides: the depth of the
+    /// new variable's scope, the name, and the records.
+    shadowed: Vec<(usize, Symbol, Vec<BorrowRecord>)>,
     /// Where each owned tensor is dropped. See `check/drops.rs`.
     pub(crate) drops: crate::hir::check::drops::DropFrames,
+    /// The tasks that have started and that nothing has joined yet. A task holds its borrows
+    /// until then, also where no statement names it. See `check/tasks.rs`.
+    running_tasks: HashSet<String>,
     /// What each view variable (`let r = q[i]`) borrows. Reset per function.
     pub(crate) views: HashMap<Symbol, crate::hir::check::views::View>,
+    /// The tensors each view-making `let` may be part of, keyed by the `let`'s position. The
+    /// traffic count reads it after the `let`'s scope has closed.
+    pub(crate) view_owners_by_let: HashMap<crate::syntax::Span, Vec<String>>,
+}
+
+/// What the borrow checker needs to know about a block to decide when a borrow made in or
+/// before it ends.
+pub(crate) struct BlockUses {
+    /// The index of the last statement in the block that names each variable.
+    pub(crate) last_use: HashMap<Symbol, usize>,
+    /// The variables the block declares. Nothing outside the block can name them.
+    pub(crate) declared: HashSet<Symbol>,
+    /// A loop body runs again after its last statement.
+    pub(crate) is_loop: bool,
 }
 
 /// What a loop's `break`s carry out of it and its `continue`s carry into its next pass: the
@@ -60,6 +87,9 @@ pub(crate) struct BorrowCx {
 pub(crate) struct LoopExits {
     pub(crate) at_break: Option<Vec<HashSet<String>>>,
     pub(crate) at_continue: Option<Vec<HashSet<String>>>,
+    /// What the function changed before the loop. While the loop is checked, `changed_vars`
+    /// holds only what the loop changes.
+    pub(crate) changed_before: HashSet<String>,
 }
 
 impl Default for BorrowCx {
@@ -73,11 +103,16 @@ impl Default for BorrowCx {
             moved_vars: vec![HashSet::new()],
             mutable_vars: vec![HashSet::new()],
             ref_provenance: HashMap::new(),
+            store_targets: HashMap::new(),
+            store_target_vars: HashMap::new(),
             current_params: HashMap::new(),
             loop_exits: Vec::new(),
             views: HashMap::new(),
+            view_owners_by_let: HashMap::new(),
+            shadowed: Vec::new(),
             borrowers_ever: HashMap::new(),
             drops: Default::default(),
+            running_tasks: HashSet::new(),
         }
     }
 }
@@ -85,9 +120,9 @@ impl Default for BorrowCx {
 impl BorrowCx {
     // --- NLL block liveness ---
 
-    /// Enter a block: install its precomputed last-use map and start at statement 0.
-    pub(crate) fn enter_block(&mut self, liveness: HashMap<Symbol, usize>) {
-        self.block_liveness.push(liveness);
+    /// Enter a block: install what it names and declares, and start at statement 0.
+    pub(crate) fn enter_block(&mut self, uses: BlockUses) {
+        self.block_liveness.push(uses);
         self.current_stmt_idx.push(0);
     }
 
@@ -112,23 +147,52 @@ impl BorrowCx {
     /// tile resident and is the conservative direction.
     pub(crate) fn is_variable_ever_read(&self, name: &str) -> bool {
         match self.block_liveness.last() {
-            Some(liveness) => liveness.contains_key(&Symbol::from(name)),
+            Some(block) => block.last_use.contains_key(&Symbol::from(name)),
             None => true,
         }
     }
 
-    /// Whether `name` is still read at a statement *after* the one currently being checked, in the
-    /// innermost block. The NLL predicate the dead-borrow sweep turns on.
-    fn is_variable_used_after(&self, name: &str) -> bool {
-        if let (Some(liveness), Some(&current_idx)) =
-            (self.block_liveness.last(), self.current_stmt_idx.last())
-        {
-            return liveness
-                .get(name)
-                .map(|&u| u > current_idx)
-                .unwrap_or(false);
+    /// Whether `name` is still used after the statement being checked. The NLL predicate the
+    /// dead-borrow sweep turns on.
+    ///
+    /// The blocks are searched from the innermost out. A block that names `name` in a later
+    /// statement answers yes. A block that declares `name` ends the search, since no block
+    /// around it can see that variable. A loop body that names a variable from outside it
+    /// answers yes too, because its next pass names it again.
+    pub(crate) fn is_variable_used_after(&self, name: &str) -> bool {
+        if self.is_running_task(name) {
+            return true;
+        }
+        let blocks = self.block_liveness.iter().zip(&self.current_stmt_idx);
+        for (block, &current_idx) in blocks.rev() {
+            let last_use = block.last_use.get(name);
+            if last_use.is_some_and(|&u| u > current_idx) {
+                return true;
+            }
+            if block.declared.contains(name) {
+                return false;
+            }
+            if block.is_loop && last_use.is_some() {
+                return true;
+            }
         }
         false
+    }
+
+    /// A task started, and holds its borrows until [`Self::end_task`].
+    pub(crate) fn start_task(&mut self, task: &str) {
+        self.running_tasks.insert(task.to_string());
+    }
+
+    /// The task is joined, so its borrows end.
+    pub(crate) fn end_task(&mut self, task: &str) {
+        self.running_tasks.remove(task);
+    }
+
+    /// Whether `name` is a running task, or the hold of a running task on what it copied.
+    pub(crate) fn is_running_task(&self, name: &str) -> bool {
+        let task = name.split_once('/').map_or(name, |(task, _)| task);
+        self.running_tasks.contains(task)
     }
 
     // --- borrow records ---
@@ -240,11 +304,52 @@ impl BorrowCx {
     // --- scope + save/restore bookkeeping ---
 
     /// Lexical-lifetime cleanup at scope exit: drop every record borrowed in a scope at or below
-    /// `depth` (the depth being popped).
-    pub(crate) fn retain_scope(&mut self, depth: usize) {
+    /// `depth` (the depth being popped), unless a variable still in scope holds it, such as
+    /// `outer` after `if c { outer = W { r : &x }; }`. `holder_depth` gives the depth of such a
+    /// variable's block, where the record then moves, to last as long as the variable does.
+    pub(crate) fn retain_scope(
+        &mut self,
+        depth: usize,
+        holder_depth: impl Fn(&str) -> Option<usize>,
+    ) {
         for borrows in self.active_borrows.values_mut() {
-            borrows.retain(|b| b.scope_depth < depth);
+            borrows.retain_mut(|b| {
+                if b.scope_depth < depth {
+                    return true;
+                }
+                match b.borrower_name.as_deref().and_then(&holder_depth) {
+                    Some(held_at) => {
+                        b.scope_depth = held_at;
+                        true
+                    }
+                    None => false,
+                }
+            });
         }
+    }
+
+    /// Set the records of `name` aside while a new variable of that name, declared at `depth`,
+    /// is in scope.
+    pub(crate) fn shadow(&mut self, name: &str, depth: usize) {
+        if let Some(records) = self.active_borrows.remove(name) {
+            self.shadowed.push((depth, name.into(), records));
+        }
+    }
+
+    /// The scope at `depth` ends: put back the records that its variables hid.
+    pub(crate) fn unshadow(&mut self, depth: usize) {
+        while self.shadowed.last().is_some_and(|(d, _, _)| *d >= depth) {
+            let (_, name, records) = self.shadowed.pop().expect("checked above");
+            self.active_borrows.entry(name).or_default().extend(records);
+        }
+    }
+
+    pub(crate) fn take_shadowed(&mut self) -> Vec<(usize, Symbol, Vec<BorrowRecord>)> {
+        std::mem::take(&mut self.shadowed)
+    }
+
+    pub(crate) fn restore_shadowed(&mut self, shadowed: Vec<(usize, Symbol, Vec<BorrowRecord>)>) {
+        self.shadowed = shadowed;
     }
 
     /// Clone the whole borrow table (a speculative/expression check restores it afterwards).
@@ -314,6 +419,20 @@ impl BorrowCx {
             }
         }
         shared
+    }
+
+    /// Add back each of `records`, as [`Self::added_since`] returned them, that is not there
+    /// now: the borrows one branch made, joined with the other branches'.
+    pub(crate) fn add_back(&mut self, records: Vec<(Symbol, BorrowRecord)>) {
+        for (base, record) in records {
+            let present = self
+                .active_borrows
+                .get(&base)
+                .is_some_and(|list| list.contains(&record));
+            if !present {
+                self.record(&base, record);
+            }
+        }
     }
 
     /// Drop each of `records`, as [`Self::added_since`] returned them.

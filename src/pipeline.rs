@@ -33,6 +33,13 @@ pub enum PipelineError {
     IO(String),
     Parse(String),
     Semantic(String),
+    /// Checking found `count` errors, which it has printed. `in_declarations` says the check of
+    /// the whole program's declarations found them, before any body was checked. The driver
+    /// ends a failed compile with the same line whether it ran in parallel or not.
+    Failed {
+        count: usize,
+        in_declarations: bool,
+    },
 }
 
 impl std::fmt::Display for PipelineError {
@@ -41,6 +48,9 @@ impl std::fmt::Display for PipelineError {
             PipelineError::IO(msg) => write!(f, "IO Error: {}", msg),
             PipelineError::Parse(msg) => write!(f, "Parse Error: {}", msg),
             PipelineError::Semantic(msg) => write!(f, "Semantic Error: {}", msg),
+            PipelineError::Failed { count, .. } => {
+                write!(f, "Semantic check failed: {count} error(s) emitted")
+            }
         }
     }
 }
@@ -93,7 +103,9 @@ struct Frontend {
     subspaces: Vec<crate::codegen::flat::SubspaceInfo>,
     /// Same travel pattern as `subspaces`: the declared-arch table for `vx.spawn` stamping
     /// (Vx#352), extracted from the env because the env cannot leave the frontend.
-    topo_archs: Vec<(i64, String)>,
+    topo_archs: Vec<(i64, crate::codegen::flat::DeclaredArch)>,
+    /// Same again: `arch::local_device_aliases`, for the `vx.local_devices` module attribute.
+    local_devices: Vec<(i32, i32)>,
     checks: Vec<FunctionCheck>,
     /// Warnings the checks found, held rather than printed. See [`report_warnings`].
     warnings: Vec<crate::diagnostic::Diagnostic>,
@@ -187,6 +199,15 @@ fn run_frontend_on(
     // Before any body: a body checked against an ambiguous declaration table has been checked
     // against a coin flip.
     let mut warnings = timed("decl_check", || declaration_check_phase(&session, &env))?;
+    // Found before the checks rename calls to generic instances, and reported after them only if
+    // they found no error, as in the driver.
+    let mut unused_functions = crate::diagnostic::DiagnosticsVec::new();
+    for m in modules.iter().filter(|m| match &reported {
+        Reported::EveryModule => true,
+        Reported::OnlyEntry(name) => m.module_path == *name,
+    }) {
+        crate::hir::check::unused_functions::warn_functions_nothing_calls(m, &mut unused_functions);
+    }
 
     let Checked {
         mut checks,
@@ -195,6 +216,7 @@ fn run_frontend_on(
         type_check_phase(&mut modules, &session, &env, sched, &reported)
     })?;
     warnings.extend(body_warnings);
+    warnings.extend(unused_functions.inner);
     let (merged_slow, merged_gen, merged_off, slow_mappings, gen_mappings) =
         timed("dedup_barrier", || deduplication_phase(&checks, &session));
 
@@ -209,6 +231,7 @@ fn run_frontend_on(
         warnings,
         subspaces: crate::codegen::flat::subspaces_from_env(&env),
         topo_archs: crate::codegen::flat::topo_archs_from_env(&env),
+        local_devices: crate::codegen::flat::local_devices_from_env(&env),
         checks,
         type_streams,
         merged_arenas: (merged_slow, merged_gen, merged_off),
@@ -352,6 +375,7 @@ pub fn compile_modules_mlir_in(
         session,
         subspaces,
         topo_archs,
+        local_devices,
         mut checks,
         warnings,
         type_streams,
@@ -363,6 +387,7 @@ pub fn compile_modules_mlir_in(
             &mut checks,
             &subspaces,
             &topo_archs,
+            &local_devices,
             &session,
             merged_arenas,
             sched,
@@ -491,20 +516,23 @@ fn macro_expansion_phase(
             global_macros.insert(mac.name.clone(), mac.rules.clone());
         }
     }
-    // Expansion is per-module and shares nothing. `MacroExpander` holds a single `&HashMap` and no
-    // mutable state, so its methods took `&mut self` without ever being able to use it; now that
-    // they take `&self`, one expander is shared across the parallel-for and the borrow checker
-    // proves the isolation rather than a comment asserting it.
+    // Expansion is per-module and shares nothing. Each module gets its own expander, because
+    // an expander counts the expansions it makes.
     // Collected here for the same reason the macro table is: both have to be complete before
     // any module is expanded, because a trait and an impl of it need not share a module.
     let trait_defaults = crate::resolver::collect_trait_defaults(parsed_modules.iter());
-    let expander = MacroExpander::new(&global_macros, &trait_defaults);
-    let expand = |m: &mut VxModule| expander.expand_module(m).map_err(PipelineError::Parse);
+    let expand = |m: &mut VxModule| {
+        MacroExpander::new(&global_macros, &trait_defaults)
+            .expand_module(m)
+            .map_err(PipelineError::Parse)
+    };
     if sched.is_seq() {
-        parsed_modules.iter_mut().try_for_each(expand)
+        parsed_modules.iter_mut().try_for_each(expand)?;
     } else {
-        parsed_modules.par_iter_mut().try_for_each(expand)
+        parsed_modules.par_iter_mut().try_for_each(expand)?;
     }
+    crate::resolver::fold_const_extents(parsed_modules);
+    Ok(())
 }
 
 /// Resolve names, and hand back the symbol map so the freeze point does not rebuild it.
@@ -873,6 +901,19 @@ pub fn build_frozen_registry_with(
         }
     }
 
+    // The generic struct instances that the layouts above hold by value (`SharedCell<i32>`), so
+    // a field naming one resolves like a field naming a plain struct.
+    for (id, name, l) in layout.instance_layouts() {
+        defs.push(TypeDefinition {
+            id,
+            name: name.to_string(),
+            size_bytes: l.size,
+            align_bytes: l.align,
+            fields: l.fields.clone(),
+            by_value_dependencies: Vec::new(),
+        });
+    }
+
     let mut registry = crate::registry::ImmutableGlobalRegistry::build_and_validate(defs)
         .map_err(PipelineError::Semantic)?;
 
@@ -1238,7 +1279,10 @@ fn check_one_function(
         .mono
         .functions
         .into_iter()
-        .filter(|(f, _)| !crate::hir::TypeChecker::is_comptime_lambda_body(f))
+        .filter(|(f, _)| {
+            !crate::hir::TypeChecker::is_comptime_lambda_body(f)
+                && !crate::hir::TypeChecker::is_comptime_fn(f)
+        })
         .collect();
     let gen_structs = checker.mono.generated_structs;
     let capacity_summaries = std::mem::take(&mut checker.traffic.capacity_summaries);
@@ -1275,9 +1319,10 @@ fn declaration_check_phase(
     let found: Vec<&crate::diagnostic::Diagnostic> = checker.errors.iter().collect();
     let errors = report_errors(&found);
     if errors > 0 {
-        return Err(PipelineError::Semantic(format!(
-            "Compilation failed with {errors} declaration errors"
-        )));
+        return Err(PipelineError::Failed {
+            count: errors,
+            in_declarations: true,
+        });
     }
     Ok(found
         .into_iter()
@@ -1546,10 +1591,10 @@ fn type_check_phase(
     );
 
     if total_errors > 0 {
-        return Err(PipelineError::Semantic(format!(
-            "Compilation failed with {} semantic errors",
-            total_errors
-        )));
+        return Err(PipelineError::Failed {
+            count: total_errors,
+            in_declarations: false,
+        });
     }
 
     #[cfg(debug_assertions)]
@@ -1883,11 +1928,13 @@ fn lower_bodies_phase<'a>(
 ///
 /// Epoch 2 lives and dies here: the session holding it and the workers that lowered against it are
 /// released before this returns.
+#[allow(clippy::too_many_arguments)]
 fn codegen_mlir_phase(
     parsed_modules: &[VxModule],
     check_results: &mut [FunctionCheck],
     subspaces: &[crate::codegen::flat::SubspaceInfo],
-    topo_archs: &[(i64, String)],
+    topo_archs: &[(i64, crate::codegen::flat::DeclaredArch)],
+    local_devices: &[(i32, i32)],
     global_session: &std::sync::Arc<GlobalSession>,
     merged_arenas: MergedArenas,
     sched: Schedule,
@@ -1965,7 +2012,9 @@ fn codegen_mlir_phase(
         &alias_tables,
         subspaces,
         topo_archs,
+        local_devices,
         sched,
+        false,
     )
     .ok()?;
     chatter!(
@@ -2972,7 +3021,13 @@ fn main() -> i32 { return 0; }
         // On the message, not just on the variant: any error would satisfy `expect_err`, including
         // one from a phase that never reached these checks.
         assert!(
-            matches!(&err, PipelineError::Semantic(m) if m.contains("declaration errors")),
+            matches!(
+                &err,
+                PipelineError::Failed {
+                    in_declarations: true,
+                    ..
+                }
+            ),
             "expected a declaration error, got {err:?}"
         );
 
@@ -2988,7 +3043,13 @@ fn main() -> i32 { return 0; }
         let err = compile_pipeline_mlir(&collision)
             .expect_err("two spaces sharing a dispatch id must be refused");
         assert!(
-            matches!(&err, PipelineError::Semantic(m) if m.contains("declaration errors")),
+            matches!(
+                &err,
+                PipelineError::Failed {
+                    in_declarations: true,
+                    ..
+                }
+            ),
             "expected a declaration error, got {err:?}"
         );
 
@@ -3197,6 +3258,33 @@ fn main() -> i32 { return 0; }
             "the sequential schedule produces a different type stream than the parallel one"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module `const` in a parameter's tensor type is the number it stands for here as well as
+    /// in `vxc`: this entry point expands macros itself, so it folds the `const`s itself.
+    #[test]
+    fn pipeline_folds_a_module_const_in_a_signature() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vx_const_extent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("extent.vx");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(
+                b"const N : i32 = 4;\n\
+                  fn first(t : &Tensor<f32, [N]>) -> f32 { return t[0]; }\n\
+                  fn main() -> i32 { return 0; }\n",
+            )
+            .unwrap();
+        let text = compile_pipeline_mlir(&[path.to_string_lossy().to_string()])
+            .expect("pipeline")
+            .expect("the program is inside the flat subset");
+        assert!(
+            text.contains("func.func @first(%arg0: memref<4xf32>"),
+            "`[N]` did not become `[4]`:\n{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

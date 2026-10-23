@@ -43,8 +43,18 @@ impl<'a> Parser<'a> {
     /// `span` is the statement's first token.
     fn parse_expr_or_assign_stmt(&mut self, expr: Expr, span: Span) -> ParseResult<'a, Statement> {
         if self.match_token(&TokenType::Equals) {
+            let start = self.peek().clone();
             let rhs = self.parse_expr()?;
             self.consume(&TokenType::Semicolon, "Expected ';'")?;
+            // `(a, b) = e` assigns each element, as in Rust. Parsed as a tuple literal, the
+            // left side was a new value that the assignment wrote into and threw away.
+            if Self::is_tuple_literal(&expr) {
+                let mut out = Vec::new();
+                self.lower_tuple_assign(expr, rhs, span, &start, &mut out)?;
+                let first = out.remove(0);
+                self.pending_stmts.extend(out);
+                return Ok(first);
+            }
             Ok(Statement::Assign(AssignStmt {
                 lhs: expr,
                 rhs,
@@ -66,6 +76,7 @@ impl<'a> Parser<'a> {
                 Expr::UnsafeBlock(UnsafeBlockExpr { .. })
                 | Expr::ComptimeBlock(ComptimeBlockExpr { .. })
                 | Expr::SpawnOn(SpawnOnExpr { .. })
+                | Expr::TaskBlock(TaskBlockExpr { .. })
                 | Expr::If(IfExpr { .. })
                 | Expr::Match(MatchExpr { .. }) => {
                     has_semicolon = self.match_token(&TokenType::Semicolon);
@@ -95,6 +106,7 @@ impl<'a> Parser<'a> {
             line: token_line,
             column: token_col,
             length: token_len,
+            expansion: self.expansion(),
         };
 
         match &token.kind {
@@ -109,12 +121,10 @@ impl<'a> Parser<'a> {
                         line: token_line,
                         column: token_col,
                         length: token_len,
+                        expansion: self.expansion(),
                     });
                 }
-                let name = match &self.advance().kind {
-                    TokenType::Identifier(s) => s.to_string(),
-                    _ => return Err(self.error("Expected identifier after let")),
-                };
+                let name = self.expect_identifier("Expected identifier after let")?;
                 let mut type_annotation = None;
                 if self.match_token(&TokenType::Colon) {
                     type_annotation = Some(self.parse_type()?);
@@ -133,6 +143,7 @@ impl<'a> Parser<'a> {
                         line: token_line,
                         column: token_col,
                         length: token_len,
+                        expansion: self.expansion(),
                     },
                 }))
             }
@@ -163,6 +174,7 @@ impl<'a> Parser<'a> {
                             line: keyword.line,
                             column: keyword.column,
                             length: keyword.length,
+                            expansion: self.expansion(),
                         },
                     }),
                     has_semi: true,
@@ -192,7 +204,7 @@ impl<'a> Parser<'a> {
                 Ok(Statement::Assert(AssertStmt {
                     expr: Box::new(expr),
                     msg,
-                    span: Span::default(),
+                    span: token_span,
                 }))
             }
             TokenType::Return => {
@@ -212,6 +224,7 @@ impl<'a> Parser<'a> {
                         line: token_line,
                         column: token_col,
                         length: token_len,
+                        expansion: self.expansion(),
                     },
                 }))
             }
@@ -230,7 +243,7 @@ impl<'a> Parser<'a> {
                 Ok(Statement::Loop(LoopStmt {
                     invariants,
                     body,
-                    span: Span::default(),
+                    span: token_span,
                 }))
             }
             TokenType::While => {
@@ -238,6 +251,7 @@ impl<'a> Parser<'a> {
                     line: token_line,
                     column: token_col,
                     length: token_len,
+                    expansion: self.expansion(),
                 };
                 self.advance();
                 let cond = self.parse_expr()?;
@@ -289,14 +303,13 @@ impl<'a> Parser<'a> {
                     line: token_line,
                     column: token_col,
                     length: token_len,
+                    expansion: self.expansion(),
                 };
                 self.advance();
-                let iter = match &self.advance().kind {
-                    TokenType::Identifier(s) => s.to_string(),
-                    _ => return Err(self.error("Expected identifier after 'for'")),
-                };
+                let iter = self.expect_identifier("Expected identifier after 'for'")?;
                 self.consume(&TokenType::In, "Expected 'in' after for iterator")?;
                 let iterable = self.parse_expr()?;
+                let across = self.parse_across_clause()?;
                 let mut invariants = Vec::new();
                 while self.match_token(&TokenType::Invariant) {
                     invariants.push(self.parse_expr()?);
@@ -314,6 +327,8 @@ impl<'a> Parser<'a> {
                     body: stmts,
                     span: for_span,
                     next_fn: None,
+                    unroll: None,
+                    across,
                 }))
             }
             TokenType::Identifier(s) => {
@@ -352,6 +367,17 @@ impl<'a> Parser<'a> {
                 let expr = self.parse_expr()?;
                 self.parse_expr_or_assign_stmt(expr, token_span)
             }
+            // An `if`, `match`, `unsafe`, `spawn` or `tasks` block that starts a statement ends at its
+            // closing brace, as in Rust. Read as one expression, `if c { .. }` followed by
+            // `*x = 1;` would be `(if c { .. }) * x = 1`.
+            TokenType::If
+            | TokenType::Match
+            | TokenType::Unsafe
+            | TokenType::Spawn
+            | TokenType::Tasks => {
+                let expr = self.parse_primary_expr()?;
+                self.parse_expr_or_assign_stmt(expr, token_span)
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 self.parse_expr_or_assign_stmt(expr, token_span)
@@ -364,6 +390,46 @@ impl<'a> Parser<'a> {
     ///
     /// The first `let` is returned and the rest wait in `pending_stmts` for
     /// `parse_statement_into`, since a statement parses to one statement.
+    /// `across <level>` or `across <level>(n)` after the range of a `for`.
+    fn parse_across_clause(&mut self) -> ParseResult<'a, Option<AcrossClause>> {
+        if !self.check(&TokenType::Across) {
+            return Ok(None);
+        }
+        let at = self.advance().clone();
+        let span = Span {
+            line: at.line,
+            column: at.column,
+            length: at.length,
+            expansion: self.expansion(),
+        };
+        let level = match &self.advance().kind {
+            TokenType::Identifier(s) => crate::symbol::Symbol::from(*s),
+            other => {
+                return Err(self.error(&format!(
+                    "Expected a level such as `blocks` or `lanes` after 'across', got {:?}",
+                    other
+                )))
+            }
+        };
+        let share = if self.match_token(&TokenType::LeftParen) {
+            let n = self.parse_expr()?;
+            self.consume(
+                &TokenType::RightParen,
+                "Expected ')' after the count of passes",
+            )?;
+            Some(Box::new(n))
+        } else {
+            None
+        };
+        Ok(Some(AcrossClause {
+            level,
+            share,
+            span,
+            kind: None,
+            subgroup_lanes: None,
+        }))
+    }
+
     fn parse_tuple_let(&mut self, span: Span) -> ParseResult<'a, Statement> {
         let start = self.peek().clone();
         let pattern = self.parse_tuple_pattern()?;
@@ -476,6 +542,74 @@ impl<'a> Parser<'a> {
                     });
                     self.lower_tuple_pattern(elem, None, element, span, start, out)?;
                 }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Parser<'a> {
+    fn is_tuple_literal(e: &Expr) -> bool {
+        matches!(e, Expr::StructInit(lit) if lit.name.as_ref().starts_with("Tuple"))
+    }
+
+    /// `(a, b) = rhs`: `rhs` is held in a `$tuple` local first, so `(a, b) = (b, a)` swaps,
+    /// then each place is assigned its element. `_` assigns nothing, and a nested tuple
+    /// recurses.
+    fn lower_tuple_assign(
+        &mut self,
+        lhs: Expr,
+        rhs: Expr,
+        span: Span,
+        start: &Token<'a>,
+        out: &mut Vec<Statement>,
+    ) -> ParseResult<'a, ()> {
+        let Expr::StructInit(lit) = lhs else {
+            out.push(Statement::Assign(AssignStmt { lhs, rhs, span }));
+            return Ok(());
+        };
+        if let Expr::StructInit(r) = &rhs {
+            if r.name.as_ref().starts_with("Tuple") && r.fields.len() != lit.fields.len() {
+                return Err(self.error_at(
+                    start,
+                    &format!(
+                        "the left side has {} elements, but the tuple has {}",
+                        lit.fields.len(),
+                        r.fields.len()
+                    ),
+                ));
+            }
+        }
+        let temp = format!("$tuple{}", self.tuple_lets);
+        self.tuple_lets += 1;
+        out.push(Statement::LetDecl(LetDeclStmt {
+            name: temp.clone().into(),
+            is_mut: false,
+            ty_ann: None,
+            expr: rhs,
+            span,
+        }));
+        for (i, (_, place)) in lit.fields.into_iter().enumerate() {
+            if matches!(&place, Expr::Identifier(id) if id.name.as_ref() == "_") {
+                continue;
+            }
+            let element = Expr::MemberAccess(MemberAccessExpr {
+                base: Box::new(Expr::Identifier(IdentifierExpr {
+                    name: temp.clone().into(),
+                    span,
+                })),
+                member: format!("_{i}").into(),
+                struct_name: None,
+                span,
+            });
+            if Self::is_tuple_literal(&place) {
+                self.lower_tuple_assign(place, element, span, start, out)?;
+            } else {
+                out.push(Statement::Assign(AssignStmt {
+                    lhs: place,
+                    rhs: element,
+                    span,
+                }));
             }
         }
         Ok(())

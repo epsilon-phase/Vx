@@ -252,10 +252,24 @@ macro_rules! instantiate_string_ffi {
             Box::into_raw(s) as *mut std::ffi::c_void
         }
 
+        /// A string of `len` NUL bytes, for the caller to overwrite through
+        /// `vx_string_as_mut_ptr` with the same number of ASCII bytes.
         #[no_mangle]
-        pub extern "C" fn vx_i32_to_string(val: i32) -> *mut std::ffi::c_void {
-            let s: Box<String> = Box::new(val.to_string());
+        pub extern "C" fn vx_string_with_len(len: i64) -> *mut std::ffi::c_void {
+            assert!(len >= 0, "vx_string_with_len: negative length {len}");
+            // NUL bytes are valid UTF-8, so the unchecked conversion holds.
+            let s: Box<String> =
+                Box::new(unsafe { String::from_utf8_unchecked(vec![0u8; len as usize]) });
             Box::into_raw(s) as *mut std::ffi::c_void
+        }
+
+        /// The string's bytes, writable. Writing anything but ASCII breaks the UTF-8
+        /// invariant, which is why no Vx caller outside `std::string` should see this.
+        #[no_mangle]
+        pub extern "C" fn vx_string_as_mut_ptr(ptr: *mut std::ffi::c_void) -> *mut u8 {
+            assert!(!ptr.is_null(), "vx_string_as_mut_ptr: null string");
+            let s = unsafe { &mut *(ptr as *mut String) };
+            unsafe { s.as_mut_vec().as_mut_ptr() }
         }
 
         #[no_mangle]
@@ -290,6 +304,19 @@ macro_rules! instantiate_string_ffi {
             }
             let s = unsafe { &*(ptr as *mut String) };
             s.len()
+        }
+
+        /// 1 when the two strings hold the same bytes, else 0. A null string is empty.
+        #[no_mangle]
+        pub extern "C" fn vx_string_eq(a: *mut std::ffi::c_void, b: *mut std::ffi::c_void) -> i32 {
+            let bytes = |p: *mut std::ffi::c_void| {
+                if p.is_null() {
+                    ""
+                } else {
+                    unsafe { (*(p as *mut String)).as_str() }
+                }
+            };
+            (bytes(a) == bytes(b)) as i32
         }
 
         #[no_mangle]

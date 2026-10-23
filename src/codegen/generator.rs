@@ -44,6 +44,9 @@ pub struct MeliorGenerator<'c> {
     pub(crate) declared_tensor_prints: std::collections::HashSet<&'static str>,
     /// Locals whose element pointer the function takes: a view through it can share their memory.
     pub(crate) pointer_taken: std::collections::HashSet<crate::symbol::Symbol>,
+    /// The locals of the function being lowered that are borrowed with `&x`. Each gets a stack
+    /// slot, so every borrow of it is the same address.
+    pub(crate) address_taken: std::collections::HashSet<crate::symbol::Symbol>,
     /// Declared memory spaces, keyed by space, so a `transfer` can emit the sub-space descriptor
     /// (granule/capacity/scope/parent) as IR metadata for later passes (see subspace_scheduling.md).
     pub(crate) memories: HashMap<syntax::MemorySpace, syntax::MemoryDecl>,
@@ -233,11 +236,21 @@ pub(crate) fn scalar_type_bits(ty_text: &str) -> Option<u32> {
         return Some(bits);
     }
     match ty_text {
+        "f4E2M1FN" => Some(4),
+        "f8E4M3FN" | "f8E5M2" => Some(8),
         "f16" | "bf16" => Some(16),
         "f32" => Some(32),
         "f64" => Some(64),
         _ => None,
     }
+}
+
+/// Whether an MLIR type spelling is a float type.
+pub(crate) fn is_float_text(ty_text: &str) -> bool {
+    matches!(
+        ty_text,
+        "f4E2M1FN" | "f8E4M3FN" | "f8E5M2" | "f16" | "bf16" | "f32" | "f64"
+    )
 }
 
 /// A drop waiting for the value of the statement it precedes.
@@ -357,11 +370,6 @@ impl<'c> MeliorGenerator<'c> {
         ty_str.starts_with("memref<")
             && !ty_str.contains('x')
             && !ty_str.starts_with("memref<memref<")
-    }
-
-    pub fn is_llvm_ptr(&self, ty: &Type<'c>) -> bool {
-        let ty_str = ty.to_string();
-        ty_str.starts_with("!llvm.ptr") || ty_str.starts_with("!llvm.array")
     }
 
     /// Adapt a closure-literal environment struct (`Closure_N`, the by-value capture record) to a
@@ -607,11 +615,36 @@ impl<'c> MeliorGenerator<'c> {
             return Ok(block.append_operation(cast_op).result(0)?.into());
         }
 
-        let is_float = |t: Type<'c>| {
-            t == self.f32_ty || t == self.f64_ty || t == self.f16_ty || t == self.bf16_ty
-        };
+        let is_float = |t: Type<'c>| is_float_text(&t.to_string());
 
-        if (from_ty == self.i32_ty || from_ty == self.i64_ty) && is_float(to_ty) {
+        // Any other pair of float types, which includes every pair with an fp8 or fp4 side. Two
+        // different types of one width (`f8e4m3` and `f8e5m2`) go through f32, which holds every
+        // value of both, so the value rounds only once.
+        if is_float(from_ty) && is_float(to_ty) && from_ty != to_ty {
+            let from_bits = scalar_type_bits(&from_ty.to_string()).unwrap_or(0);
+            let to_bits = scalar_type_bits(&to_ty.to_string()).unwrap_or(0);
+            let convert =
+                |op: &str, v: Value<'c, 'c>, ty: Type<'c>| -> Result<Value<'c, 'c>, LowerError> {
+                    let op = melior::ir::operation::OperationBuilder::new(op, self.loc())
+                        .add_operands(&[v])
+                        .add_results(&[ty])
+                        .build()?;
+                    Ok(block.append_operation(op).result(0)?.into())
+                };
+            return match from_bits.cmp(&to_bits) {
+                std::cmp::Ordering::Greater => convert("arith.truncf", val, to_ty),
+                std::cmp::Ordering::Less => convert("arith.extf", val, to_ty),
+                std::cmp::Ordering::Equal => {
+                    let wide = convert("arith.extf", val, self.f32_ty)?;
+                    convert("arith.truncf", wide, to_ty)
+                }
+            };
+        }
+
+        // A `bool` is `i1`, and `sitofp` would make `true` into -1.0.
+        let is_number_int = |t: Type<'c>| melior::ir::TypeLike::is_integer(&t) && t != self.i1_ty;
+
+        if is_number_int(from_ty) && is_float(to_ty) {
             let cast_op = melior::ir::operation::OperationBuilder::new("arith.sitofp", self.loc())
                 .add_operands(&[val])
                 .add_results(&[to_ty])
@@ -620,7 +653,7 @@ impl<'c> MeliorGenerator<'c> {
             return Ok(block.append_operation(cast_op).result(0)?.into());
         }
 
-        if is_float(from_ty) && (to_ty == self.i32_ty || to_ty == self.i64_ty) {
+        if is_float(from_ty) && is_number_int(to_ty) {
             let cast_op = melior::ir::operation::OperationBuilder::new("arith.fptosi", self.loc())
                 .add_operands(&[val])
                 .add_results(&[to_ty])
@@ -799,6 +832,7 @@ impl<'c> MeliorGenerator<'c> {
             owned_tensors: std::collections::HashSet::new(),
             declared_tensor_prints: std::collections::HashSet::new(),
             pointer_taken: std::collections::HashSet::new(),
+            address_taken: std::collections::HashSet::new(),
             memories: HashMap::new(),
             transfer_impls: HashMap::new(),
             topologies: HashMap::new(),
@@ -832,6 +866,7 @@ impl<'c> MeliorGenerator<'c> {
                 line: 1,
                 column: 1,
                 length: 1,
+                expansion: 0,
             },
             index_ty,
             i32_ty,
@@ -885,6 +920,17 @@ impl<'c> MeliorGenerator<'c> {
             .set_attribute("vx.drops", melior::ir::Attribute::unit(self.context));
 
         self.generate_module(program, modules)?;
+
+        // After `generate_module`, which is what fills `self.topologies`.
+        let local_devices = crate::arch::local_device_aliases(self.topologies.iter());
+        let attr = crate::codegen::flat::local_devices_attr(&local_devices);
+        if let Some(value) = attr.strip_prefix(", vx.local_devices = ") {
+            let value = melior::ir::Attribute::parse(self.context, value)
+                .expect("vx.local_devices is a valid array attribute");
+            self.module
+                .as_operation_mut()
+                .set_attribute("vx.local_devices", value);
+        }
 
         let op = self.module.as_operation();
         let s = format!("{}", op);
@@ -1208,6 +1254,7 @@ impl<'c> MeliorGenerator<'c> {
         self.allocs.clear();
         self.subspace_offsets.clear(); // per-function sub-space bump allocator (SS2)
         self.pointer_taken = syntax::locals_with_pointer_taken(&func.body);
+        self.address_taken = syntax::locals_with_address_taken(&func.body);
         let is_main = func.name.as_ref() == "main";
         let true_ret_ty = self.lower_type(&func.return_type)?;
         let ret_ty = if is_main { self.i32_ty } else { true_ret_ty };
@@ -1254,8 +1301,6 @@ impl<'c> MeliorGenerator<'c> {
             crate::codegen::lower::LowerError::from("No first operation".to_string())
         })?;
         let func_loc = dummy_op.location();
-
-        let _region = Region::new();
 
         let mut block_args = Vec::new();
         for ty in &arg_tys {
@@ -1388,7 +1433,7 @@ impl<'c> MeliorGenerator<'c> {
         // every program that reached this path.
         //
         // Nothing wanted the wrapper. The ciface convention is how the dispatcher finds an
-        // *outlined kernel* -- `runtime/vx_host_call.h` builds `_mlir_ciface_<kernel>` and the
+        // *outlined kernel* -- `runtime/vx_host_call.h` builds `_vx_ciface_<kernel>` and the
         // attribute is set for that in `KernelOpLowering` -- and `main` is entered through its
         // ordinary symbol.
         let _ = is_main;
@@ -1400,6 +1445,14 @@ impl<'c> MeliorGenerator<'c> {
             func_attributes.push((
                 melior::ir::Identifier::new(self.context, "passthrough"),
                 attr,
+            ));
+        }
+
+        // A `pub fn` stays exported: `vx-hide-program-symbols` skips a function with `vx.pub`.
+        if func.is_pub {
+            func_attributes.push((
+                melior::ir::Identifier::new(self.context, "vx.pub"),
+                melior::ir::Attribute::unit(self.context),
             ));
         }
 
@@ -1630,8 +1683,9 @@ impl<'c> MeliorGenerator<'c> {
                     return Ok(out);
                 }
                 // The block the statement hands back is never reached, and nothing will be
-                // lowered into it, but it still needs a terminator.
-                if let Some(b) = out.filter(|b| b.first_operation().is_none()) {
+                // lowered into it, but it still needs a terminator. It may hold the placeholder
+                // value of an `unsafe` block.
+                if let Some(b) = out.filter(|b| b.terminator().is_none()) {
                     b.append_operation(
                         melior::ir::operation::OperationBuilder::new(
                             "llvm.unreachable",
@@ -1754,6 +1808,9 @@ impl<'c> MeliorGenerator<'c> {
             Expr::Match(e) => LowerToMelior::lower(e, self, block),
             Expr::Number(e) => LowerToMelior::lower(e, self, block),
             Expr::UnsafeBlock(e) => LowerToMelior::lower(e, self, block),
+            Expr::TaskBlock(_) => {
+                unreachable!("the checker makes each `tasks` and `spawn` a block")
+            }
             Expr::Grad(e) => LowerToMelior::lower(e, self, block),
             Expr::Vjp(e) => LowerToMelior::lower(e, self, block),
             Expr::Jvp(e) => LowerToMelior::lower(e, self, block),
@@ -1801,7 +1858,7 @@ impl<'c> MeliorGenerator<'c> {
     /// caller falls back to a conservative default. This replaces `SizeOfExpr::lower`'s old hardcoded
     /// `8` for aggregates, which under-sized a `Vec<struct>`'s element buffer (a `Vec<Vec<T>>` UB). (#242)
     pub(crate) fn type_size_align(&self, ty: &syntax::Type, depth: u32) -> Option<(usize, usize)> {
-        use crate::layout::{align_up, scalar_size_align};
+        use crate::layout::scalar_size_align;
         if depth > 32 {
             return None; // guard against a pathological/cyclic nesting
         }
@@ -1813,21 +1870,57 @@ impl<'c> MeliorGenerator<'c> {
             syntax::Type::Pinned(inner, _) | syntax::Type::Verified(inner) => {
                 self.type_size_align(inner, depth)
             }
-            syntax::Type::GenericInstance(base, _) => self.type_size_align(base, depth),
-            syntax::Type::Struct(name, _) => {
-                let base = name.as_ref().split('<').next().unwrap_or(name.as_ref());
-                let decl = self.structs.get(base)?;
-                let mut offset = 0usize;
-                let mut align = 1usize;
-                for (_, fty) in &decl.fields {
-                    let (fsize, falign) = self.type_size_align(fty, depth + 1)?;
-                    offset = align_up(offset, falign) + fsize;
-                    align = align.max(falign);
+            // `Holder<i64>`: the fields with `T` replaced by `i64`.
+            syntax::Type::GenericInstance(base, args) => {
+                let syntax::Type::Struct(name, _) = &**base else {
+                    return self.type_size_align(base, depth);
+                };
+                let decl = self.structs.get(name)?;
+                let mapping = decl
+                    .generics
+                    .iter()
+                    .zip(args)
+                    .map(|(param, arg)| (param.name().into(), arg.clone()))
+                    .collect();
+                let fields: Vec<_> = decl
+                    .fields
+                    .iter()
+                    .map(|(_, t)| t.substitute(&mapping))
+                    .collect();
+                self.fields_size_align(&fields, depth)
+            }
+            // A generic instance stored by its name, such as `Holder<i64>`.
+            syntax::Type::Struct(name, _) if name.contains('<') => {
+                let mut lexer = crate::lexer::Lexer::new(name);
+                let tokens = lexer.tokenize();
+                let parsed = crate::parser::Parser::new(&tokens, name)
+                    .parse_type()
+                    .ok()?;
+                match parsed {
+                    syntax::Type::GenericInstance(..) => self.type_size_align(&parsed, depth),
+                    _ => None,
                 }
-                Some((align_up(offset, align), align))
+            }
+            syntax::Type::Struct(name, _) => {
+                let decl = self.structs.get(name)?;
+                let fields: Vec<_> = decl.fields.iter().map(|(_, t)| t.clone()).collect();
+                self.fields_size_align(&fields, depth)
             }
             _ => None,
         }
+    }
+
+    /// Byte size and alignment of a struct with these field types, in order.
+    fn fields_size_align(&self, fields: &[syntax::Type], depth: u32) -> Option<(usize, usize)> {
+        use crate::layout::align_up;
+        let mut offset = 0usize;
+        let mut align = 1usize;
+        for fty in fields {
+            let (fsize, falign) = self.type_size_align(fty, depth + 1)?;
+            offset = align_up(offset, falign) + fsize;
+            align = align.max(falign);
+        }
+        Some((align_up(offset, align), align))
     }
 
     ///
@@ -1859,6 +1952,9 @@ impl<'c> MeliorGenerator<'c> {
         for position in 0..arity {
             let mut payload_ty_str = "none".to_string();
             let mut widest = 0u32;
+            // Numbers of different kinds, such as `i32` and `f32`, share an integer slot. A float
+            // goes in as its bits; an integer in a float slot could read back as a denormal.
+            let mut scalars: Vec<String> = Vec::new();
             for (_v_name, payload) in enum_def {
                 let Some(types) = payload else { continue };
                 let Some(ty) = types.get(position) else {
@@ -1883,6 +1979,9 @@ impl<'c> MeliorGenerator<'c> {
                          generator"
                     )));
                 }
+                if scalar_type_bits(&lowered).is_some() && !scalars.contains(&lowered) {
+                    scalars.push(lowered.clone());
+                }
                 match scalar_type_bits(&lowered) {
                     Some(b) if b > widest => {
                         widest = b;
@@ -1891,6 +1990,9 @@ impl<'c> MeliorGenerator<'c> {
                     None if payload_ty_str == "none" => payload_ty_str = lowered,
                     _ => {}
                 }
+            }
+            if scalars.len() > 1 && scalars.iter().any(|t| is_float_text(t)) {
+                payload_ty_str = format!("i{widest}");
             }
             slots.push(payload_ty_str);
         }
@@ -1915,7 +2017,6 @@ impl<'c> MeliorGenerator<'c> {
         })
     }
 
-    /// An instantiated generic enum (its name holds `<...>`): a tag and the payload slot.
     /// The `vx.placed` mark of a placed parameter or result. A placement written as a device
     /// holds that device's memory; on-chip memory, by the address space its type is given, is
     /// scratch nothing frees.
@@ -2042,7 +2143,12 @@ impl<'c> MeliorGenerator<'c> {
                         Some(m) => crate::arch::declared_address_space(m, self.memories.get(m))
                             .ok_or_else(|| LowerError::from(unmappable_space_message(m)))?,
                     };
-                    format!("!llvm.ptr<{}>", addr_space.nvptx_addrspace())
+                    // Placement is erased into the C ABI, so no `arch:` is in hand here: `None`
+                    // means nothing was declared, not a target this compiler does not know.
+                    format!(
+                        "!llvm.ptr<{}>",
+                        crate::arch::address_space_for_arch(None, addr_space)
+                    )
                 }
             }
             syntax::Type::Struct(name, _) => {
@@ -2279,11 +2385,25 @@ impl<'c> MeliorGenerator<'c> {
         };
 
         let memref_str = if addr_space != crate::arch::AddressSpace::Host {
+            // The target is the placement's topology: its declared `arch:` when it has one.
+            // Only a declared topology can have one, so a built-in placement names no target
+            // and keeps today's numbering.
+            let arch: Option<&str> = match top.as_ref() {
+                Some(p) => match &p.topology {
+                    syntax::Topology::Custom(name) => self
+                        .topologies
+                        .get(name)
+                        .and_then(|d| d.arch.as_ref())
+                        .map(|a| a.as_ref()),
+                    _ => None,
+                },
+                None => None,
+            };
             format!(
                 "memref<{}{}, {}>",
                 shape_str,
                 ty_str,
-                addr_space.nvptx_addrspace()
+                crate::arch::address_space_for_arch(arch, addr_space)
             )
         } else {
             format!("memref<{}{}>", shape_str, ty_str)
@@ -2307,6 +2427,8 @@ impl<'c> MeliorGenerator<'c> {
             // to a type the checker already computed -- and a redundant annotation then decides
             // which code is generated. The flat path's inference already sees through it.
             Expr::UnsafeBlock(u) => self.infer_ast_type(u.ret.as_deref()?),
+            // A number has the type the checker gave it.
+            Expr::Number(n) => n.ty.clone().map(syntax::Type::Scalar),
             // `let p = &mut x` binds a reference. Recording that is what tells a later read of
             // `p` to hand the reference back rather than load through it; an unannotated binding
             // recorded nothing, so the read could not tell `p` from a scalar local of its own.
@@ -2316,6 +2438,17 @@ impl<'c> MeliorGenerator<'c> {
                 is_mut: b.is_mut,
                 region_id: syntax::REGION_UNSET as usize,
             }),
+            // A generic struct's literal does not spell its type arguments, so only a plain
+            // struct is known from the literal alone.
+            Expr::StructInit(s) => self
+                .structs
+                .get(&s.name)
+                .filter(|decl| decl.generics.is_empty())
+                .map(|_| syntax::Type::Struct(s.name.clone(), s.type_id)),
+            // The parser reads `true` and `false` as names, and the lowering makes each an `i1`.
+            Expr::Identifier(id) if matches!(id.name.as_ref(), "true" | "false") => {
+                Some(syntax::Type::Scalar(syntax::ElementType::Bool))
+            }
             Expr::Identifier(id) => self.ast_env.get(&id.name).cloned().or_else(|| {
                 // A bare function name used as a *value* (`let f = probe`) is a function pointer;
                 // recover its signature from the function registry so a later indirect call `f(..)`

@@ -476,11 +476,44 @@ pub struct UnsafeBlockExpr {
     pub stmts: Vec<Statement>,
     pub ret: Option<Box<Expr>>,
     pub span: Span,
+    /// The compiler made this block (for `vec![..]`), so W1010 never warns about it or counts it
+    /// as a block around another one.
+    pub generated: bool,
+    /// The checker made this block from a `tasks` block or a task body. Each pass treats it as a
+    /// plain block, which T7 allows. The flat code generator runs a task on a thread of its own.
+    pub task: Option<TaskBlockKind>,
 }
 impl UnsafeBlockExpr {
     pub fn new(stmts: Vec<Statement>, ret: Option<Box<Expr>>, span: Span) -> Self {
-        Self { stmts, ret, span }
+        Self {
+            stmts,
+            ret,
+            span,
+            generated: false,
+            task: None,
+        }
     }
+}
+
+/// Which block a [`TaskBlockExpr`] is.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TaskBlockKind {
+    /// `tasks { .. }`: when the block ends, every task that it started is finished.
+    Tasks,
+    /// `spawn { .. }` in a `tasks` block: a task. Its value is a `Task<T>`.
+    Spawn,
+}
+
+/// `tasks { .. }`, or `spawn { .. }` without `on`. The design is in
+/// docs/discussions/cpu_tasks_send_sync_and_shared_atomics.md. The checker makes both blocks an
+/// [`UnsafeBlockExpr`] with a `task` mark once it has checked them. The code generators never see
+/// one.
+#[derive(Debug, PartialEq, Clone)]
+pub struct TaskBlockExpr {
+    pub kind: TaskBlockKind,
+    pub stmts: Vec<Statement>,
+    pub ret: Option<Box<Expr>>,
+    pub span: Span,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -644,6 +677,12 @@ pub fn statement_always_exits(stmt: &Statement, never: &dyn Fn(&str) -> bool) ->
                 !arms.is_empty() && arms.iter().all(|a| block_always_exits(&a.body, never))
             }
             Expr::FunctionCall(c) => is_abort_or_panic(c) || never(c.name.as_ref()),
+            Expr::UnsafeBlock(UnsafeBlockExpr { stmts, .. }) => block_always_exits(stmts, never),
+            Expr::TaskBlock(TaskBlockExpr {
+                kind: TaskBlockKind::Tasks,
+                stmts,
+                ..
+            }) => block_always_exits(stmts, never),
             _ => false,
         },
         _ => false,
@@ -676,6 +715,11 @@ pub fn yields_no_value(expr: &Expr) -> bool {
             else_block: None,
             ..
         }) | Expr::UnsafeBlock(UnsafeBlockExpr { ret: None, .. })
+            | Expr::TaskBlock(TaskBlockExpr {
+                kind: TaskBlockKind::Tasks,
+                ret: None,
+                ..
+            })
     )
 }
 
@@ -691,13 +735,15 @@ pub fn yields_no_value(expr: &Expr) -> bool {
 /// Only the case where *every* path returns counts. A construct where one arm returns and another
 /// yields a value is still a value.
 pub fn diverges_on_every_path(expr: &Expr) -> bool {
-    // A branch may also end in a `match` whose every arm exits; that `match` is a statement too.
+    // A branch may also end in a `match` or an `unsafe` block that exits on every path; that is a
+    // statement too.
     fn block_returns(stmts: &[Statement]) -> bool {
         match stmts.last() {
             Some(Statement::Return(_)) => true,
             Some(last @ Statement::ExprStmt(ExprStmtStmt { expr, .. })) => {
                 diverges_on_every_path(expr)
-                    || (matches!(expr, Expr::Match(_)) && statement_always_exits(last, &|_| false))
+                    || (matches!(expr, Expr::Match(_) | Expr::UnsafeBlock(_))
+                        && statement_always_exits(last, &|_| false))
             }
             _ => false,
         }
@@ -709,6 +755,10 @@ pub fn diverges_on_every_path(expr: &Expr) -> bool {
             else_block: Some(else_block),
             ..
         }) => block_returns(then_block) && block_returns(else_block),
+        // `unsafe { ..; return x; }` as a function's last statement.
+        Expr::UnsafeBlock(UnsafeBlockExpr {
+            stmts, ret: None, ..
+        }) => block_returns(stmts),
         // Deliberately not `match`. A `match` whose arms all return already compiled correctly --
         // the rewrite to `return <match>` is harmless there, because the arm blocks carry their own
         // terminators and the chain never falls through to the merge block. Treating it as
@@ -758,7 +808,7 @@ impl RangeExpr {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Pattern {
     Wildcard,
-    Literal(Expr), // e.g. Number, StringLiteral
+    Literal(Box<Expr>), // e.g. Number, StringLiteral
     Identifier(Symbol),
     EnumVariant(Symbol, Symbol, Option<Vec<Pattern>>), // enum_name, variant_name, payload patterns
 }
@@ -767,6 +817,8 @@ pub enum Pattern {
 pub struct MatchArm {
     pub pattern: Pattern,
     pub body: Vec<Statement>,
+    /// The arm's first token. `Span::default()` for an arm the compiler wrote itself.
+    pub span: Span,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -910,6 +962,7 @@ pub enum Expr {
     Vjp(VjpExpr),
     Jvp(JvpExpr),
     SpawnOn(SpawnOnExpr),
+    TaskBlock(TaskBlockExpr),
     VecMacro(VecMacroExpr),
     Closure(ClosureExpr),
     MacroCall(MacroCallExpr),
@@ -953,6 +1006,7 @@ macro_rules! delegate_expr {
             Expr::Vjp(e) => e.$method.clone(),
             Expr::Jvp(e) => e.$method.clone(),
             Expr::SpawnOn(e) => e.$method.clone(),
+            Expr::TaskBlock(e) => e.$method.clone(),
             Expr::VecMacro(e) => e.$method.clone(),
             Expr::Closure(e) => e.$method.clone(),
             Expr::MacroCall(e) => e.$method.clone(),
@@ -996,13 +1050,28 @@ fn substitute_words(text: &str, mapping: &std::collections::HashMap<Symbol, Type
     result
 }
 
+/// An `mlir!` block's `returns` type is parsed without the enclosing function's type
+/// parameters in scope, so `returns : T` reads as a type named `T`. A name the substitution
+/// binds is that parameter, so it is substituted like one.
+fn substitute_mlir_returns(ty: &Type, mapping: &std::collections::HashMap<Symbol, Type>) -> Type {
+    match ty {
+        Type::Struct(name, None) if mapping.contains_key(name) => mapping[name].clone(),
+        Type::Pointer(inner, mem, is_mut) => Type::Pointer(
+            Box::new(substitute_mlir_returns(inner, mapping)),
+            mem.clone(),
+            *is_mut,
+        ),
+        _ => ty.substitute(mapping),
+    }
+}
+
 /// Is this a tensor construction -- storage the compiler allocated?
 ///
 /// A view built with `tensor_view_2d` has the same type and a shape the checker enforces, but
 /// names memory the compiler does not control: two views over one pointer are two names for one
 /// buffer, which no rule about names can see.
 pub fn is_tensor_construction(e: &Expr) -> bool {
-    match e {
+    match bare_unsafe_value(e) {
         Expr::FunctionCall(fc) => {
             let n = fc.name.as_ref();
             if matches!(n, "Tensor::new" | "Tensor::uninit" | "Tensor::fill") {
@@ -1012,6 +1081,19 @@ pub fn is_tensor_construction(e: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// `unsafe { e }` with nothing else in it, as `e`, so code that recognises a shape sees
+/// `unsafe { Tensor<..>::uninit() }` as the allocation it is. Peels any number of them.
+pub fn bare_unsafe_value(e: &Expr) -> &Expr {
+    let mut e = e;
+    while let Expr::UnsafeBlock(u) = e {
+        match (u.stmts.is_empty(), u.ret.as_deref()) {
+            (true, Some(r)) => e = r,
+            _ => break,
+        }
+    }
+    e
 }
 
 /// The local an `@` operand reads, when the operand is a bare name or a borrow of one.
@@ -1040,6 +1122,19 @@ pub fn locals_with_pointer_taken(stmts: &[Statement]) -> std::collections::HashS
                 if let Some(root) = matmul_operand_root(&m.base) {
                     names.insert(root.clone());
                 }
+            }
+        }
+    });
+    names
+}
+
+/// The locals in `stmts` whose address is taken with `&x` or `&mut x`.
+pub fn locals_with_address_taken(stmts: &[Statement]) -> std::collections::HashSet<Symbol> {
+    let mut names = std::collections::HashSet::new();
+    visit_exprs(stmts, &mut |e| {
+        if let Expr::Borrow(b) = e {
+            if let Expr::Identifier(id) = &*b.expr {
+                names.insert(id.name.clone());
             }
         }
     });
@@ -1147,6 +1242,12 @@ pub fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             }
         }
         Expr::SpawnOn(b) => {
+            visit_exprs(&b.stmts, f);
+            if let Some(r) = &b.ret {
+                visit_expr(r, f);
+            }
+        }
+        Expr::TaskBlock(b) => {
             visit_exprs(&b.stmts, f);
             if let Some(r) = &b.ret {
                 visit_expr(r, f);
@@ -1332,6 +1433,8 @@ impl Expr {
                 stmts: e.stmts.iter().map(|s| s.substitute(mapping)).collect(),
                 ret: e.ret.as_ref().map(|r| Box::new(r.substitute(mapping))),
                 span: e.span,
+                generated: e.generated,
+                task: e.task,
             }),
             Expr::StructInit(e) => {
                 let mut new_name = e.name.clone();
@@ -1378,6 +1481,7 @@ impl Expr {
                     .map(|arm| MatchArm {
                         pattern: arm.pattern.clone(), // Patterns don't currently have types to substitute
                         body: arm.body.iter().map(|s| s.substitute(mapping)).collect(),
+                        span: arm.span,
                     })
                     .collect(),
                 span: e.span,
@@ -1403,6 +1507,12 @@ impl Expr {
                 // The device index is substituted too: `spawn on(NPU[R])` in a generic body must
                 // become `NPU[5]` at `f<5>`, or dispatch silently falls back to device 0 (#284).
                 top: e.top.substitute(mapping),
+                stmts: e.stmts.iter().map(|s| s.substitute(mapping)).collect(),
+                ret: e.ret.as_ref().map(|r| Box::new(r.substitute(mapping))),
+                span: e.span,
+            }),
+            Expr::TaskBlock(e) => Expr::TaskBlock(TaskBlockExpr {
+                kind: e.kind,
                 stmts: e.stmts.iter().map(|s| s.substitute(mapping)).collect(),
                 ret: e.ret.as_ref().map(|r| Box::new(r.substitute(mapping))),
                 span: e.span,
@@ -1497,7 +1607,10 @@ impl Expr {
                     })
                     .collect(),
                 clobbers: e.clobbers.iter().map(|ex| ex.substitute(mapping)).collect(),
-                returns: e.returns.as_ref().map(|t| t.substitute(mapping)),
+                returns: e
+                    .returns
+                    .as_ref()
+                    .map(|t| substitute_mlir_returns(t, mapping)),
                 dialects: e.dialects.clone(),
                 block_str: substitute_words(&e.block_str, mapping),
                 span: e.span,

@@ -121,7 +121,7 @@ pub struct ImmutableGlobalRegistry {
     /// order* — so the flat lowerer resolves a variant to its discriminant ordinal (`Color::Green` ->
     /// `1`) without walking the AST. Only enums whose every variant is payload-free are listed; a
     /// data-carrying (tagged-union) enum is omitted, so constructing/matching one declines to the AST
-    /// path (#227). Populated by `build_frozen_registry`; empty when deserialized from a `.vxlib`.
+    /// path (#227). Populated by `build_frozen_registry` and when deserialized from a `.vxlib`.
     pub enum_variants: FxHashMap<crate::symbol::Symbol, Vec<crate::symbol::Symbol>>,
     /// Base struct declarations keyed by name, carrying each field's *declared* (possibly generic)
     /// AST type — the field `Type`s the frozen `layouts` erase (a pointer field becomes `Opaque`).
@@ -494,6 +494,14 @@ impl ImmutableGlobalRegistry {
         })
     }
 
+    /// An enum whose variants carry no data: its layout has no fields, and its value is an
+    /// `i32` tag.
+    pub fn is_payload_free_enum(&self, gid: TypeId) -> bool {
+        self.layouts.get(&gid).is_some_and(|d| {
+            d.align_bytes != 0 && d.fields.is_empty() && !self.structs.contains_key(&gid)
+        })
+    }
+
     /// The `const` table named `name`, with its position in `const_tables`.
     pub fn const_table(&self, name: &str) -> Option<(usize, &ConstTable)> {
         let at = self
@@ -668,6 +676,50 @@ impl ImmutableGlobalRegistry {
         };
         let gid = attached.or_else(|| self.resolve_unique_nominal(name))?;
         self.structs.get(&gid)
+    }
+
+    /// Whether a value of type `ty` holds a `SharedCell`, in a field or enum payload at any
+    /// depth. A shared reference to such a value can write through the cell, so it is not
+    /// read-only. A pointer or reference field points to another value, so it does not count.
+    /// When the registry does not know a type's fields, the answer is `true`.
+    pub fn holds_shared_cell(&self, ty: &crate::syntax::Type) -> bool {
+        self.holds_shared_cell_at(ty, 0)
+    }
+
+    fn holds_shared_cell_at(&self, ty: &crate::syntax::Type, depth: usize) -> bool {
+        use crate::syntax::Type;
+        // A value cannot hold itself, so only a bug in the layout check could get this deep.
+        assert!(depth < 64, "holds_shared_cell: {ty:?} nests too deep");
+        let (base, args): (&Type, &[Type]) = match ty {
+            Type::GenericInstance(base, args) => (base, args),
+            Type::Verified(inner) | Type::Pinned(inner, _) => {
+                return self.holds_shared_cell_at(inner, depth + 1)
+            }
+            _ => (ty, &[]),
+        };
+        let subst = |fty: &Type, generics: &[crate::symbol::Symbol]| {
+            let mapping: std::collections::HashMap<_, _> =
+                generics.iter().cloned().zip(args.iter().cloned()).collect();
+            fty.substitute(&mapping)
+        };
+        match base {
+            Type::Struct(name, _) if name.as_ref() == "SharedCell" => true,
+            // A struct or enum whose fields the registry does not have may hold a cell. Losing
+            // `llvm.readonly` costs speed, and a wrong one would make the optimizer drop a write.
+            Type::Struct(..) => self.struct_fields_of(base).is_none_or(|s| {
+                s.fields
+                    .iter()
+                    .any(|(_, f)| self.holds_shared_cell_at(&subst(f, &s.generics), depth + 1))
+            }),
+            Type::Enum(name, _) if self.enum_variants.contains_key(name) => false,
+            Type::Enum(name, _) => self.enum_data.get(name).is_none_or(|e| {
+                e.variants
+                    .iter()
+                    .flat_map(|(_, p)| p)
+                    .any(|f| self.holds_shared_cell_at(&subst(f, &e.generics), depth + 1))
+            }),
+            _ => false,
+        }
     }
 }
 
@@ -992,6 +1044,58 @@ mod tests {
                 .insert(crate::symbol::Symbol::from(*name), sig(module, *w1));
         }
         reg
+    }
+
+    #[test]
+    fn a_shared_cell_is_found_in_a_field_at_any_depth() {
+        use crate::symbol::Symbol;
+        use crate::syntax::types::ElementType;
+        use crate::syntax::Type;
+        let i32_ty = Type::Scalar(ElementType::I32);
+        let named =
+            |name: &str, w1: u64| Type::Struct(Symbol::from(name), Some(TypeId::new(1, w1, 0, 0)));
+        let cell = named("SharedCell", 1);
+        let holder = named("Holder", 2);
+        let counter = named("Counter", 3);
+        let plain = named("Plain", 4);
+        let mut reg = ImmutableGlobalRegistry::build_and_validate(vec![]).unwrap();
+        let mut add = |w1: u64, generics: &[&str], fields: Vec<Type>| {
+            reg.structs.insert(
+                TypeId::new(1, w1, 0, 0),
+                StructFields {
+                    generics: generics.iter().map(|g| Symbol::from(*g)).collect(),
+                    fields: fields.into_iter().map(|f| (Symbol::from("f"), f)).collect(),
+                },
+            );
+        };
+        let t = Type::Generic(Symbol::from("T"), None);
+        add(1, &["T"], vec![t.clone()]);
+        add(2, &["T"], vec![t]);
+        add(
+            3,
+            &[],
+            vec![Type::GenericInstance(
+                Box::new(cell.clone()),
+                vec![i32_ty.clone()],
+            )],
+        );
+        add(4, &[], vec![i32_ty.clone()]);
+        let instance =
+            |base: &Type, arg: Type| Type::GenericInstance(Box::new(base.clone()), vec![arg]);
+        let cell_of_i32 = instance(&cell, i32_ty.clone());
+
+        assert!(reg.holds_shared_cell(&cell_of_i32));
+        assert!(reg.holds_shared_cell(&counter), "a field holds the cell");
+        assert!(
+            reg.holds_shared_cell(&instance(&holder, cell_of_i32.clone())),
+            "a generic field holds the cell after substitution"
+        );
+        assert!(!reg.holds_shared_cell(&plain));
+        assert!(!reg.holds_shared_cell(&instance(&holder, i32_ty.clone())));
+        // A pointer to a cell points to another value, so the reference itself stays read-only.
+        assert!(!reg.holds_shared_cell(&Type::Pointer(Box::new(cell_of_i32), None, true)));
+        // The registry does not know the fields of `Missing`, so it may hold a cell.
+        assert!(reg.holds_shared_cell(&named("Missing", 9)));
     }
 
     /// The #291 acceptance property: merging the same set of artifacts must produce the same

@@ -194,11 +194,14 @@ impl<'a> TypeChecker<'a> {
             }
         }
         let Some(view) = self.view_of(expr, ty) else {
+            self.borrow.view_owners_by_let.remove(span);
             return;
         };
+        let owners = view.owners.iter().map(|(owner, _)| owner.clone()).collect();
+        self.borrow.view_owners_by_let.insert(*span, owners);
         if let Some(RefProvenance::Local(depth)) = view.provenance {
             if depth > self.current_scope_depth() {
-                self.report_block_escape(name, span);
+                self.report_block_escape(name, depth, span);
             }
         }
         for (owner, _) in &view.owners {
@@ -206,12 +209,11 @@ impl<'a> TypeChecker<'a> {
                 self.lookup(owner).map(|(t, _)| t),
                 Some(t) if Self::is_ref_type(t)
             );
-            if is_mut
-                && !through_reference
-                && self.lookup(owner).is_some()
-                && !self.is_mutable(owner)
-            {
-                self.report_read_only(owner, "a view of it cannot be declared `mut`", span);
+            if is_mut && !through_reference && self.lookup(owner).is_some() {
+                self.changed_vars.insert(owner.to_string());
+                if !self.is_mutable(owner) {
+                    self.report_read_only(owner, "a view of it cannot be declared `mut`", span);
+                }
             }
         }
         self.borrow_for_view(name, &view, is_mut, span);

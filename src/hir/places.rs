@@ -7,14 +7,14 @@
 //===----------------------------------------------------------------------===//
 //! Shared "place" helpers — one derivation of *which memory an lvalue names* and *whether two paths
 //! overlap*, used by both the borrow checker (conflict detection, `expr.rs`) and the flat lowerer
-//! (§5.4 alias-scope disjointness, `flatten.rs`).
+//! (alias-scope disjointness, `flatten.rs`).
 //!
-//! `scalar_references_flat.md` §16.2 recorded that these facts were being computed twice — the checker's
-//! `extract_base_and_path` / its three inline overlap loops, and the lowerer's `place_base_path` /
-//! `paths_may_alias`. Both derivations were individually sound but duplicated; this module is the single
-//! source both now call. The borrow checker keeps its `Vec<String>` representation (its `BorrowRecord`
-//! stores string paths) by adapting `base_and_path` at the boundary; the overlap predicate is generic
-//! over the path element, so `Vec<String>` and `Vec<Symbol>` share it without conversion.
+//! These facts used to be computed twice -- the checker's `extract_base_and_path` and its three
+//! inline overlap loops, and the lowerer's `place_base_path` / `paths_may_alias`. Both were sound
+//! but duplicated; this module is the single source both now call. The borrow checker keeps its
+//! `Vec<String>` representation (its `BorrowRecord` stores string paths) by adapting
+//! `base_and_path` at the boundary; the overlap predicate is generic over the path element, so
+//! `Vec<String>` and `Vec<Symbol>` share it without conversion.
 use crate::symbol::Symbol;
 use crate::syntax::Expr;
 
@@ -68,7 +68,8 @@ pub fn paths_may_alias<T: AsRef<str>>(a: &[T], b: &[T]) -> bool {
 }
 
 /// How a place reads in a message: `q[0].x`, with a dot before each field and none before an
-/// index.
+/// index. A tuple's fields, which the parser names `_0`, `_1`, .., read as the program writes
+/// them: `t.0`.
 pub fn display_place<T: AsRef<str>>(root: &str, path: &[T]) -> String {
     let mut out = root.to_string();
     for p in path {
@@ -76,7 +77,18 @@ pub fn display_place<T: AsRef<str>>(root: &str, path: &[T]) -> String {
         if !p.starts_with('[') {
             out.push('.');
         }
-        out.push_str(p);
+        match p.strip_prefix('_') {
+            Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => out.push_str(n),
+            _ => out.push_str(p),
+        }
     }
     out
+}
+
+/// A moved place as the checker records it, `p.a` or `t._0`, as it reads in a message.
+pub fn display_dotted(place: &str) -> String {
+    let mut parts = place.split('.');
+    let root = parts.next().unwrap_or_default();
+    let path: Vec<&str> = parts.collect();
+    display_place(root, &path)
 }
