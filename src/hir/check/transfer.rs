@@ -194,6 +194,12 @@ impl<'a> TypeChecker<'a> {
                     Self::scan_expr_for_asserts(r, out);
                 }
             }
+            Expr::TaskBlock(b) => {
+                Self::collect_assert_contracts(&b.stmts, out);
+                if let Some(r) = &b.ret {
+                    Self::scan_expr_for_asserts(r, out);
+                }
+            }
             Expr::ComptimeBlock(b) => {
                 Self::collect_assert_contracts(&b.stmts, out);
                 if let Some(r) = &b.ret {
@@ -583,7 +589,10 @@ impl<'a> TypeChecker<'a> {
         // `check_capacity` has no guard against that, unlike `record_staging_route` beside it. A
         // counter mints a fresh key per visit and turns one 3 MiB tile into two.
         let key = if span.line != 0 || span.column != 0 {
-            format!("@{}:{}:{}", span.line, span.column, span.length)
+            format!(
+                "@{}:{}:{}:{}",
+                span.line, span.column, span.length, span.expansion
+            )
         } else if let Some(name) = &self.current_assignment_target {
             // A synthesized placement carrying no position: fall back to the binding, which is
             // what this keyed on before and is stable across the second visit. Two shadowed
@@ -636,7 +645,10 @@ impl<'a> TypeChecker<'a> {
     /// exactly -- no `speculating` guard, span-keyed so a node checked twice lands on the same
     /// record, first visit's program order kept.
     pub(crate) fn record_call_edge(&mut self, callee: &str, span: &crate::syntax::Span) {
-        let key = format!("@{}:{}:{}:{}", span.line, span.column, span.length, callee);
+        let key = format!(
+            "@{}:{}:{}:{}:{}",
+            span.line, span.column, span.length, span.expansion, callee
+        );
         if self.traffic.call_sites.contains_key(&key) {
             return;
         }
@@ -648,6 +660,7 @@ impl<'a> TypeChecker<'a> {
                 scope: self.traffic.scope_chain.clone(),
                 order: self.traffic.placement_order,
                 span: *span,
+                in_closure: self.traffic.closure_depth > 0,
             },
         );
     }
@@ -748,6 +761,14 @@ impl<'a> TypeChecker<'a> {
             // earlier in program order whose block is still open -- the same prefix test the
             // peak walk uses, evaluated at the call instead of at a placement.
             for (k, c) in calls.iter().enumerate() {
+                // A call from a closure body happens wherever the closure is called. What is
+                // resident at any point is at most the function's peak.
+                if c.in_closure {
+                    if total > 0 {
+                        summary.calls[k].live.insert(space.name(), total);
+                    }
+                    continue;
+                }
                 let held: u64 = placed
                     .iter()
                     .filter(|(_, sc, ord)| {
@@ -934,6 +955,82 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// The declaration of the memory space that `p` places a tensor in, if the program has one.
+    fn space_decl(&self, p: &crate::syntax::Placement) -> Option<&crate::syntax::MemoryDecl> {
+        let space = self.placement_space(p);
+        self.env
+            .memories
+            .values()
+            .find(|m| m.name.as_ref() == space.name())
+            .copied()
+    }
+
+    /// The alignment that a tensor placed by `p` has: its `aligned(N)`, or the `alignment:` of its
+    /// space, whichever is larger. 0 when neither says.
+    pub(crate) fn alignment_of(&self, p: &crate::syntax::Placement) -> u64 {
+        let least = self
+            .space_decl(p)
+            .and_then(|m| m.alignment.as_ref())
+            .map_or(0, |a| a.0);
+        p.alignment.unwrap_or(0).max(least)
+    }
+
+    /// Each `aligned(N)` in `ty` is in a space whose storage the compiler lays out, and is at
+    /// least the `alignment:` of that space (E6034).
+    fn check_alignments_in(&mut self, ty: &Type, context: &str, span: &Span) {
+        match ty {
+            Type::Borrow { inner, .. }
+            | Type::Pointer(inner, ..)
+            | Type::Ref(inner, _)
+            | Type::Pinned(inner, _) => self.check_alignments_in(inner, context, span),
+            Type::GenericInstance(base, args) => {
+                self.check_alignments_in(base, context, span);
+                for a in args {
+                    self.check_alignments_in(a, context, span);
+                }
+            }
+            Type::Tensor(_, _, Some(p)) => {
+                let Some(n) = p.alignment else {
+                    return;
+                };
+                let space = self.placement_space(p).name();
+                let decl = self.space_decl(p);
+                let laid_out = decl.is_some_and(|m| {
+                    matches!(
+                        m.scope,
+                        Some(
+                            crate::syntax::Scope::Sm
+                                | crate::syntax::Scope::Cta
+                                | crate::syntax::Scope::Thread
+                        )
+                    )
+                });
+                let least = decl.and_then(|m| m.alignment.as_ref()).map_or(0, |a| a.0);
+                let message = if !laid_out {
+                    Some(format!(
+                        "{context}: `aligned({n})` needs a space whose storage the compiler lays \
+                         out, one declared with `scope: sm`, `cta` or `thread`, and '{space}' is not"
+                    ))
+                } else if n < least {
+                    Some(format!(
+                        "{context}: `aligned({n})` is less than the `alignment: {least} B` of \
+                         '{space}', which every tensor there has"
+                    ))
+                } else {
+                    None
+                };
+                if let Some(message) = message {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E6034,
+                        message,
+                        Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn check_type_placement(&mut self, ty: &Type, context: &str, span: &Span) {
         self.check_placement_of_type(ty, context, span, true)
     }
@@ -949,6 +1046,7 @@ impl<'a> TypeChecker<'a> {
 
     fn check_placement_of_type(&mut self, ty: &Type, context: &str, span: &Span, record: bool) {
         self.report_unheld_placements(ty, context);
+        self.check_alignments_in(ty, context, span);
         for (e, d, space) in self.placed_tensors(ty) {
             self.check_capacity_of(&e, &d, &space, context, span, record);
             self.check_element_type(&e, &space, context);
@@ -2120,7 +2218,6 @@ impl<'a> TypeChecker<'a> {
 
                 let prev_top = self.active_topology.clone();
                 let prev_mem = self.active_memory.clone();
-                let prev_warned = std::mem::take(&mut self.host_reads_warned);
                 self.active_topology = actual_top.clone();
                 self.active_memory = self.transfer_cost_graph.default_memory_for(&actual_top);
 
@@ -2231,7 +2328,6 @@ impl<'a> TypeChecker<'a> {
 
                 self.active_topology = prev_top;
                 self.active_memory = prev_mem;
-                self.host_reads_warned = prev_warned;
 
                 // The result of a device kernel is located ON that device: return
                 // `Pinned<ret_ty, d>` so reading it on another topology re-triggers the USE

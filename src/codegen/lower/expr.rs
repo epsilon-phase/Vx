@@ -2039,7 +2039,11 @@ fn lower_unsafe_block<'c>(
         }
     }
     if let Some(ret_expr) = &this.ret {
+        // The drops waiting for the value. A statement inside the value, in an `if` for
+        // example, must not run them.
+        let waiting = std::mem::take(&mut gen.queued_drops);
         let (val, ty, cur) = gen.generate_expr(ret_expr, current_block)?;
+        gen.queued_drops.extend(waiting);
         let cur = gen.run_queued_drops(cur)?;
         Ok((val, ty, cur))
     } else {
@@ -3947,17 +3951,17 @@ impl<'c> LowerToMelior<'c> for NumberExpr {
         } else {
             gen.i32_ty
         };
-        let ty_str = ty.to_string();
-        if ty_str.contains("f32")
-            || ty_str.contains("f64")
-            || ty_str.contains("f16")
-            || ty_str.contains("bf16")
-        {
+        if crate::codegen::generator::is_float_text(&ty.to_string()) {
+            let v = val_str.parse::<f64>().unwrap();
+            let v = ast_ty_opt
+                .as_ref()
+                .and_then(|e| e.nearest_narrow_value(v))
+                .unwrap_or(v);
             let op = OperationBuilder::new("arith.constant", gen.loc())
                 .add_results(&[ty])
                 .add_attributes(&[(
                     Identifier::new(gen.context, "value"),
-                    FloatAttribute::new(gen.context, ty, val_str.parse::<f64>().unwrap()).into(),
+                    FloatAttribute::new(gen.context, ty, v).into(),
                 )])
                 .build()?;
             let op_ref = block.append_operation(op);
@@ -4049,6 +4053,12 @@ impl<'c> LowerToMelior<'c> for MatchExpr {
             }
             .or(gen.expected_type)
         });
+        // An arm gives a value, so the placeholder below would replace it with a wrong one.
+        if tail_expr.is_some() && !in_statement && value_ty.is_none() {
+            return Err(LowerError::ParseType(
+                "cannot find the type of the value that this `match` gives".to_string(),
+            ));
+        }
 
         let parent_region = block.parent_region().unwrap();
         let merge_block = match value_ty {

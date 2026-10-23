@@ -1,4 +1,4 @@
-# Vx: bundled LLVM, llvm-sass, GLM on GPU, and visibility/versioning design
+# Vx: bundled LLVM, and visibility/versioning design
 
 *Chat export, October 2026*
 
@@ -93,187 +93,7 @@ Suggestion: ORC for JIT, system `cc` for AOT in v0.0.3, embedded lld later if ne
 
 ______________________________________________________________________
 
-## 4. The real reason: llvm-sass
-
-**Aditya:** We use clang as a linker. The real reason I'm doing it is that I want to ship the llvm-sass backend at some point.
-
-**Claude:**
-
-That makes bundling LLVM required, not just convenient. A system LLVM will never contain your SASS backend, and LLVM has no stable plugin interface for codegen targets.
-
-**Where the pin lives.** Vx and llvm-sass must build against exactly the same LLVM commit. A separate toolchain-build repo would own the pin, build LLVM + MLIR + Enzyme + llvm-sass together, and publish dev and release artifacts. A toolchain version = (LLVM commit, llvm-sass commit).
-
-**Developer build time stays flat for Vx contributors.** They never compile llvm-sass. If llvm-sass is an LLVM target, each change needs a toolchain rebuild before Vx sees it; treat it like an LLVM bump.
-
-**Keep PTX in the release.** SASS is tied to one SM architecture; PTX is forward-compatible through the driver JIT. Embed both: SASS for validated targets plus PTX fallback, like nvcc fatbins.
-
-**Make it a build-time option in `vxc`** (Cargo feature or CMake option), so `vxc` still builds without llvm-sass.
-
-**CI needs a GPU.** GitHub-hosted runners can't execute SASS. Use a self-hosted runner or a manual hardware gate per claimed SM target.
-
-On clang as the linker: llvm-sass doesn't depend on it. Use the system `cc` as linker driver in v0.0.3, possibly embedded lld later.
-
-______________________________________________________________________
-
-## 5. Keeping llvm-sass inside Vx only
-
-**Aditya:** For now llvm-sass is in my private repo. I don't want to ship it separately — huge risk of Vx becoming an llvm-sass fork and nobody using Vx. llvm-sass + llvm-nvptx together can emit a complete CUDA binary while we gradually emit llvm-sass completely. Timeline unknown.
-
-**Claude:**
-
-The key design rule: Vx should never offer an entry point that turns `vxc` into a general-purpose SASS emitter (arbitrary LLVM IR or PTX in, SASS out). The SASS path should only be reachable from Vx source. The stronger moat: llvm-sass knows exact register counts, shared memory and occupancy at compile time, feeding admission verdicts.
-
-**Hybrid SASS + PTX granularity.** Split per kernel: each entry point plus its transitive device functions goes to one backend.
-
-- **Linking constraint:** device calls can't cross between llvm-sass and ptxas cubins without relocatable device code and nvlink.
-- **Fallback:** automatic per kernel; `vxc` records which path each kernel took.
-- **Testing:** differential testing — compile both ways, run on GPU, compare.
-- **Forward compatibility:** keep PTX embedded alongside SASS.
-
-**Two toolchain variants.** Public dev toolchain without llvm-sass (public CI, fork PRs); release toolchain with llvm-sass built in a protected workflow with a deploy key.
-
-**Open-source story.** A closed component in an MIT binary needs upfront disclosure and its own license notice in the archive.
-
-**Publication.** Artifact-evaluation "available" badges usually require public availability.
-
-______________________________________________________________________
-
-## 6. Open sourcing llvm-sass in a combined toolchain
-
-**Aditya:** I can release it in public as a combined toolchain. Open sourcing Vx has provided value: ~200 stars, invited to present at Paradigm Frontiers 2026. Making Vx the one compiler that has the potential to be ptxas-free can be pretty big.
-
-**Claude:**
-
-I'd open source it, as part of the combined toolchain in the vx-lang org rather than a standalone repo.
-
-**The fork risk is smaller than it feels.**
-
-- Being ignored is the bigger danger than being forked. A closed blob inside an MIT language becomes a demo nobody can build on (Mojo's closed compiler drew constant criticism).
-- Outside use is mostly a win: the work still says vx-lang, and most users will track upstream rather than maintain a SASS backend.
-- The hard-to-copy parts live in Vx: per-kernel hybrid selection, exact resource numbers feeding admission verdicts, differential testing.
-
-**Living in the combined toolchain.** Apache-2.0 with the LLVM exception keeps upstreaming possible and fits next to MIT.
-
-**Before announcing:**
-
-1. **Legal read on the ISA question.** SASS encodings come from reverse engineering; NVIDIA's CUDA license terms restrict reverse engineering of the SDK. Get advice from a software-licensing lawyer before the code goes public.
-1. **Make the claim precise.** Mesa's NAK already compiles to native NVIDIA ISA without ptxas (for Vulkan shaders). Google's gpucc still relied on ptxas. Defensible claim: "an open path from a general-purpose language to complete CUDA binaries, with ptxas becoming optional per kernel," ideally with a measured coverage number.
-1. **Don't tie the release to the talk** (15-minute slot). A live demo plus "code lands with v0.0.3" is strong.
-
-Motivation example: the LLVM tracker has a ptxas miscompile involving divergent branches and convergent operations that was hard to diagnose without ptxas source.
-
-______________________________________________________________________
-
-## 7. What to build next for a larger audience
-
-**Aditya:** We shipped bundled LLVM; llvm-sass ships next release. What high-value library/utility should we ship? Someone from Paradigm built GLM with Vx + Python without vLLM, CPU-only so far.
-
-**Claude:**
-
-Start from the GLM prototype and generalize it.
-
-**Hybrid CPU+GPU inference for large MoE models.** Attention and KV cache on GPU, cold experts in host memory on CPU. A heterogeneous placement problem — what Vx's memory-space and topology types are for. Admission checking answers "does this model fit my machine at this context length, and with what split?" at compile time.
-
-**Make it general where it's cheap.** A Vx kernel library of shared operators (RMSNorm, RoPE, GQA/MLA attention with paged KV cache, gated MLPs, MoE routing + grouped GEMM, FP8/INT4 matmuls, sampling) plus a Hugging Face `config.json` + safetensors loader.
-
-**Packaging reaches the most people.** `pip install vx` wheel with bundled toolchain (manylinux, macOS arm64) and zero-copy DLPack interop with PyTorch/NumPy.
-
-**Avoid** building a vLLM competitor (serving stack). Be the layer underneath.
-
-**Order:** GLM on GPU with logit checks → extract kernel library + second model family → wheel → hybrid offload with admission verdicts → honest benchmarks vs llama.cpp and vLLM.
-
-______________________________________________________________________
-
-## 8. Plan / GitHub issue for GPU bring-up
-
-**Aditya:** I'll find a cheaper GPU on RunPod. A100 is $1.8/hr, so I can test on that machine with AWS EC2 as host. Give me a plan for a GitHub issue.
-
-**Claude:**
-
-A RunPod GPU can't use an EC2 instance as its host — a pod is its own machine. Hybrid offload runs on the pod's CPU and RAM, so check pod RAM/vCPUs. Use EC2 for builds/CI only. Do bring-up on a cheaper card (L4/A10/RTX 4090); use the A100 for perf and the MoE milestone. Keep weights on a network volume; stop pods when idle.
-
-```markdown
-# GPU bring-up for GLM inference, then generalize into a Vx LLM kernel library
-
-## Context
-@<author> built GLM inference with Vx + Python, no vLLM, CPU only. This issue
-takes it to NVIDIA GPUs, extracts the reusable pieces into a kernel library,
-and builds toward hybrid CPU+GPU inference for MoE models, using admission
-verdicts to decide placement.
-
-## Goals
-- GLM runs on GPU with outputs matching the Hugging Face reference
-- Shared LLM operators live in a reusable Vx library, not model-specific code
-- A second model family runs on the same library with mostly config changes
-- Hybrid CPU+GPU MoE inference, with `vxc` reporting at compile time whether
-  a model fits a machine at a given context length, and with what split
-
-## Non-goals
-- Serving stack (continuous batching, scheduler, OpenAI API); a minimal demo
-  server at most
-- Multi-GPU / multi-node
-- Training
-
-## Hardware
-- Bring-up: a single cheaper GPU on RunPod (L4 / A10 / RTX 4090)
-- Perf + MoE milestone: A100 80GB on RunPod; record host RAM and vCPUs for
-  every benchmark, since offload depends on them
-- Model weights on a RunPod network volume
-- Builds / CI: EC2 or GitHub runners; GPU tests run only on the pod
-
-## Milestones
-
-### M0: Infrastructure
-- [ ] Pod setup script: Vx toolchain, CUDA driver check, weights on volume
-- [ ] Reference harness: run the HF transformers model, dump logits for a
-      fixed prompt set to a file we compare against
-- [ ] Choose bring-up model: <smallest GLM checkpoint, dense if available>
-
-### M1: GLM on GPU (correctness first)
-- [ ] Port prototype ops to GPU kernels (BF16)
-- [ ] Prefill + decode with a contiguous KV cache
-- [ ] Pass criteria: greedy decode matches the HF reference token for token
-      for the first <N> tokens on all reference prompts; per-position logit
-      max-abs-diff under <tol>
-- [ ] Perplexity on a small fixed eval set within <x>% of HF
-
-### M2: Extract the kernel library
-- [ ] Operators: RMSNorm, RoPE, GQA attention, gated MLP, MoE routing +
-      grouped GEMM, sampling
-- [ ] Paged KV cache
-- [ ] Hugging Face loader: config.json + safetensors → model definition
-- [ ] Per-op tests against PyTorch reference implementations
-- [ ] GLM rewritten on top of the library, M1 tests still pass
-
-### M3: Second model family
-- [ ] <Qwen or Llama>, added mostly through config, same M1-style criteria
-- [ ] List anything that needed new code; that's the library's next gap
-
-### M4: Hybrid CPU+GPU MoE
-- [ ] Target: <MoE GLM checkpoint that doesn't fit in 80GB>
-- [ ] Attention + KV cache on GPU, experts in host memory, CPU expert path
-- [ ] Admission verdict: given model config + machine (GPU memory, host RAM),
-      `vxc` reports fit / no-fit, max context, and the placement it chose
-- [ ] Correctness vs HF reference on a subset of prompts
-
-### M5: Quantization + benchmarks
-- [ ] FP8 and INT4 weight matmuls
-- [ ] Benchmarks against llama.cpp and vLLM on the same pod, same model,
-      same precision: prefill tokens/s, decode tokens/s, time to first token,
-      peak memory
-- [ ] Publish scripts and raw numbers, including runs where Vx loses
-
-## Open questions
-- Which GLM checkpoints does the prototype support today?
-- Does the prototype author want to co-own M1/M2?
-- Where should the library live: in-tree (`lib/llm`) or a separate repo?
-```
-
-Packaging (`pip install vx` wheel with DLPack interop) is better as its own linked issue.
-
-______________________________________________________________________
-
-## 9. Problems with Rust's `pub` visibility
+## 4. Problems with Rust's `pub` visibility
 
 **Aditya:** What is the problem with Rust's pub visibility? They have private, crate and external.
 
@@ -293,7 +113,7 @@ For Vx: explicit package-level export semantics, a package/workspace visibility 
 
 ______________________________________________________________________
 
-## 10. Proposed Vx visibility syntax and semantics
+## 5. Proposed Vx visibility syntax and semantics
 
 **Aditya:** So how should the syntax and semantics look?
 
@@ -341,7 +161,7 @@ Alternative: an explicit export list in the package root (Haskell, Go internal p
 
 ______________________________________________________________________
 
-## 11. Visibility at the ABI level
+## 6. Visibility at the ABI level
 
 **Aditya:** The programming world reasons in terms of object file, static library, DSO/shared object, and executable. Visibility at the ABI level should reflect one of these. Am I thinking it right?
 
@@ -371,7 +191,7 @@ Rule of thumb: language visibility sets the most a symbol may be exported; build
 
 ______________________________________________________________________
 
-## 12. Covariance between visibility and versioning
+## 7. Covariance between visibility and versioning
 
 **Aditya:** This also partly addresses package management. We need algorithms for a covariance (partial order) relation among visibility and versioning. This will help with (1) fewer exported symbols, (2) lower binary load time, (3) semantic versioning of shipped binaries.
 

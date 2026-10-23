@@ -55,8 +55,14 @@ pub(crate) struct BorrowCx {
     /// Every borrower each variable has had in the function, kept after the borrow ends: a
     /// drop point is after the last use of all of them.
     borrowers_ever: HashMap<String, HashSet<String>>,
+    /// The borrows of variables that a newer `let` of the same name hides: the depth of the
+    /// new variable's scope, the name, and the records.
+    shadowed: Vec<(usize, Symbol, Vec<BorrowRecord>)>,
     /// Where each owned tensor is dropped. See `check/drops.rs`.
     pub(crate) drops: crate::hir::check::drops::DropFrames,
+    /// The tasks that have started and that nothing has joined yet. A task holds its borrows
+    /// until then, also where no statement names it. See `check/tasks.rs`.
+    running_tasks: HashSet<String>,
     /// What each view variable (`let r = q[i]`) borrows. Reset per function.
     pub(crate) views: HashMap<Symbol, crate::hir::check::views::View>,
     /// The tensors each view-making `let` may be part of, keyed by the `let`'s position. The
@@ -81,6 +87,9 @@ pub(crate) struct BlockUses {
 pub(crate) struct LoopExits {
     pub(crate) at_break: Option<Vec<HashSet<String>>>,
     pub(crate) at_continue: Option<Vec<HashSet<String>>>,
+    /// What the function changed before the loop. While the loop is checked, `changed_vars`
+    /// holds only what the loop changes.
+    pub(crate) changed_before: HashSet<String>,
 }
 
 impl Default for BorrowCx {
@@ -100,8 +109,10 @@ impl Default for BorrowCx {
             loop_exits: Vec::new(),
             views: HashMap::new(),
             view_owners_by_let: HashMap::new(),
+            shadowed: Vec::new(),
             borrowers_ever: HashMap::new(),
             drops: Default::default(),
+            running_tasks: HashSet::new(),
         }
     }
 }
@@ -148,7 +159,10 @@ impl BorrowCx {
     /// statement answers yes. A block that declares `name` ends the search, since no block
     /// around it can see that variable. A loop body that names a variable from outside it
     /// answers yes too, because its next pass names it again.
-    fn is_variable_used_after(&self, name: &str) -> bool {
+    pub(crate) fn is_variable_used_after(&self, name: &str) -> bool {
+        if self.is_running_task(name) {
+            return true;
+        }
         let blocks = self.block_liveness.iter().zip(&self.current_stmt_idx);
         for (block, &current_idx) in blocks.rev() {
             let last_use = block.last_use.get(name);
@@ -163,6 +177,22 @@ impl BorrowCx {
             }
         }
         false
+    }
+
+    /// A task started, and holds its borrows until [`Self::end_task`].
+    pub(crate) fn start_task(&mut self, task: &str) {
+        self.running_tasks.insert(task.to_string());
+    }
+
+    /// The task is joined, so its borrows end.
+    pub(crate) fn end_task(&mut self, task: &str) {
+        self.running_tasks.remove(task);
+    }
+
+    /// Whether `name` is a running task, or the hold of a running task on what it copied.
+    pub(crate) fn is_running_task(&self, name: &str) -> bool {
+        let task = name.split_once('/').map_or(name, |(task, _)| task);
+        self.running_tasks.contains(task)
     }
 
     // --- borrow records ---
@@ -296,6 +326,30 @@ impl BorrowCx {
                 }
             });
         }
+    }
+
+    /// Set the records of `name` aside while a new variable of that name, declared at `depth`,
+    /// is in scope.
+    pub(crate) fn shadow(&mut self, name: &str, depth: usize) {
+        if let Some(records) = self.active_borrows.remove(name) {
+            self.shadowed.push((depth, name.into(), records));
+        }
+    }
+
+    /// The scope at `depth` ends: put back the records that its variables hid.
+    pub(crate) fn unshadow(&mut self, depth: usize) {
+        while self.shadowed.last().is_some_and(|(d, _, _)| *d >= depth) {
+            let (_, name, records) = self.shadowed.pop().expect("checked above");
+            self.active_borrows.entry(name).or_default().extend(records);
+        }
+    }
+
+    pub(crate) fn take_shadowed(&mut self) -> Vec<(usize, Symbol, Vec<BorrowRecord>)> {
+        std::mem::take(&mut self.shadowed)
+    }
+
+    pub(crate) fn restore_shadowed(&mut self, shadowed: Vec<(usize, Symbol, Vec<BorrowRecord>)>) {
+        self.shadowed = shadowed;
     }
 
     /// Clone the whole borrow table (a speculative/expression check restores it afterwards).

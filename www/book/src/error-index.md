@@ -17,10 +17,10 @@ the test suite has one, a program that triggers it.
 - [Warnings](#warnings) — `W1001`–`W1034` (25 codes)
 - [Parser Errors](#parser-errors) — `E1001`–`E1013` (13 codes)
 - [Name Resolution Errors](#name-resolution-errors) — `E2001`–`E2007` (7 codes)
-- [Type Errors](#type-errors) — `E3001`–`E3051` (50 codes)
-- [Borrow/Ownership Errors](#borrowownership-errors) — `E4001`–`E4013` (13 codes)
+- [Type Errors](#type-errors) — `E3001`–`E3058` (57 codes)
+- [Borrow/Ownership Errors](#borrowownership-errors) — `E4001`–`E4014` (14 codes)
 - [Safety Errors](#safety-errors) — `E5001`–`E5002` (2 codes)
-- [Topology/Hardware Errors](#topologyhardware-errors) — `E6001`–`E6031` (31 codes)
+- [Topology/Hardware Errors](#topologyhardware-errors) — `E6001`–`E6034` (34 codes)
 - [Tensor/Math Errors](#tensormath-errors) — `E7001`–`E7004` (4 codes)
 - [Contract/Verification Errors](#contractverification-errors) — `E8001`–`E8006` (6 codes)
 
@@ -53,8 +53,8 @@ Reported without stopping the compile. A warning means the program is accepted b
 | [`W1029`](/errors/W1029/) | A tensor placed in a memory space that declares a `capacity` has a *dynamic* (non- literal) shape, so the capacity check (E6009/E6010) could not run — the placement is unverified. Silence by making the shape static, or bounding it. Emitted only when the destination space actually declares a capacity. |
 | [`W1030`](/errors/W1030/) | A topology's device index is not a compile-time constant (`GPU[i]` for a runtime `i`), so it cannot be resolved to a device instance and falls back to index 0. Every such spawn therefore targets the same device. Vx models one representative device per declared kind (#284), so a fleet program should index with constants or const generics. |
 | [`W1031`](/errors/W1031/) | A proof obligation could not be discharged because no SMT solver was available, so the property is **unverified** rather than proved. Distinct from W1027, which means the solver ran and found a violation. Emitted only under `VX_ALLOW_UNVERIFIED`; without it a missing solver is an error, because silence used to be indistinguishable from success (Vx#374). |
-| [`W1033`](/errors/W1033/) | The loop of a `spawn` region runs on one thread although each pass writes only memory of its own, so its passes could run at the same time. The warning points at what stops it: a call the compiler cannot show writes nothing, inline MLIR, a read of a row another pass writes, bounds not known when compiling, and the like. |
-| [`W1034`](/errors/W1034/) | Code on the built-in `Topology::GPU` uses a tensor that lives in host memory (`CPU_DRAM`). The built-in GPU lists host memory as visible, so this compiles. A matmul sent to cuBLAS has its operands copied to the device, but a kernel the compiler generates is given the host pointer as it is, and what it does with it depends on the driver: it may reach host memory over the link, one access at a time, or fault. Transfer the tensor to `Memory::GPU_HBM` before the region. Reported once per tensor per region. A later version may make this an error. |
+| [`W1033`](/errors/W1033/) | The loop of a `spawn` region runs on one thread although each pass writes only memory of its own, so its passes could run at the same time. The warning points at what stops it: a call the compiler cannot show writes nothing, inline MLIR, a read of a row another pass writes, bounds not known when compiling, and the like. A region that calls `barrier()` asks for blocks and threads, so it is warned about whenever it runs on one thread, with the first thing that stopped the split: two threads that may write the same element, a `break` out of a loop that holds a `barrier()`, a write to block-shared memory with no `barrier()` after it, and the like. |
+| [`W1034`](/errors/W1034/) | The program writes a variable that a closure copied, and uses the closure after the write. The closure keeps the value that it copied, so it does not see the write. A later release makes this an error (K4). |
 
 ## Parser Errors
 
@@ -146,6 +146,13 @@ Raised by the type checker. Vx performs no implicit numeric conversion, so many 
 | [`E3049`](/errors/E3049/) | Two impls of the same trait for the same type: `impl Describe for Point` written twice, in one module or in two. A type has one impl of a trait, so a call could not choose between them. Remove one. |
 | [`E3050`](/errors/E3050/) | A pattern inside a variant's payload that is not a name or `_`, such as the `3` in `Val(3)` or the `Inner::A(v)` in `Wrap(Inner::A(v))`. The compiler does not test such a pattern when it chooses an arm, so the arm would be taken for any payload. Bind the payload to a name and test it in the arm, with an `if` or another `match`. |
 | [`E3051`](/errors/E3051/) | A `match` pattern that names a variant of another enum than the value matched, such as `Other::Red` in a `match` on a `Color`. Write the variant with the matched value's enum. |
+| [`E3052`](/errors/E3052/) | Arithmetic on fp8 or fp4 values (`f8e4m3`, `f8e5m2` or `f4e2m1`) with no written result type, as in `print(a * b)`. The compiler computes in f32 and rounds once to the written type, so the program must write it: `let c : f32 = a * b;`. Also `+=` and the other compound operators on these values, and any operator on tensors of them. |
+| [`E3053`](/errors/E3053/) | An impl of `Send` or `Sync` with no `unsafe`, as in `impl Send for Handle {}`. The compiler derives both from the fields, and a raw pointer is neither. An impl claims one for a type that holds a raw pointer, and the compiler cannot check the claim. Write `unsafe impl Send for Handle {}`. |
+| [`E3054`](/errors/E3054/) | `unsafe impl` of a trait other than `Send` or `Sync`, or of no trait at all. Only those two traits make a claim that the compiler cannot check. Remove `unsafe`. |
+| [`E3055`](/errors/E3055/) | A task takes a value that is not `Send`, or reads a variable whose type is not `Sync`. A task that moves a value, copies it or writes it needs `Send`. A task that reads a variable in place shares it with the code around the task, so it needs `Sync`. The error names the field that makes the type fail. |
+| [`E3056`](/errors/E3056/) | `spawn { .. }` outside a `tasks { .. }` block. The end of the `tasks` block waits for each task, so a task cannot outlive the variables it uses. A `spawn` in a closure, or directly in another task, is outside the block too. Put the `spawn` in a `tasks` block of its own. |
+| [`E3057`](/errors/E3057/) | A task handle used in a way other than `h.join()`, or a `spawn` that is not the value of a `let` or a statement of its own. A task must not leave its `tasks` block, so the program cannot return a handle, store it, or pass it to a function. Write `let h = spawn { .. };` and later `h.join()`. |
+| [`E3058`](/errors/E3058/) | A `return`, `break` or `continue` that leaves a task, or a task that joins another task. The last expression of a task body is its result. A task cannot join another task yet. Join both tasks in the `tasks` block. |
 
 ## Borrow/Ownership Errors
 
@@ -166,6 +173,7 @@ Raised by the borrow checker and the linear-type rules. These rule out use-after
 | [`E4011`](/errors/E4011/) | A view of a tensor (a row `q[i]` or a field `h.t`) used where a tensor of its own is held: stored in a variable that already exists (`t = q[i]`) or a struct field (`h.t = q[i]`, `Holder { t : q[i] }`), or passed to a function that takes the tensor by value (`f(q[i])`). A view shares its owner's memory and is not a copy. Bind it to a new variable with `let`, pass `q[i].clone()`, or take the parameter by reference. |
 | [`E4012`](/errors/E4012/) | A call to the `drop` method of a `Drop` impl by hand: `x.drop()`. `drop` runs when the value is dropped, so calling it as well would run it twice. Write `drop(x)`, from `core::mem`, to drop a value early. |
 | [`E4013`](/errors/E4013/) | A field moved out of a value that must keep it: `let x = p.a` where `p`'s type implements `Drop`, whose `drop` needs every field, or `let x = make().a`, where the value has no name and drops all its fields at the end of the statement. Borrow the field (`&p.a`), clone it, or bind the value to a variable first. |
+| [`E4014`](/errors/E4014/) | A task that can still run when a variable that it uses ends or changes. A task in a loop that the same pass does not join runs at the same time as the next pass, so it must not write a variable from outside the loop, or read one that the loop writes. A task must not use a variable that ends before its `tasks` block, such as one of the loop body. Join the task in the same block: `let h = spawn { .. };` and then `h.join();`. |
 
 ## Safety Errors
 
@@ -213,6 +221,9 @@ Raised by the placement and capacity rules — the checks that make Vx different
 | [`E6029`](/errors/E6029/) | A pointer argument into one memory passed to a parameter that wants a pointer into another: a host `*mut f32` where `*mut f32 in Memory::GPU_HBM` is declared, or the reverse. The two are different types, and the C library or kernel behind the parameter reads the memory the declaration names, so the spaces must match exactly. |
 | [`E6030`](/errors/E6030/) | A `spawn` region on a device hands out a tensor it makes, which the host could not free. The compiler makes such a tensor before the region instead, in the device's memory, when the region hands it out as a variable created with `Tensor<..>(..)`, `::new()` or `unsafe { ..::uninit() }`, with no type annotation, a size that uses nothing the region computes, and a name nothing outside the region already uses. |
 | [`E6031`](/errors/E6031/) | A tensor shape that folds to a negative extent, or whose size is more than 2^63 - 1 bytes, the most an allocation can ask for. The size is known, and it is not one the generated code can allocate: it would wrap. |
+| [`E6032`](/errors/E6032/) | An `across` loop that the topology or its place cannot have: a level the topology does not name, a loop outside a `spawn on` region or in the wrong order, a size that is not known when the kernel is compiled or is over the limit, or a jump out of the loop. |
+| [`E6033`](/errors/E6033/) | An index into a tensor in a `scope: thread` space that is not known when compiling. Such a tensor stays in registers, and a register has no address. So each index must be a constant, or made of constants and the variables of `for` loops with constant bounds, at most 1024 passes each. The code generator unrolls those loops. |
+| [`E6034`](/errors/E6034/) | An `aligned(N)` in a tensor type that the compiler cannot give: the space is not one whose storage the compiler lays out (`scope: sm`, `cta` or `thread`), or N is less than the `alignment:` of the space, which every tensor there has. |
 
 ## Tensor/Math Errors
 
@@ -240,4 +251,4 @@ Raised when a `requires`, `ensures` or `invariant` clause cannot be discharged, 
 
 ______________________________________________________________________
 
-151 diagnostics.
+162 diagnostics.

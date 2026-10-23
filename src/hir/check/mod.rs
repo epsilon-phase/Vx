@@ -15,9 +15,13 @@
 //===----------------------------------------------------------------------===//
 
 pub mod access;
+pub mod across;
+pub mod across_lanes;
+pub mod across_proof;
 pub mod autodiff;
 pub mod calls;
 pub mod capacity_fold;
+pub mod closure_copies;
 pub mod control;
 pub mod drops;
 pub mod escape;
@@ -28,6 +32,8 @@ pub mod parallel;
 pub mod projection;
 pub mod raw;
 pub mod region_traffic;
+pub mod tasks;
+pub mod thread_safety;
 pub mod transfer;
 pub mod unused_functions;
 pub mod views;

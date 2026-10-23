@@ -103,7 +103,7 @@ struct Frontend {
     subspaces: Vec<crate::codegen::flat::SubspaceInfo>,
     /// Same travel pattern as `subspaces`: the declared-arch table for `vx.spawn` stamping
     /// (Vx#352), extracted from the env because the env cannot leave the frontend.
-    topo_archs: Vec<(i64, String)>,
+    topo_archs: Vec<(i64, crate::codegen::flat::DeclaredArch)>,
     /// Same again: `arch::local_device_aliases`, for the `vx.local_devices` module attribute.
     local_devices: Vec<(i32, i32)>,
     checks: Vec<FunctionCheck>,
@@ -516,15 +516,16 @@ fn macro_expansion_phase(
             global_macros.insert(mac.name.clone(), mac.rules.clone());
         }
     }
-    // Expansion is per-module and shares nothing. `MacroExpander` holds a single `&HashMap` and no
-    // mutable state, so its methods took `&mut self` without ever being able to use it; now that
-    // they take `&self`, one expander is shared across the parallel-for and the borrow checker
-    // proves the isolation rather than a comment asserting it.
+    // Expansion is per-module and shares nothing. Each module gets its own expander, because
+    // an expander counts the expansions it makes.
     // Collected here for the same reason the macro table is: both have to be complete before
     // any module is expanded, because a trait and an impl of it need not share a module.
     let trait_defaults = crate::resolver::collect_trait_defaults(parsed_modules.iter());
-    let expander = MacroExpander::new(&global_macros, &trait_defaults);
-    let expand = |m: &mut VxModule| expander.expand_module(m).map_err(PipelineError::Parse);
+    let expand = |m: &mut VxModule| {
+        MacroExpander::new(&global_macros, &trait_defaults)
+            .expand_module(m)
+            .map_err(PipelineError::Parse)
+    };
     if sched.is_seq() {
         parsed_modules.iter_mut().try_for_each(expand)?;
     } else {
@@ -898,6 +899,19 @@ pub fn build_frozen_registry_with(
                 by_value_dependencies: deps,
             });
         }
+    }
+
+    // The generic struct instances that the layouts above hold by value (`SharedCell<i32>`), so
+    // a field naming one resolves like a field naming a plain struct.
+    for (id, name, l) in layout.instance_layouts() {
+        defs.push(TypeDefinition {
+            id,
+            name: name.to_string(),
+            size_bytes: l.size,
+            align_bytes: l.align,
+            fields: l.fields.clone(),
+            by_value_dependencies: Vec::new(),
+        });
     }
 
     let mut registry = crate::registry::ImmutableGlobalRegistry::build_and_validate(defs)
@@ -1919,7 +1933,7 @@ fn codegen_mlir_phase(
     parsed_modules: &[VxModule],
     check_results: &mut [FunctionCheck],
     subspaces: &[crate::codegen::flat::SubspaceInfo],
-    topo_archs: &[(i64, String)],
+    topo_archs: &[(i64, crate::codegen::flat::DeclaredArch)],
     local_devices: &[(i32, i32)],
     global_session: &std::sync::Arc<GlobalSession>,
     merged_arenas: MergedArenas,
@@ -2000,6 +2014,7 @@ fn codegen_mlir_phase(
         topo_archs,
         local_devices,
         sched,
+        false,
     )
     .ok()?;
     chatter!(

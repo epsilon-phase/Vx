@@ -14,7 +14,9 @@
 //===----------------------------------------------------------------------===//
 
 use super::super::*;
-use crate::hir::check_state::ComptimeEvalFlow;
+use crate::hir::check_state::{
+    ComptimeCheck, ComptimeCheckProblem, ComptimeCheckProblemKind, ComptimeEvalFlow,
+};
 use std::collections::HashMap;
 
 /// What running a `comptime` block produced.
@@ -46,12 +48,15 @@ impl<'a> TypeChecker<'a> {
     /// leave nothing behind, so there is no such thing as one that half-ran: until now those
     /// were emitted as ordinary run-time code, which is how a loop or a call the evaluator
     /// skipped stayed invisible.
+    /// `return_is_value`: the block is a closure's whole body or the value of a `return`, so a
+    /// `return` in it gives the block's value.
     fn fold_comptime_block(
         &mut self,
         stmts: &[Statement],
         ret: Option<&Expr>,
         block_span: Span,
         before: &HashMap<crate::symbol::Symbol, Value>,
+        return_is_value: bool,
     ) -> ComptimeFold {
         let interpretation = self.observe_comptime_block(stmts, ret, before);
         // At the block's last expression; at the `comptime` keyword when there is none, or when
@@ -61,6 +66,19 @@ impl<'a> TypeChecker<'a> {
             .filter(|span| *span != Span::default())
             .unwrap_or(block_span);
 
+        // A check that fails every time the block runs stops the build. Each one is reported,
+        // so a block of asserts reports every assert that fails.
+        let failed: Vec<_> = interpretation
+            .check_problems
+            .iter()
+            .filter(|problem| problem.kind == ComptimeCheckProblemKind::Fails)
+            .collect();
+        if !failed.is_empty() {
+            for problem in failed {
+                self.report_comptime_check_failure(problem);
+            }
+            return ComptimeFold::Refused;
+        }
         // Anything it writes that outlives it would have to survive, and the block does not.
         if let Some(name) = interpretation.escaping_write {
             self.report_comptime_block_failure(
@@ -77,6 +95,10 @@ impl<'a> TypeChecker<'a> {
             self.report_comptime_depth_exceeded(&span);
             return ComptimeFold::Refused;
         }
+        if let Some(loop_span) = interpretation.loop_limit_reached_at {
+            self.report_comptime_loop_limit(&loop_span);
+            return ComptimeFold::Refused;
+        }
         if interpretation.outcome.requires_refusal || !interpretation.outcome.support.is_supported()
         {
             self.report_comptime_block_failure(
@@ -85,10 +107,25 @@ impl<'a> TypeChecker<'a> {
             );
             return ComptimeFold::Refused;
         }
+        // Any other check would disappear with the block, and never run.
+        if !interpretation.check_problems.is_empty() {
+            for problem in &interpretation.check_problems {
+                self.report_comptime_check_failure(problem);
+            }
+            return ComptimeFold::Refused;
+        }
         // A `return` inside the block, where the block is a closure or function body, is
         // that body's value -- `|| comptime { ..; return x; }` is how the closure fixtures
         // are written. Answer with it, the same as a trailing expression.
         if interpretation.outcome.flow == ComptimeEvalFlow::Return {
+            if !return_is_value {
+                self.report_comptime_block_failure(
+                    "a `return` in it leaves the function, which a block that runs while \
+                     compiling cannot do",
+                    &span,
+                );
+                return ComptimeFold::Refused;
+            }
             return self.fold_value(interpretation.outcome.value.concrete, &span);
         }
         if interpretation.outcome.flow != ComptimeEvalFlow::Normal {
@@ -141,6 +178,67 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// A false assert on a path that always runs is E8002. Every other check that a block
+    /// cannot show to pass is E3033.
+    pub(crate) fn report_comptime_check_failure(&mut self, problem: &ComptimeCheckProblem) {
+        use ComptimeCheckProblemKind::*;
+        let why = match (&problem.check, problem.kind) {
+            (ComptimeCheck::Assert(message), Fails) => {
+                if self.speculating || self.consteval.closure_body_depth > 0 {
+                    return;
+                }
+                let message = message.as_deref().unwrap_or("Comptime assertion failed");
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E8002,
+                    format!("Comptime assert failed: {}", message),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(&problem.span)),
+                );
+                return;
+            }
+            (ComptimeCheck::Assert(_), MayFail) => {
+                "this assert is false on a path that depends on a value known only when the \
+                 program runs"
+            }
+            (ComptimeCheck::Assert(_), Undecided) => {
+                "this assert depends on a value known only when the program runs"
+            }
+            (ComptimeCheck::Division, Fails) => {
+                "this division stops the program: it divides by zero, or it divides the \
+                 minimum value by -1"
+            }
+            (ComptimeCheck::Division, MayFail) => {
+                "this division stops the program on a path that depends on a value known only \
+                 when the program runs"
+            }
+            (ComptimeCheck::Division, Undecided) => {
+                "this division depends on a value known only when the program runs, and it may \
+                 stop the program"
+            }
+        };
+        self.report_comptime_block_failure(why, &problem.span);
+    }
+
+    /// E8005, once. The checker's own evaluator may have reported it at the same loop.
+    pub(crate) fn report_comptime_loop_limit(&mut self, span: &Span) {
+        if self.speculating
+            || self.consteval.closure_body_depth > 0
+            || self
+                .errors
+                .has_error(crate::diagnostic::DiagnosticCode::E8005)
+        {
+            return;
+        }
+        self.errors.error_with_code(
+            crate::diagnostic::DiagnosticCode::E8005,
+            format!(
+                "compile-time evaluation ran more than {} loop iterations and was stopped. A \
+                 loop whose end condition is never reached is the usual cause.",
+                crate::hir::check_state::MAX_LOOP_STEPS
+            ),
+            Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
+        );
+    }
+
     fn report_comptime_block_failure(&mut self, why: &str, span: &Span) {
         // A closure body is not asked to fold where it is written -- its parameters have no
         // values yet. The call is what has to fold, and that is reported at the call.
@@ -173,6 +271,27 @@ impl<'a> TypeChecker<'a> {
     ///
     /// Only immutable values: numbers, booleans and arrays of them. Anything else has no
     /// spelling that survives to run time on its own.
+    /// Give each untyped number in a folded value the element type of `ty`. A whole number
+    /// such as 0.0 is written `0`, which is an `i32` without a type, and in an array that
+    /// first element made the whole array an `i32` array.
+    pub(crate) fn give_numbers_the_type(value: &mut Expr, ty: &Type) {
+        let elem = match ty {
+            Type::Scalar(elem) | Type::Tensor(elem, _, _) => elem,
+            _ => return,
+        };
+        match value {
+            Expr::Number(n) => {
+                n.ty.get_or_insert_with(|| elem.clone());
+            }
+            Expr::Array(array) => {
+                for element in &mut array.elements {
+                    Self::give_numbers_the_type(element, ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn value_to_expr(value: &Value, span: &Span) -> Option<Expr> {
         match value {
             Value::Int(i) => Some(Expr::Number(NumberExpr {
@@ -216,6 +335,7 @@ impl<'a> TypeChecker<'a> {
                 span: block_span,
             }) => {
                 let block_span = *block_span;
+                let return_is_value = std::mem::take(&mut self.consteval.comptime_return_is_value);
                 // What is known before the block runs. Its own `let`s live in the scope
                 // pushed below and are gone by the time the fold needs them, so the block
                 // is run again from here rather than read out of the checker's environment.
@@ -242,11 +362,17 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.consteval.comptime_depth -= 1;
                 self.pop_scope();
-                let folded = self.fold_comptime_block(stmts, ret.as_deref(), block_span, &before);
+                let folded = self.fold_comptime_block(
+                    stmts,
+                    ret.as_deref(),
+                    block_span,
+                    &before,
+                    return_is_value,
+                );
                 // An assertion the placement fold answered `true` is discharged here: nothing
-                // at run time holds a placement, so nothing is left to check. (A false one
-                // was reported by the assert check.) Asserts on anything else stay, as the
-                // program wrote them.
+                // at run time holds a placement, so nothing is left to check. (The fold
+                // reported a false one.) Asserts on anything else stay, as the program wrote
+                // them.
                 stmts.retain(|s| {
                     !matches!(s, Statement::Assert(a)
                         if matches!(&*a.expr, Expr::Identifier(id) if id.name.as_ref() == "true"))
@@ -260,11 +386,7 @@ impl<'a> TypeChecker<'a> {
                     // an untyped literal is an `i32` to the legacy code generator, which cut
                     // an `i64` like 20! down to its low 32 bits.
                     ComptimeFold::Folded(mut value) => {
-                        if let (Expr::Number(n), Type::Scalar(elem)) = (&mut *value, &ret_ty) {
-                            if n.ty.is_none() {
-                                n.ty = Some(elem.clone());
-                            }
-                        }
+                        Self::give_numbers_the_type(&mut value, &ret_ty);
                         *expr = *value
                     }
                     // It ran and produced nothing, so nothing is left to emit.
@@ -341,6 +463,48 @@ impl<'a> TypeChecker<'a> {
         })
     }
 
+    /// The values known after paths join: a value stays known only when every path leaves it
+    /// the same. Each path is the checker's scopes of known values at the join.
+    fn join_known_values(
+        paths: Vec<Vec<HashMap<crate::symbol::Symbol, Value>>>,
+    ) -> Vec<HashMap<crate::symbol::Symbol, Value>> {
+        let mut paths = paths.into_iter();
+        let mut joined = paths.next().unwrap_or_default();
+        for path in paths {
+            assert_eq!(
+                joined.len(),
+                path.len(),
+                "paths join at the same scope depth"
+            );
+            for (scope, other) in joined.iter_mut().zip(&path) {
+                scope.retain(|name, value| other.get(name) == Some(value));
+            }
+        }
+        joined
+    }
+
+    /// The value of an `if` condition when the checker knows it. A condition that calls a
+    /// function is not evaluated: the call could run a whole function body while checking.
+    fn known_condition(&self, cond: &Expr) -> Option<bool> {
+        fn calls_nothing(expr: &Expr) -> bool {
+            match expr {
+                Expr::Identifier(_) | Expr::Number(_) => true,
+                Expr::BinaryOp(op) => calls_nothing(&op.lhs) && calls_nothing(&op.rhs),
+                Expr::RelationalOp(op) => calls_nothing(&op.lhs) && calls_nothing(&op.rhs),
+                Expr::LogicalOp(op) => calls_nothing(&op.lhs) && calls_nothing(&op.rhs),
+                Expr::UnaryOp(op) => calls_nothing(&op.expr),
+                _ => false,
+            }
+        }
+        if !calls_nothing(cond) {
+            return None;
+        }
+        match self.eval_expr(cond, &self.consteval_snapshot()) {
+            Some(Value::Bool(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     pub(crate) fn check_if_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         let unused = std::mem::replace(&mut self.value_unused, false);
         let if_expr = match expr {
@@ -354,9 +518,11 @@ impl<'a> TypeChecker<'a> {
                 .push("Condition in if expression must be of type bool (i1)".to_string());
         }
 
+        let mut taken = None;
         if if_expr.is_comptime {
             let tmp_env = self.consteval_snapshot();
             if let Some(Value::Bool(b)) = self.eval_expr(&if_expr.cond, &tmp_env) {
+                taken = Some(b);
                 if b {
                     if_expr.else_block = None;
                 } else {
@@ -382,6 +548,9 @@ impl<'a> TypeChecker<'a> {
         if let Some(c) = &cond_fact {
             self.consteval.constraints.push(c.clone());
         }
+        // Each branch starts from the values known before the `if`, and the paths join after it.
+        let taken = taken.or_else(|| self.known_condition(&if_expr.cond));
+        let values_before = self.consteval.env.clone();
         self.push_releasing_scope();
         let mut then_ty = Type::Struct("void".into(), None);
         if !self.speculating && !if_expr.then_block.is_empty() {
@@ -396,6 +565,7 @@ impl<'a> TypeChecker<'a> {
                 .push(crate::hir::prover::negate(c));
         }
         let marks_after_then = self.branch_end(&if_expr.then_block);
+        let values_after_then = std::mem::replace(&mut self.consteval.env, values_before);
         self.restore_moved(marks_before.clone());
         let then_borrows = self.borrow.added_since(&borrows_before);
         self.borrow.forget(&then_borrows);
@@ -452,6 +622,12 @@ impl<'a> TypeChecker<'a> {
             .else_block
             .as_ref()
             .is_some_and(|b| self.branch_ends_early(b));
+        let values_after_else = std::mem::take(&mut self.consteval.env);
+        self.consteval.env = match (taken, then_ends, else_ends) {
+            (Some(true), _, _) | (None, false, true) => values_after_then,
+            (Some(false), _, _) | (None, true, false) => values_after_else,
+            (None, _, _) => Self::join_known_values(vec![values_after_then, values_after_else]),
+        };
         match (then_ends, else_ends) {
             (true, false) => self.consteval.constraints.extend(else_facts),
             (false, true) => self.consteval.constraints.extend(then_facts),
@@ -496,6 +672,7 @@ impl<'a> TypeChecker<'a> {
                 ret: ret_expr,
                 span,
                 generated,
+                ..
             }) => {
                 let block_span = *span;
                 let written = !*generated;
@@ -515,6 +692,18 @@ impl<'a> TypeChecker<'a> {
                 let declares_a_variable = stmts
                     .iter()
                     .any(|s| matches!(s, Statement::LetDecl(l) if !l.name.starts_with("$value")));
+                // A value nothing takes is the block's last statement, which the block drops
+                // as it drops `make();`.
+                if unused {
+                    if let Some(value) = ret_expr.take() {
+                        let span = value.span();
+                        stmts.push(Statement::ExprStmt(crate::syntax::stmt::ExprStmtStmt {
+                            expr: *value,
+                            has_semi: false,
+                            span,
+                        }));
+                    }
+                }
                 // `unsafe { let v = ..; v }`, as `vec![..]` writes: the block's drops are placed
                 // when its statements are checked, so the value is moved out of `v` by one of
                 // them, into a `$value` that owns nothing.
@@ -536,11 +725,10 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.push_scope();
                 self.value_unused = unused;
-                let mut ret_ty = self.check_expr_block(stmts, ret_expr.as_deref(), consume);
-                if let Some(r) = ret_expr {
-                    self.value_unused = unused;
-                    ret_ty = self.check_expr_type_flag(r, consume);
-                }
+                let ret_ty = match ret_expr {
+                    Some(r) => self.check_expr_block_with_value(stmts, r, unused, consume),
+                    None => self.check_expr_block(stmts, None, consume),
+                };
                 self.pop_scope();
                 if written {
                     // An error inside may hide the operation that needed `unsafe`, so only a
@@ -630,7 +818,10 @@ impl<'a> TypeChecker<'a> {
         if self.speculating {
             return;
         }
-        let Pattern::Literal(Expr::Number(n)) = pattern else {
+        let Pattern::Literal(lit) = pattern else {
+            return;
+        };
+        let Expr::Number(n) = &**lit else {
             return;
         };
         let elem = match expr_ty {
@@ -853,7 +1044,10 @@ impl<'a> TypeChecker<'a> {
                 // it cannot say which arm the code after the `match` came through.
                 let facts_before = self.consteval.constraints.len();
                 let mut every_arm_ends = !arms.is_empty();
+                let values_before = self.consteval.env.clone();
+                let mut values_after_arms = Vec::new();
                 for arm in arms {
+                    self.consteval.env = values_before.clone();
                     self.consteval.constraints.truncate(facts_before);
                     self.restore_moved(marks_before.clone());
                     let added = self.borrow.added_since(&borrows_before);
@@ -897,6 +1091,9 @@ impl<'a> TypeChecker<'a> {
                     };
                     self.pop_scope();
                     every_arm_ends &= self.branch_ends_early(&arm.body);
+                    if !self.branch_ends_early(&arm.body) {
+                        values_after_arms.push(self.consteval.env.clone());
+                    }
                     if let Some(after) = self.branch_end(&arm.body) {
                         joined = Some(match joined.take() {
                             Some(j) => Self::union_moved(j, after),
@@ -923,6 +1120,11 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.restore_moved(joined.unwrap_or(marks_before));
                 self.borrow.add_back(arm_borrows);
+                // With no `_` arm, the value may match no arm at all.
+                if !has_wildcard || values_after_arms.is_empty() {
+                    values_after_arms.push(values_before);
+                }
+                self.consteval.env = Self::join_known_values(values_after_arms);
                 self.consteval.constraints.truncate(facts_before);
                 if every_arm_ends {
                     self.consteval
@@ -998,6 +1200,11 @@ impl<'a> TypeChecker<'a> {
                 self.next_id += 1;
 
                 let cloned_params = e.params.clone();
+                // The `let` whose value this closure is. A `let` in the body changes the field.
+                let in_let = self
+                    .let_closure
+                    .take()
+                    .zip(self.current_assignment_target.clone());
 
                 let closure_depth = self.scopes.len();
                 self.mono.closure_depths.push(closure_depth);
@@ -1019,7 +1226,11 @@ impl<'a> TypeChecker<'a> {
                 self.consteval.closure_body_depth += 1;
                 // A `return` in the body leaves the closure, not the function around it.
                 self.drops_enter_function(Vec::new(), &[]);
+                self.traffic.closure_depth += 1;
+                self.consteval.comptime_return_is_value = matches!(*b, Expr::ComptimeBlock(_));
                 let expr_ret_ty = self.check_expr_type(&mut b);
+                self.consteval.comptime_return_is_value = false;
+                self.traffic.closure_depth -= 1;
                 self.drops_exit_function();
                 self.consteval.closure_body_depth -= 1;
                 self.consteval.comptime_depth = outer_comptime;
@@ -1047,6 +1258,14 @@ impl<'a> TypeChecker<'a> {
                         if matches!(ty, Type::Struct(_, _) | Type::Tensor(_, _, _)) {
                             self.consume(name.as_ref());
                         }
+                    }
+                    let copied: Vec<String> = captured_vars
+                        .iter()
+                        .filter(|(_, ty)| !matches!(ty, Type::Struct(_, _) | Type::Tensor(_, _, _)))
+                        .map(|(name, _)| name.to_string())
+                        .collect();
+                    if let Some((at, closure)) = in_let {
+                        self.note_closure_copies(closure, &copied, &at);
                     }
                 }
 
@@ -1100,6 +1319,7 @@ impl<'a> TypeChecker<'a> {
 
                 let call_func = decl::Function {
                     is_unsafe: false,
+                    is_pub: false,
                     name: func_name.clone().into(),
                     generics: vec![],
                     params: env_params,

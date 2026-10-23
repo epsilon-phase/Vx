@@ -41,6 +41,9 @@ const KNOWN_DECLINES: &[&str] = &[
     // `let u = if c { ..; };`: the flat path declines a `let` of a `void` value, with or
     // without `: void` ("a let with no type annotation"). The file is about the AST path.
     "backend/pass/if_else_with_no_value_bound_by_let.vx",
+    // A `match` that gives a `bool`: the flat path declines a match used as a value. The file
+    // is about the AST path.
+    "optimizations/pass/match_that_gives_a_bool.vx",
     // A struct passed to `grad`: the flat path declines it ("an autodiff argument that is not a
     // scalar"). The file is about the AST path.
     "backend/pass/autodiff/autodiff_for_variable_argument.vx",
@@ -188,6 +191,9 @@ const KNOWN_DECLINES: &[&str] = &[
     // `a && b` in a `print!` argument: the flat path declines it ("a logical operator lowers only
     // in memory mode"). The file is about the AST path.
     "frontend/pass/print_argument_with_and_or.vx",
+    // `p.v = o` stores a `Vec` into a struct field: the flat path declines "a store to a nested
+    // nominal field".
+    "frontend/pass/moved_variable_given_a_new_value.vx",
     // `c = a.clone()` inside a `spawn`: the flat path declines it ("a tensor given a new value
     // inside a branch or loop"). The kernel has to write `c` for `c` to be passed as a slot,
     // which is what the file checks.
@@ -337,6 +343,11 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
             // needs --host and --machine
             "optimizations/pass/dtcm_tiles_in_sibling_blocks_fit_a_cortex_m7.vx",
             "optimizations/pass/gpu_kernel_in_main_on_the_ast_code_generator.vx", // needs --machine
+            "optimizations/pass/gpu_register_tensor_stays_in_registers.vx",       // needs --machine
+            "optimizations/pass/register_tensor_loops_are_unrolled.vx",           // needs --machine
+            "optimizations/pass/gpu_kernel_stack_slots_keep_their_order.vx",      // needs --machine
+            "optimizations/pass/across_loops_run_in_order_on_the_cpu.vx",         // needs --machine
+            "optimizations/pass/across_kernels_that_pass_the_checks.vx",          // needs --machine
             "frontend/pass/packages/import_from_a_package.vx",                    // needs --package
         ];
         if NOT_STANDALONE.contains(&name.as_str()) {
@@ -495,12 +506,12 @@ fn flat_path_answers_match_the_backend_expectations() {
     let mut checked = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
-    // `read_dir` rather than the recursive `corpus_programs` above, because this must be
-    // the SAME corpus `run_backend_test` runs, and that walks the directory without
-    // descending. Subdirectories like backend/pass/autodiff/ are reached by their own RUN
-    // lines instead, and their `// EXPECT:` lines assert on emitted IR rather than on what
-    // the program printed -- recursing would quietly test a different thing against
-    // assertions that were never about program output.
+    // `read_dir` rather than the recursive `corpus_programs` above, because this must be the
+    // SAME corpus `run_expect_lines_on_the_ast_code_generator` runs, and that walks the
+    // directory without descending. Subdirectories like backend/pass/autodiff/ are reached by
+    // their own RUN lines instead, and their `// EXPECT:` lines assert on emitted IR rather
+    // than on what the program printed -- recursing would quietly test a different thing
+    // against assertions that were never about program output.
     let backend_dir = tests.join("backend/pass");
     let mut programs: Vec<PathBuf> = std::fs::read_dir(&backend_dir)
         .expect("tests/backend/pass is missing")
@@ -520,13 +531,14 @@ fn flat_path_answers_match_the_backend_expectations() {
         }
         let source = std::fs::read_to_string(&program).unwrap_or_default();
 
-        // The same gates `run_backend_test` applies, so the two harnesses agree on what a
-        // fixture has opted out of -- all but `// REQUIRES: flat-codegen`, which says the
-        // legacy path gets the answers wrong and is therefore a reason to run a file here,
-        // not to skip it. Every other `// REQUIRES:` is about which codegen path a
-        // program takes, which is this file's other test, not a reason to skip running one.
-        // `NO_EXEC` was the gate this loop first left out: a fixture that has never been run
-        // can carry EXPECT lines nothing has ever compared, and `matmul_bf16.vx` did.
+        // The same gates `run_expect_lines_on_the_ast_code_generator` applies, so the two
+        // harnesses agree on what a fixture has opted out of -- all but
+        // `// REQUIRES: flat-codegen`, which says the legacy path gets the answers wrong and is
+        // therefore a reason to run a file here, not to skip it. Every other `// REQUIRES:` is
+        // about which codegen path a program takes, which is this file's other test, not a
+        // reason to skip running one. `NO_EXEC` was the gate this loop first left out: a
+        // fixture that has never been run can carry EXPECT lines nothing has ever compared,
+        // and `matmul_bf16.vx` did.
         if source.contains("// NO_EXEC") {
             continue;
         }
@@ -575,8 +587,9 @@ fn flat_path_answers_match_the_backend_expectations() {
 
         // Both streams, because a fixture's expected output is not always on stdout --
         // ffi_stdio.vx writes deliberately to stderr, and an unwind message goes there too.
-        // `run_backend_test` sees one combined string from the in-process JIT, so checking
-        // only stdout here would fail programs the legacy path passes for no real reason.
+        // `run_expect_lines_on_the_ast_code_generator` sees one combined string from the
+        // in-process JIT, so checking only stdout here would fail programs the legacy path
+        // passes for no real reason.
         let out = format!("{}{}", String::from_utf8_lossy(&output.stdout), log);
         for expect in &expects {
             if !crate::integration_test::compile_test::expect_matches(&out, expect) {

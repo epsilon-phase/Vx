@@ -125,30 +125,60 @@ impl<'a> TypeChecker<'a> {
         tail: Option<&Expr>,
         consume: bool,
     ) -> Type {
+        self.check_block_and_value(stmts, tail, None, consume)
+    }
+
+    /// A block with a separate value, `v` in `unsafe { ..; v }`. The value is checked inside
+    /// the block, so what it uses or moves is seen before the block's drops are placed.
+    /// `unused`: nothing reads the block's value.
+    pub(crate) fn check_expr_block_with_value(
+        &mut self,
+        stmts: &mut Vec<Statement>,
+        value: &mut Expr,
+        unused: bool,
+        consume: bool,
+    ) -> Type {
+        self.check_block_and_value(stmts, None, Some((value, unused)), consume)
+    }
+
+    /// `tail` is a separate value checked after the block closes, and `value` one checked
+    /// inside it. A block has at most one of the two.
+    fn check_block_and_value(
+        &mut self,
+        stmts: &mut Vec<Statement>,
+        tail: Option<&Expr>,
+        value: Option<(&mut Expr, bool)>,
+        consume: bool,
+    ) -> Type {
+        let has_value = value.is_some();
+        let tail = tail.or(value.as_ref().map(|(v, _)| &**v));
         Self::name_loop_literals(stmts);
         self.hoist_spawn_allocations(stmts);
         let block_unused = std::mem::replace(&mut self.value_unused, false);
         let mut ret_ty = Type::Struct("void".into(), None);
         let mut terminated = false;
         let mut terminated_at = None;
+        let mut type_at_end = None;
+        let mut state_at_end = None;
         let last = stmts.len().saturating_sub(1);
         // An `if` or `match` arm is a block of its own: what it declares is dropped inside it,
         // and a borrow made in it ends at its last use there.
-        self.drops_enter_block(stmts);
+        self.drops_enter_block(stmts, tail);
         self.borrow.enter_block(Self::block_uses(stmts, tail));
 
         let mut declared = std::collections::HashMap::new();
         for (i, s) in stmts.iter_mut().enumerate() {
             self.borrow.set_stmt(i);
             self.drops_set_stmt(i);
-            if terminated && !self.speculating {
+            // Code that never runs is still checked, as rustc checks it, but it does not give
+            // the block its type.
+            if terminated && terminated_at == Some(i - 1) && !self.speculating {
                 let stmt_span = s.span();
                 self.errors.warn(
                     crate::diagnostic::DiagnosticCode::W1003,
                     "Unreachable code after return, break, or continue",
                     Some(crate::diagnostic::SourceSpan::from_ast_span(&stmt_span)),
                 );
-                break;
             }
             self.warn_if_declared_twice(s, &mut declared);
 
@@ -165,7 +195,12 @@ impl<'a> TypeChecker<'a> {
                 let before = self.consteval_snapshot();
                 let scopes = self.consteval_scopes();
                 let saved_borrows = self.borrow.snapshot();
-                self.value_unused = *has_semi || i != last || block_unused;
+                // With a `tail`, the last statement is not the block's value either.
+                self.value_unused = *has_semi || i != last || tail.is_some() || block_unused;
+                // `v;` reads `v`: it does not move it.
+                let consume =
+                    consume && !(self.value_unused && matches!(expr, Expr::Identifier(_)));
+                self.allow_spawn_statement(expr);
                 let ty = self.check_expr_type_flag(expr, consume);
                 if !*has_semi {
                     // A last expression that never finishes, `todo()`, gives the block the type
@@ -189,14 +224,33 @@ impl<'a> TypeChecker<'a> {
             }
 
             match s {
-                Statement::Return(_) | Statement::Break(_) | Statement::Continue(_) => {
+                Statement::Return(_) | Statement::Break(_) | Statement::Continue(_)
+                    if !terminated =>
+                {
                     terminated = true;
                     terminated_at = Some(i);
+                    type_at_end = Some(ret_ty.clone());
+                    state_at_end = Some(self.save_flow_state());
                 }
                 _ => {}
             }
         }
-        self.drops_exit_block(stmts, terminated_at);
+        let value_ty = value.map(|(value, unused)| {
+            self.borrow.set_stmt(stmts.len());
+            self.drops_set_stmt(stmts.len());
+            self.value_unused = unused;
+            self.check_expr_type_flag(value, consume)
+        });
+        if let Some(ty) = type_at_end {
+            ret_ty = ty;
+        }
+        if let Some(ty) = value_ty {
+            ret_ty = ty;
+        }
+        if let Some(state) = state_at_end {
+            self.restore_flow_state(state);
+        }
+        self.drops_exit_block(stmts, terminated_at, !block_unused && !has_value);
         self.borrow.exit_block();
         ret_ty
     }
@@ -272,7 +326,7 @@ impl<'a> TypeChecker<'a> {
                 // A comptime lambda runs while compiling, so its calls fold here. With every
                 // call folded the lambda is unused, and the `let` that bound it is dropped.
                 let span = expr.span();
-                self.fold_comptime_lambda_call(expr, &span);
+                self.fold_comptime_lambda_call(expr, &span, &ty);
                 ty
             }
             Expr::IndirectCall(..) => self.check_indirectcall_expr(expr, consume),
@@ -285,7 +339,10 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
             Expr::IndexAccess(..) => self.check_indexaccess_expr(expr, consume),
-            Expr::MethodCall(..) => self.check_methodcall_expr(expr, consume),
+            Expr::MethodCall(..) => match self.check_task_join(expr, consume && !value_unused) {
+                Some(ty) => ty,
+                None => self.check_methodcall_expr(expr, consume),
+            },
             Expr::BinaryOp(..) => self.check_binaryop_expr(expr, consume),
             Expr::RelationalOp(..) => self.check_relationalop_expr(expr),
             Expr::LogicalOp(..) => self.check_logicalop_expr(expr),
@@ -317,6 +374,10 @@ impl<'a> TypeChecker<'a> {
             Expr::UnsafeBlock(..) => {
                 self.value_unused = value_unused;
                 self.check_unsafeblock_expr(expr, consume)
+            }
+            Expr::TaskBlock(..) => {
+                self.value_unused = value_unused;
+                self.check_task_block_expr(expr, consume)
             }
             Expr::StructInit(..) => self.check_structinit_expr(expr, consume),
             Expr::Grad(..) => self.check_grad_expr(expr),
@@ -433,6 +494,12 @@ impl<'a> TypeChecker<'a> {
         if let (Some((t_inner, t_top)), Some((s_inner, s_top))) =
             (Self::located_parts(target), Self::located_parts(source))
         {
+            // A tensor fits where a smaller alignment is asked, not a larger one.
+            if let (Type::Tensor(_, _, Some(t)), Type::Tensor(_, _, Some(s))) = (target, source) {
+                if self.alignment_of(s) < self.alignment_of(t) {
+                    return false;
+                }
+            }
             return t_top == s_top && self.is_assignable(&t_inner, &s_inner);
         }
 

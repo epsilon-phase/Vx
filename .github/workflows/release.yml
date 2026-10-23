@@ -53,9 +53,11 @@ jobs:
       - name: Work out the version
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_VERSION" ]; then
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
           else
             echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
@@ -147,6 +149,8 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           # The suffix is passed rather than detected, so the artifact is named by the job that
@@ -157,7 +161,7 @@ jobs:
           else
             export VX_BUNDLE_ENZYME="$RUNNER_TEMP/enzyme/LLVMEnzyme-22.dylib"
           fi
-          VX_SKIP_BUILD=1 ./scripts/release/package.sh "${{ steps.version.outputs.version }}"
+          VX_SKIP_BUILD=1 ./scripts/release/package.sh "$VERSION"
 
       # A tarball that has never been unpacked anywhere but its build directory is not evidence
       # of anything. This unpacks it somewhere unrelated, points it at the LLVM on this runner
@@ -165,10 +169,13 @@ jobs:
       # not the checkout -- which is where the cwd-relative path bugs used to show up.
       - name: Smoke-test the packaged toolchain
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          target="${{ matrix.target }}"
+          version="$VERSION"
+          target="$TARGET"
           prefix="/tmp/vx-test/vx-${version}-${target}"
 
           mkdir -p /tmp/vx-test

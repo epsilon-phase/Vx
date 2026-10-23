@@ -16,6 +16,13 @@ use super::*;
 
 use crate::hir;
 use crate::hir::borrow_cx::BlockUses;
+
+/// See [`TypeChecker::save_flow_state`].
+pub(crate) struct FlowState {
+    moved: Vec<HashSet<String>>,
+    borrows: HashMap<crate::symbol::Symbol, Vec<crate::hir::env::BorrowRecord>>,
+    drops: crate::hir::check::drops::DropFrames,
+}
 use crate::hir::check_state::ComptimeEvalContext;
 use crate::hir::comptime_interpreter::{
     ComptimeFunctionBodies, ComptimeInterpreter, ComptimeObservation,
@@ -183,7 +190,7 @@ impl<'a> TypeChecker<'a> {
         }
 
         self.borrow.enter_block(uses);
-        self.drops_enter_block(body);
+        self.drops_enter_block(body, None);
 
         // A block is always checked for real, never speculatively. Force `speculating` off for the
         // loop so a block reached from *inside* a return-type probe (e.g. a generic function body
@@ -193,6 +200,7 @@ impl<'a> TypeChecker<'a> {
         self.speculating = false;
 
         let mut terminated_at = None;
+        let mut state_at_end = None;
         let mut declared = HashMap::new();
         if is_function_body {
             for name in self.borrow.current_params.keys() {
@@ -203,29 +211,52 @@ impl<'a> TypeChecker<'a> {
         for i in 0..body.len() {
             self.borrow.set_stmt(i);
             self.drops_set_stmt(i);
-            if terminated {
+            // Code that never runs is still checked, as rustc checks it. The warning is once
+            // per block.
+            if terminated && terminated_at == Some(i - 1) {
                 let stmt_span = body[i].span();
                 self.errors.warn(
                     crate::diagnostic::DiagnosticCode::W1003,
                     "Unreachable code after return, break, or continue",
                     Some(crate::diagnostic::SourceSpan::from_ast_span(&stmt_span)),
                 );
-                break; // Only warn once per block
             }
 
             self.warn_if_declared_twice(&body[i], &mut declared);
             self.check_statement(&mut body[i], return_type, true);
             match &body[i] {
-                Statement::Return(_) | Statement::Break(_) | Statement::Continue(_) => {
+                Statement::Return(_) | Statement::Break(_) | Statement::Continue(_)
+                    if !terminated =>
+                {
                     terminated = true;
                     terminated_at = Some(i);
+                    state_at_end = Some(self.save_flow_state());
                 }
                 _ => {}
             }
         }
-        self.drops_exit_block(body, terminated_at);
+        if let Some(state) = state_at_end {
+            self.restore_flow_state(state);
+        }
+        self.drops_exit_block(body, terminated_at, false);
         self.speculating = saved_speculating;
         self.borrow.exit_block();
+    }
+
+    /// What the checks after a `return`, `break` or `continue` change, but code that runs
+    /// must not see: moves, borrows and drop points.
+    pub(crate) fn save_flow_state(&self) -> FlowState {
+        FlowState {
+            moved: self.moved_snapshot(),
+            borrows: self.borrow.snapshot(),
+            drops: self.drops_save(),
+        }
+    }
+
+    pub(crate) fn restore_flow_state(&mut self, state: FlowState) {
+        self.restore_moved(state.moved);
+        self.borrow.restore(state.borrows);
+        self.drops_restore(state.drops);
     }
 
     /// W1005: `stmt` is a `let` of a name its block already declared, so the earlier value can no
@@ -320,11 +351,20 @@ impl<'a> TypeChecker<'a> {
         consume: bool,
     ) {
         match stmt {
+            Statement::LetDecl(decl) if crate::hir::check::tasks::is_spawn(&decl.expr) => {
+                self.check_spawn_let(decl, consume)
+            }
             Statement::LetDecl(decl) => self.check_let_decl_stmt(decl, consume),
             Statement::ForLoop(floop) => self.check_for_loop_stmt(floop, consume, return_type),
             Statement::Loop(lp) => self.check_loop_stmt(lp, return_type),
-            Statement::Break(b) => self.drops_exit("break", b.span.line, true),
-            Statement::Continue(c) => self.drops_exit("continue", c.span.line, true),
+            Statement::Break(b) => {
+                self.check_task_exit(&Statement::Break(b.clone()));
+                self.drops_exit("break", b.span.line, true)
+            }
+            Statement::Continue(c) => {
+                self.check_task_exit(&Statement::Continue(c.clone()));
+                self.drops_exit("continue", c.span.line, true)
+            }
             Statement::Assign(AssignStmt { lhs, rhs, span: _ }) => {
                 self.check_assign_stmt(lhs, None, rhs, consume, None)
             }
@@ -339,6 +379,7 @@ impl<'a> TypeChecker<'a> {
                 self.check_assign_stmt(lhs, Some(&op), rhs, consume, Some(operand_ty))
             }
             Statement::Return(ret) => {
+                self.check_task_exit(&Statement::Return(ret.clone()));
                 if self.check_return_stmt(ret, consume, return_type) {
                     // `return todo()`: the call never finishes, so nothing is returned. Keep the
                     // call as a statement, which the code generators end the block after.
@@ -363,6 +404,9 @@ impl<'a> TypeChecker<'a> {
                 let scopes = self.consteval_scopes();
                 let saved_borrows = self.borrow.snapshot();
                 self.value_unused = true;
+                // `v;` reads `v`: it does not move it.
+                let consume = consume && !matches!(expr, Expr::Identifier(_));
+                self.allow_spawn_statement(expr);
                 self.check_expr_type_flag(expr, consume);
                 self.restore_borrows_keeping_held(saved_borrows);
                 self.settle_mut_borrow_call(expr, &before, &scopes);
@@ -378,7 +422,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Check a `let` binding: type the initializer, bind the name (annotation wins), record the
     /// binding's reference provenance (#243), and register an equality constraint for an immutable.
-    fn check_let_decl_stmt(&mut self, decl: &mut LetDeclStmt, consume: bool) {
+    pub(crate) fn check_let_decl_stmt(&mut self, decl: &mut LetDeclStmt, consume: bool) {
         let LetDeclStmt {
             name,
             is_mut: _is_mut,
@@ -405,7 +449,10 @@ impl<'a> TypeChecker<'a> {
         let from_literal = ty_ann.is_none() && matches!(bare, Expr::Number(n) if n.ty.is_none());
         let prev_expected = self.expected_type.take();
         self.expected_type = ty_ann.clone();
+        self.let_closure = matches!(&*expr, Expr::Closure(_)).then_some(*span);
         let ty = self.check_expr_type_flag(expr, consume);
+        self.let_closure = None;
+        let ty = crate::hir::check::operators::round_narrow_arithmetic(expr, ty, ty_ann.as_ref());
         self.expected_type = prev_expected;
         self.current_assignment_target = None;
 
@@ -461,6 +508,7 @@ impl<'a> TypeChecker<'a> {
             if !memory_already_recorded {
                 self.check_type_placement(ann, &context, span);
             }
+            self.shadow_borrows(name);
             self.insert(name.to_string(), ann.clone());
             ann.clone()
         } else {
@@ -471,6 +519,7 @@ impl<'a> TypeChecker<'a> {
             if !memory_already_recorded {
                 self.check_type_placement(&ty, &context, span);
             }
+            self.shadow_borrows(name);
             self.insert(name.to_string(), ty.clone());
             let depth = self.current_scope_depth();
             if from_literal {
@@ -489,6 +538,16 @@ impl<'a> TypeChecker<'a> {
             if !self.speculating {
                 self.borrow
                     .copy_borrows(from.name.as_ref(), name.as_ref(), self.scopes.len());
+                self.reborrow_mut_variable(from.name.as_ref(), name.as_ref());
+            }
+        }
+        // `let w = h.r` copies a reference out of `h`, so `w` holds what `h` holds.
+        if let Expr::MemberAccess(_) = &*expr {
+            if let Some((root, _)) = Self::extract_base_and_path(expr) {
+                if !self.speculating && Self::is_ref_type(&binding_ty) {
+                    self.borrow
+                        .copy_borrows(&root, name.as_ref(), self.scopes.len());
+                }
             }
         }
 
@@ -617,8 +676,27 @@ impl<'a> TypeChecker<'a> {
             body,
             span: loop_span,
             next_fn,
+            unroll,
+            across,
         } = floop;
         let loop_span = *loop_span;
+        // The `n` of `across blocks(n)` is a count, as a loop bound is.
+        if let Some(a) = across.as_mut() {
+            let at = a.span;
+            if let Some(n) = a.share.as_deref_mut() {
+                let ty = self.check_expr_type_flag(n, false);
+                if ty != Type::Scalar(ElementType::I32) && ty != Type::Unknown {
+                    self.errors.error_with_code(
+                        crate::diagnostic::DiagnosticCode::E6032,
+                        format!(
+                            "the count of an `across` loop is an `i32`, as a loop bound is, not \
+                             `{ty}`"
+                        ),
+                        Some(crate::diagnostic::SourceSpan::from_ast_span(&at)),
+                    );
+                }
+            }
+        }
         // `for x in t` over a tensor reads it by index: `for $i in 0..t.len() { let x = t[$i]; .. }`.
         // A tensor of rank 2 or more gives its rows.
         if matches!(&**iterable, Expr::Array(_))
@@ -895,13 +973,39 @@ impl<'a> TypeChecker<'a> {
         let scopes = self.consteval_scopes();
 
         let marks_before = self.moved_snapshot();
-        self.borrow.loop_exits.push(Default::default());
+        self.borrow
+            .loop_exits
+            .push(crate::hir::borrow_cx::LoopExits {
+                changed_before: std::mem::take(&mut self.changed_vars),
+                ..Default::default()
+            });
         self.drops_enter_loop();
         let header = LoopHeader {
             binds: Some(iter.as_str()),
             evaluates: Some(&**iterable),
         };
+        let bounds = match &**iterable {
+            Expr::Range(r) if !crate::hir::check::raw::body_reassigns(body, iter) => {
+                match (
+                    self.eval_expr(&r.start, &before),
+                    self.eval_expr(&r.end, &before),
+                ) {
+                    (Some(Value::Int(lo)), Some(Value::Int(hi))) => Some((lo, hi)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        self.unroll_candidates
+            .push(crate::hir::env::UnrollCandidate {
+                var: iter.as_str().into(),
+                bounds,
+                used: false,
+            });
         self.check_loop_body(body, return_type, header);
+        if let Some(c) = self.unroll_candidates.pop().filter(|c| c.used) {
+            *unroll = c.bounds;
+        }
         self.drops_exit_loop();
         self.settle_loop_moves(marks_before, outer_depth, body, &loop_span);
 
@@ -939,6 +1043,9 @@ impl<'a> TypeChecker<'a> {
     ) {
         let end = self.branch_end(body);
         let exits = self.borrow.loop_exits.pop().expect("pushed by the loop");
+        let changed_in_loop = std::mem::replace(&mut self.changed_vars, exits.changed_before);
+        self.changed_vars.extend(changed_in_loop.iter().cloned());
+        self.check_tasks_in_loop(outer_depth, &changed_in_loop, span);
         let next_pass = [end.clone(), exits.at_continue.clone()]
             .into_iter()
             .flatten()
@@ -998,7 +1105,12 @@ impl<'a> TypeChecker<'a> {
         let scopes = self.consteval_scopes();
 
         let marks_before = self.moved_snapshot();
-        self.borrow.loop_exits.push(Default::default());
+        self.borrow
+            .loop_exits
+            .push(crate::hir::borrow_cx::LoopExits {
+                changed_before: std::mem::take(&mut self.changed_vars),
+                ..Default::default()
+            });
         self.drops_enter_loop();
         let header = LoopHeader {
             binds: None,
@@ -1069,11 +1181,15 @@ impl<'a> TypeChecker<'a> {
     /// Refuse writing to a variable, or a field or element of it, while a `&` borrow of that
     /// part is still used afterwards (E4009): the borrow would see the value change under it.
     /// A live `&mut` borrow is already refused as a use of the variable (E4002).
-    fn check_assign_while_borrowed(&mut self, lhs: &Expr) {
+    /// `joined` holds the tasks that the right side joins before the write.
+    fn check_assign_while_borrowed(&mut self, lhs: &Expr, joined: &[String]) {
         if self.speculating || self.borrow.skip_borrow_check {
             return;
         }
-        let Some((root, path)) = Self::extract_base_and_path(lhs) else {
+        // `*m = v` writes what `m` points at, which `&*m` borrowed.
+        let direct = Self::extract_base_and_path(lhs);
+        let through_deref = direct.is_none();
+        let Some((root, path)) = direct.or_else(|| self.reborrow_base_and_path(lhs)) else {
             return;
         };
         let shared = self
@@ -1081,18 +1197,26 @@ impl<'a> TypeChecker<'a> {
             .live_borrows(&root)
             .iter()
             // A borrow with no borrower is a temporary, `f(&x)`, over by the end of its statement.
-            .any(|b| {
+            .find(|b| {
                 !b.is_mut
-                    && b.borrower_name.is_some()
+                    && b.borrower_name.as_deref().is_some_and(|n| {
+                        !joined
+                            .iter()
+                            .any(|t| n.split('/').next() == Some(t.as_str()))
+                    })
                     && crate::hir::places::paths_may_alias(&path, &b.path)
-            });
-        if shared {
-            let place = crate::hir::places::display_place(&root, &path);
+            })
+            .map(crate::hir::check::tasks::held_by_task_note);
+        if let Some(note) = shared {
+            let mut place = crate::hir::places::display_place(&root, &path);
+            if through_deref {
+                place = format!("*{place}");
+            }
             self.errors.error_with_code(
                 crate::diagnostic::DiagnosticCode::E4009,
                 format!(
                     "`{place}` is assigned while it is borrowed, and the borrow is used after the \
-                     assignment"
+                     assignment.{note}"
                 ),
                 Some(crate::diagnostic::SourceSpan::from_ast_span(&lhs.span())),
             );
@@ -1116,6 +1240,7 @@ impl<'a> TypeChecker<'a> {
         // value the name no longer owns; both stay refused.
         let mut owner_before = None;
         let mut moved_fields_before = Vec::new();
+        let moved_before = self.moved_snapshot();
         if op.is_none() {
             if let Expr::Identifier(id) = lhs {
                 owner_before = self.drops_owner_state(id.name.as_ref());
@@ -1130,7 +1255,8 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        self.check_assign_while_borrowed(lhs);
+        let joined = self.tasks_joined_in(rhs);
+        self.check_assign_while_borrowed(lhs, &joined);
         self.record_change(lhs);
         if let Some(root) = self.read_only_root(lhs) {
             self.report_read_only(&root, "it cannot be assigned", &lhs.span());
@@ -1202,8 +1328,28 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         }
+        // The right-hand side is read before the write, so `o = o` still reads a moved `o`.
+        self.restore_moved(moved_before);
+        // `r = v` gives `r` a new value, so the borrows `r` held end, unless `v` reads `r`.
+        if let (None, Expr::Identifier(id)) = (op, &*lhs) {
+            let mut reads_target = false;
+            crate::syntax::visit_expr(rhs, &mut |e| {
+                reads_target |= matches!(e, Expr::Identifier(i) if i.name == id.name);
+            });
+            if !reads_target && !self.speculating {
+                let held: Vec<_> = self
+                    .borrow
+                    .snapshot()
+                    .into_iter()
+                    .flat_map(|(base, records)| records.into_iter().map(move |r| (base.clone(), r)))
+                    .filter(|(_, r)| r.borrower_name.as_deref() == Some(id.name.as_ref()))
+                    .collect();
+                self.borrow.forget(&held);
+            }
+        }
         let mut rhs_ty =
             self.check_expr_expecting(rhs, Some(lhs_ty.clone()), consume && !copies_into_tensor);
+        rhs_ty = crate::hir::check::operators::round_narrow_arithmetic(rhs, rhs_ty, Some(&lhs_ty));
         self.current_assignment_target = None;
         // `*r = &mut y`, with `r` bound to `&mut x`: `r` reaches the borrows `x` now holds.
         if let (Some(var), Expr::Dereference(d)) = (self.store_target_var_of(lhs), &*lhs) {
@@ -1244,6 +1390,9 @@ impl<'a> TypeChecker<'a> {
                 let depth = self.scope_depth_of(&id.name);
                 self.reach_borrows_of(&id.name, rhs, depth);
             } else {
+                if let Some((root, path)) = Self::extract_base_and_path(lhs) {
+                    self.unconsume_field(&root, &path);
+                }
                 self.drops_note_place_assign(lhs, &lhs_ty, lhs.span().line, &moved_fields_before);
             }
         }
@@ -1252,8 +1401,24 @@ impl<'a> TypeChecker<'a> {
             if !self.check_restricted_operands(op, &lhs_ty, &rhs_ty, &span) {
                 return;
             }
+            let narrow = [&lhs_ty, &rhs_ty]
+                .iter()
+                .find_map(|t| Self::scalar_elem(t).filter(|e| e.is_narrow_float()));
+            if let Some(elem) = narrow {
+                let symbol = crate::hir::check::operators::binary_op_symbol(op);
+                self.errors.error_with_code(
+                    crate::diagnostic::DiagnosticCode::E3052,
+                    format!(
+                        "`{symbol}=` on `{elem}` values is not supported. Write `x = x {symbol} y`, \
+                         which computes in f32 and rounds once to the type of `x`"
+                    ),
+                    Some(crate::diagnostic::SourceSpan::from_ast_span(&span)),
+                );
+                return;
+            }
         }
-        if !self.is_assignable(&lhs_ty, &rhs_ty) {
+        // A moved variable reads as `Unknown`, and E4001 already reported it.
+        if rhs_ty != Type::Unknown && !self.is_assignable(&lhs_ty, &rhs_ty) {
             // Named types and a location, like every other type error: this fires on a
             // narrowing store into half storage, where the fix is to write the `as` the
             // language requires rather than to guess what was meant.
@@ -1286,13 +1451,41 @@ impl<'a> TypeChecker<'a> {
             );
         }
 
+        // A fact the prover holds about the assigned variable stops being true here. A write to
+        // a field, an element or through a pointer drops every fact about the variable.
+        fn assigned_root(place: &Expr) -> Option<&crate::symbol::Symbol> {
+            match place {
+                Expr::Identifier(id) => Some(&id.name),
+                Expr::IndexAccess(access) => assigned_root(&access.base),
+                Expr::MemberAccess(access) => assigned_root(&access.base),
+                Expr::Dereference(deref) => assigned_root(&deref.expr),
+                _ => None,
+            }
+        }
+        if let Some(root) = assigned_root(lhs) {
+            self.neutralize_facts_mentioning(root.as_ref());
+        }
         // Keep the compile-time value of the assigned variable in step with the assignment.
         // An assignment the evaluator cannot compute makes the variable unknown rather than
         // leaving the previous value behind, which later reads would report as a certainty.
+        // `x op= v` gives `x` the value of `x op v`.
+        let assigned = match op {
+            Some(op) => Expr::BinaryOp(BinaryOpExpr {
+                lhs: Box::new(lhs.clone()),
+                op: op.clone(),
+                rhs: Box::new(rhs.clone()),
+                span: Span::default(),
+                operand_ty: match &lhs_ty {
+                    Type::Scalar(elem) => Some(elem.clone()),
+                    _ => None,
+                },
+            }),
+            None => rhs.clone(),
+        };
         match lhs {
             Expr::Identifier(IdentifierExpr { name, span: _ }) => {
                 let tmp_env = self.consteval_snapshot();
-                let new_val = self.eval_expr(rhs, &tmp_env);
+                let new_val = self.eval_expr(&assigned, &tmp_env);
                 if let Some(scope) = self.consteval_scope_of(name.as_ref()) {
                     let env = &mut self.consteval.env[scope];
                     match new_val {
@@ -1322,7 +1515,7 @@ impl<'a> TypeChecker<'a> {
                         None
                     };
                     let new_val = if direct {
-                        self.eval_expr(rhs, &tmp_env)
+                        self.eval_expr(&assigned, &tmp_env)
                     } else {
                         None
                     };
@@ -1550,7 +1743,10 @@ impl<'a> TypeChecker<'a> {
 
         let prev_expected = self.expected_type.take();
         self.expected_type = Some(return_type.clone());
+        self.consteval.comptime_return_is_value = matches!(&*expr, Expr::ComptimeBlock(_));
         let ty = self.check_expr_type_flag(expr, consume);
+        self.consteval.comptime_return_is_value = false;
+        let ty = crate::hir::check::operators::round_narrow_arithmetic(expr, ty, Some(return_type));
         self.expected_type = prev_expected;
         self.drops_exit("return", span.line, false);
 
@@ -1639,6 +1835,11 @@ impl<'a> TypeChecker<'a> {
         }
 
         let is_verified = matches!(return_type, Type::Verified(_));
+        // The `comptime` interpreter decides an assert inside a `comptime` block, when the
+        // block is folded.
+        if self.consteval.comptime_depth > 0 && !is_verified {
+            return;
+        }
         let mut tmp_env = HashMap::new();
         for env in &self.consteval.env {
             for (k, v) in env {
@@ -1796,7 +1997,8 @@ impl<'a> TypeChecker<'a> {
                 if !is_float {
                     return n_str.parse::<i64>().ok().map(Value::Int);
                 }
-                n_str.parse::<f64>().ok().map(Value::Number)
+                let value = n_str.parse::<f64>().ok()?;
+                ComptimeInterpreter::round_float(value, ty.as_ref()).map(Value::Number)
             }
             // `Reachable<A, B>`: true iff a transfer path exists in the cost graph. Topology
             // variables have already been substituted during monomorphization.
@@ -1831,22 +2033,33 @@ impl<'a> TypeChecker<'a> {
             }
 
             Expr::Identifier(IdentifierExpr { name: n, span: _ }) => env.get(n.as_ref()).cloned(),
-            Expr::BinaryOp(BinaryOpExpr { lhs, op, rhs, .. }) => {
+            Expr::BinaryOp(BinaryOpExpr {
+                lhs,
+                op,
+                rhs,
+                operand_ty,
+                ..
+            }) => {
                 let l = self.eval_expr(lhs, env)?;
                 let r = self.eval_expr(rhs, env)?;
                 // Two integers stay integers, so `/` truncates the way the emitted code does
-                // and a large value keeps every bit. A result that overflows has no value
-                // rather than a wrapped one, which would be baked into the program unnoticed.
+                // and a large value keeps every bit. A result outside the operands' type has no
+                // value rather than a wrapped one, which would be baked into the program
+                // unnoticed. So has a zero divisor, and the minimum value divided by -1.
                 if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
                     let (a, b) = (*a, *b);
+                    let range = operand_ty
+                        .as_ref()
+                        .and_then(ComptimeInterpreter::integer_range)
+                        .unwrap_or(crate::hir::comptime_interpreter::I64_RANGE);
                     return match op {
-                        BinaryOp::Add => a.checked_add(b).map(Value::Int),
-                        BinaryOp::Sub => a.checked_sub(b).map(Value::Int),
-                        BinaryOp::Mul => a.checked_mul(b).map(Value::Int),
-                        // The checked forms answer None for a zero divisor, and for the one
-                        // signed division that overflows.
-                        BinaryOp::Div => a.checked_div(b).map(Value::Int),
-                        BinaryOp::Rem => a.checked_rem(b).map(Value::Int),
+                        BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Rem => {
+                            ComptimeInterpreter::integer_op(a, b, op, range).map(Value::Int)
+                        }
                         // The bit pattern is exact now, but `>>` reads it one way for a
                         // signed type and another for an unsigned one, and this value does
                         // not record which it came from. Left unfolded until it does.
@@ -1861,12 +2074,15 @@ impl<'a> TypeChecker<'a> {
                 // Anything else numeric is float arithmetic, an integer mixed with a float
                 // included.
                 let (a, b) = (l.as_f64()?, r.as_f64()?);
+                let round = |x: f64| {
+                    ComptimeInterpreter::round_float(x, operand_ty.as_ref()).map(Value::Number)
+                };
                 match op {
-                    BinaryOp::Add => Some(Value::Number(a + b)),
-                    BinaryOp::Sub => Some(Value::Number(a - b)),
-                    BinaryOp::Mul => Some(Value::Number(a * b)),
-                    BinaryOp::Div => Some(Value::Number(a / b)),
-                    BinaryOp::Rem => (b != 0.0).then(|| Value::Number(a % b)),
+                    BinaryOp::Add => round(a + b),
+                    BinaryOp::Sub => round(a - b),
+                    BinaryOp::Mul => round(a * b),
+                    BinaryOp::Div => round(a / b),
+                    BinaryOp::Rem => (b != 0.0).then(|| round(a % b)).flatten(),
                     // A bit pattern read out of an `f64` would not be the bit pattern the
                     // program is talking about. Left unfolded rather than folded wrongly.
                     BinaryOp::BitAnd
@@ -2244,16 +2460,9 @@ impl<'a> TypeChecker<'a> {
         args: &[Expr],
         env: &HashMap<crate::symbol::Symbol, Value>,
     ) -> Option<Value> {
-        eprintln!("[ic] indirect call, callee = {:?}", callee);
         let Expr::Identifier(IdentifierExpr { name, span: _ }) = callee else {
             return None;
         };
-        eprintln!(
-            "[ic] name={:?} body={:?}",
-            name.as_ref(),
-            self.closure_call_body(name.as_ref())
-                .map(|f| f.name.to_string())
-        );
         let func = self.closure_call_body(name.as_ref())?;
         // The first parameter is the captured environment, which the call does not write.
         let skip = func.params.len().checked_sub(args.len())?;
@@ -2559,15 +2768,22 @@ impl<'a> TypeChecker<'a> {
                 body,
                 span: _,
                 next_fn: _,
+                unroll: _,
+                across: _,
             }) => self.eval_for_loop(iter, iterable, body, env),
             Statement::Loop(LoopStmt {
                 body,
                 invariants: _,
                 span: _,
             }) => self.eval_loop(body, env),
-            // Already checked and discharged by `check_assert_stmt`, and it produces no
-            // value, so there is nothing left for the evaluator to do with it.
-            Statement::Assert(_) => EvalFlow::Normal,
+            // The program goes on past an assert only when it holds, so a run that cannot
+            // show it true gives no value.
+            Statement::Assert(assert) => {
+                if !matches!(self.eval_expr(&assert.expr, env), Some(Value::Bool(true))) {
+                    self.consteval.unsupported_stmt.set(true);
+                }
+                EvalFlow::Normal
+            }
             Statement::Break(_) => EvalFlow::Break,
             Statement::Continue(_) => EvalFlow::Continue,
             // A call written as a statement. It is run only when it writes through a

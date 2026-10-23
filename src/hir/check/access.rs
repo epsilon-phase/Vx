@@ -16,6 +16,9 @@
 use super::super::*;
 use std::collections::HashMap;
 
+/// The most passes of one loop that the compiler unrolls for a register tensor.
+const MAX_UNROLLED_PASSES: i64 = 1024;
+
 impl<'a> TypeChecker<'a> {
     /// Whether a type opts out of being moved by implementing `Copy`.
     ///
@@ -107,8 +110,15 @@ impl<'a> TypeChecker<'a> {
             }));
         }
         let mut visiting = vec![decl.name.clone()];
-        let value = match self.const_value(&decl.expr, &mut visiting) {
+        let value = match self.const_value(&Self::typed_const_expr(decl), &mut visiting) {
             Some(value) => value,
+            // Worked out in 64 bits, a value that its own type cannot hold.
+            None if self
+                .const_value(&decl.expr, &mut vec![decl.name.clone()])
+                .is_some() =>
+            {
+                return report(self, "has a value that does not fit its declared type")
+            }
             None => {
                 return report(
                     self,
@@ -138,6 +148,32 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// The expression of `decl`, with its declared type on each number and arithmetic operation
+    /// that has none, so that the arithmetic is done at that type.
+    fn typed_const_expr(decl: &crate::syntax::ConstDecl) -> Expr {
+        fn give(expr: &mut Expr, elem: &ElementType) {
+            match expr {
+                Expr::BinaryOp(op) => {
+                    op.operand_ty.get_or_insert_with(|| elem.clone());
+                    give(&mut op.lhs, elem);
+                    give(&mut op.rhs, elem);
+                }
+                Expr::UnaryOp(op) => give(&mut op.expr, elem),
+                Expr::Number(n) => {
+                    n.ty.get_or_insert_with(|| elem.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut expr = decl.expr.clone();
+        if let Type::Scalar(elem) = &decl.ty {
+            if *elem != ElementType::Bool {
+                give(&mut expr, elem);
+            }
+        }
+        expr
+    }
+
     /// `expr` evaluated while compiling, with the values of the `const`s it names. `visiting`
     /// holds the `const`s being evaluated, so one defined through itself has no value.
     fn const_value(&self, expr: &Expr, visiting: &mut Vec<crate::symbol::Symbol>) -> Option<Value> {
@@ -150,7 +186,7 @@ impl<'a> TypeChecker<'a> {
             }
             if let Some(decl) = self.env.consts.get(&name).copied() {
                 visiting.push(name.clone());
-                let value = self.const_value(&decl.expr, visiting);
+                let value = self.const_value(&Self::typed_const_expr(decl), visiting);
                 visiting.pop();
                 env.insert(name, value?);
             }
@@ -170,7 +206,7 @@ impl<'a> TypeChecker<'a> {
         {
             return None;
         }
-        match self.const_value(&decl.expr, &mut vec![name.clone()])? {
+        match self.const_value(&Self::typed_const_expr(decl), &mut vec![name.clone()])? {
             Value::Int(i) => Some(i),
             _ => None,
         }
@@ -299,48 +335,6 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
-    /// W1034: code on the built-in GPU uses `name`, a tensor in host memory. The built-in GPU
-    /// lists host memory as visible, so the use is allowed, but a kernel given a host pointer
-    /// may reach it over the host link or fault, depending on the driver.
-    fn warn_host_tensor_on_gpu(
-        &mut self,
-        name: &crate::symbol::Symbol,
-        ty: &Type,
-        top: &Topology,
-        span: &crate::syntax::Span,
-    ) {
-        if !matches!(self.active_topology, Topology::GPU(_)) {
-            return;
-        }
-        let space = match ty {
-            Type::Tensor(..) => self.value_memory_space(ty, top),
-            Type::Borrow {
-                inner, mem_space, ..
-            } if matches!(**inner, Type::Tensor(..)) => match mem_space {
-                Some(m) => m.clone(),
-                None => self.value_memory_space(inner, top),
-            },
-            _ => return,
-        };
-        if space != crate::syntax::MemorySpace::CPUDRAM
-            || !self.host_reads_warned.insert(name.clone())
-        {
-            return;
-        }
-        self.errors.warn(
-            crate::diagnostic::DiagnosticCode::W1034,
-            format!(
-                "'{}' lives in host memory (CPU_DRAM) but is used on {}; a GPU kernel may reach it \
-                 over the host link or fault, depending on the driver. Transfer it first: \
-                 `transfer({}, Memory::GPU_HBM)`",
-                name,
-                self.active_topology.display_name(),
-                name
-            ),
-            Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
-        );
-    }
-
     pub(crate) fn check_identifier_expr(&mut self, expr: &mut Expr, consume: bool) -> Type {
         match expr {
             Expr::Identifier(id) => {
@@ -355,6 +349,7 @@ impl<'a> TypeChecker<'a> {
 
                 // Track variable usage for W1001/W1009 diagnostics
                 self.used_vars.insert(name.clone());
+                self.note_task_use(name.as_ref(), &span);
 
                 if !self.borrow.skip_borrow_check && !self.speculating {
                     // NLL: a borrow whose borrower is dead past this access no longer conflicts, so a
@@ -364,7 +359,11 @@ impl<'a> TypeChecker<'a> {
                         if b.is_mut {
                             self.errors.error_with_code(
                                 crate::diagnostic::DiagnosticCode::E4002,
-                                format!("Cannot access '{}' because it is mutably borrowed.", name),
+                                format!(
+                                    "Cannot access '{}' because it is mutably borrowed.{}",
+                                    name,
+                                    crate::hir::check::tasks::held_by_task_note(b)
+                                ),
                                 Some(crate::diagnostic::SourceSpan::from_ast_span(&span)),
                             );
                             break;
@@ -526,16 +525,20 @@ impl<'a> TypeChecker<'a> {
                         // Enforce Topology Boundaries! A reference to a placed tensor is only a
                         // pointer, so naming it reads nothing; indexing and `print` check the
                         // tensor's placement where the data is read.
+                        // A scalar that nothing can write goes to a device region by value, as
+                        // a launch parameter, so where it lives does not matter. A reference to
+                        // it would still point into the memory where it lives.
+                        let by_value = matches!(ty, Type::Scalar(_))
+                            && !self.is_mutable(name.as_ref())
+                            && self.borrowed_name != Some(span);
                         let is_valid = matches!(&ty, Type::Borrow { inner, .. } if inner.placement().is_some())
+                            || by_value
                             || self.transfer_cost_graph.is_type_accessible(
                                 &self.active_topology,
                                 &top,
                                 &ty,
                             );
 
-                        if is_valid && !self.speculating {
-                            self.warn_host_tensor_on_gpu(&name, &ty, &top, &span);
-                        }
                         if !is_valid {
                             let is_pinned_on_host = matches!(ty, Type::Pinned(_, _))
                                 && matches!(self.active_topology, Topology::CPU);
@@ -847,8 +850,9 @@ impl<'a> TypeChecker<'a> {
                                 self.errors.error_with_code(
                                     crate::diagnostic::DiagnosticCode::E4002,
                                     format!(
-                                        "Cannot access '{}' because it is mutably borrowed.",
-                                        name
+                                        "Cannot access '{}' because it is mutably borrowed.{}",
+                                        name,
+                                        crate::hir::check::tasks::held_by_task_note(b)
                                     ),
                                     Some(crate::diagnostic::SourceSpan::from_ast_span(&ma_span)),
                                 );
@@ -1135,6 +1139,116 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Whether a tensor placed in `placement` must stay in registers: its space is declared
+    /// `scope: thread`.
+    pub(crate) fn is_register_space(&self, placement: Option<&crate::syntax::Placement>) -> bool {
+        let Some(p) = placement else {
+            return false;
+        };
+        let crate::syntax::MemorySpace::Custom(name) = &p.space else {
+            return false;
+        };
+        self.env
+            .memories
+            .values()
+            .any(|m| m.name == *name && m.scope == Some(crate::syntax::Scope::Thread))
+    }
+
+    /// A tensor in a `scope: thread` space stays in registers, and a register has no address.
+    /// So each index must be a constant, or made of constants and the variables of `for` loops
+    /// with constant bounds. Such a loop is marked, and the code generator unrolls it.
+    fn check_register_index(&mut self, base: &Expr, idx: &Expr, ix_span: &crate::syntax::Span) {
+        if self.speculating {
+            return;
+        }
+        let env = self.consteval_snapshot();
+        if matches!(self.eval_expr(idx, &env), Some(Value::Int(_))) {
+            return;
+        }
+        let mut names = Vec::new();
+        let unknown = !Self::index_names(idx, &mut names);
+        let mut why = None;
+        for name in &names {
+            let constant = matches!(
+                self.eval_expr(
+                    &Expr::Identifier(crate::syntax::expr::IdentifierExpr {
+                        name: name.clone(),
+                        span: *ix_span,
+                    }),
+                    &env
+                ),
+                Some(Value::Int(_))
+            );
+            if constant {
+                continue;
+            }
+            let candidate = self
+                .unroll_candidates
+                .iter_mut()
+                .rev()
+                .find(|c| c.var == *name);
+            match candidate {
+                Some(c) => match c.bounds {
+                    Some((lo, hi)) if hi - lo <= MAX_UNROLLED_PASSES => c.used = true,
+                    Some((lo, hi)) => {
+                        why = Some(format!(
+                            "the loop of '{name}' has {} passes, and the compiler unrolls at \
+                             most {MAX_UNROLLED_PASSES}",
+                            hi - lo
+                        ));
+                    }
+                    None => {
+                        why = Some(format!(
+                            "the bounds of the loop of '{name}' are not constants, so the \
+                             compiler cannot unroll it"
+                        ));
+                    }
+                },
+                None => {
+                    why = Some(format!(
+                        "'{name}' is not a constant or the variable of a `for` loop"
+                    ));
+                }
+            }
+        }
+        if why.is_none() && unknown {
+            why = Some(
+                "the index uses a value that is not a constant or a loop variable".to_string(),
+            );
+        }
+        if let Some(why) = why {
+            let tensor = match crate::hir::places::base_and_path(base) {
+                Some((root, _)) => format!("the register tensor '{root}'"),
+                None => "a register tensor".to_string(),
+            };
+            self.errors.error_with_code(
+                crate::diagnostic::DiagnosticCode::E6033,
+                format!(
+                    "{tensor} needs an index that is known when compiling: {why}. A tensor in a \
+                     `scope: thread` space stays in registers, which have no address"
+                ),
+                Some(crate::diagnostic::SourceSpan::from_ast_span(ix_span)),
+            );
+        }
+    }
+
+    /// Collects the variables of an index made of numbers, variables and arithmetic. False when
+    /// the index has anything else in it, such as a call or another index.
+    fn index_names(idx: &Expr, names: &mut Vec<crate::symbol::Symbol>) -> bool {
+        match idx {
+            Expr::Number(_) => true,
+            Expr::Identifier(id) => {
+                names.push(id.name.clone());
+                true
+            }
+            Expr::BinaryOp(b) => {
+                Self::index_names(&b.lhs, names) && Self::index_names(&b.rhs, names)
+            }
+            Expr::AsCast(c) => Self::index_names(&c.expr, names),
+            _ => false,
+        }
+    }
+
     /// The largest value an index can take, when the compiler knows it: a constant, or a
     /// variable with a known upper limit, such as the variable of `for j in 0..6`. `None` for
     /// a variable that can take no value at all, such as that of `for j in 0..0`, since the
@@ -1244,10 +1358,11 @@ impl<'a> TypeChecker<'a> {
                 if let Some((name, mut path)) = place {
                     if !self.borrow.skip_borrow_check && !self.speculating {
                         path.push(crate::hir::places::index_element(idx));
-                        let conflict = self.borrow.live_borrows(&name).iter().any(|b| {
+                        let conflict = self.borrow.live_borrows(&name).iter().find(|b| {
                             b.is_mut && crate::hir::places::paths_may_alias(&path, &b.path)
                         });
-                        if conflict {
+                        let conflict = conflict.map(crate::hir::check::tasks::held_by_task_note);
+                        if let Some(note) = conflict {
                             // Point at the variable, as the whole-variable rule does.
                             let mut root = &**obj;
                             while let Expr::IndexAccess(IndexAccessExpr { base, .. })
@@ -1261,7 +1376,10 @@ impl<'a> TypeChecker<'a> {
                             };
                             self.errors.error_with_code(
                                 crate::diagnostic::DiagnosticCode::E4002,
-                                format!("Cannot access '{}' because it is mutably borrowed.", name),
+                                format!(
+                                    "Cannot access '{}' because it is mutably borrowed.{note}",
+                                    name
+                                ),
                                 Some(crate::diagnostic::SourceSpan::from_ast_span(&at)),
                             );
                         }
@@ -1359,8 +1477,11 @@ impl<'a> TypeChecker<'a> {
                     Type::Borrow { inner, .. } => *inner,
                     other => other,
                 };
-                if let Type::Tensor(_, dims, _) = &base {
+                if let Type::Tensor(_, dims, placement) = &base {
                     self.check_tensor_index_in_range(dims, idx, &ix_span);
+                    if self.is_register_space(placement.as_ref()) {
+                        self.check_register_index(obj, idx, &ix_span);
+                    }
                 }
                 if let Type::Pointer(..) = &base {
                     self.require_unsafe_raw_access("Indexing a raw pointer", &ix_span);
@@ -1451,6 +1572,29 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// `holder` gets a copy of the `&mut` in `from`, as in `let b = a` or `H { r : a }`. That
+    /// reborrows `*from`, so `from` cannot be used while `holder` is.
+    pub(crate) fn reborrow_mut_variable(&mut self, from: &str, holder: &str) {
+        if self.speculating
+            || from == holder
+            || !matches!(
+                self.lookup(from),
+                Some((Type::Borrow { is_mut: true, .. }, _))
+            )
+        {
+            return;
+        }
+        self.borrow.record(
+            from,
+            BorrowRecord {
+                is_mut: true,
+                scope_depth: self.scopes.len(),
+                borrower_name: Some(holder.to_string()),
+                path: Vec::new(),
+            },
+        );
+    }
+
     pub(crate) fn check_borrow_expr(&mut self, expr: &mut Expr) -> Type {
         match expr {
             Expr::Borrow(BorrowExpr {
@@ -1467,7 +1611,12 @@ impl<'a> TypeChecker<'a> {
                 }
                 let old_allow = self.allow_cross_topology;
                 self.allow_cross_topology |= borrows_placed;
+                let old_borrowed = self.borrowed_name.take();
+                if let Expr::Identifier(id) = &**inner {
+                    self.borrowed_name = Some(id.span);
+                }
                 let inner_ty = self.check_expr_type_flag(inner, false);
+                self.borrowed_name = old_borrowed;
                 self.allow_cross_topology = old_allow;
                 // Quiet when a reference to a reference is what was asked for, as in
                 // `let q : &&i64 = &&a;`.
@@ -1506,7 +1655,11 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 let direct = Self::extract_base_and_path(inner);
-                let is_reborrow = direct.is_none();
+                // `&t.v` with `t : &S` borrows through `t`, as `&*rq` does.
+                let through_ref = direct.as_ref().is_some_and(|(name, path)| {
+                    !path.is_empty() && matches!(self.lookup(name), Some((Type::Borrow { .. }, _)))
+                });
+                let is_reborrow = direct.is_none() || through_ref;
                 let place = direct.or_else(|| self.reborrow_base_and_path(inner));
                 if let Some((name, path)) = place {
                     if *is_mut {
@@ -1619,8 +1772,9 @@ impl<'a> TypeChecker<'a> {
                 self.errors.error_with_code(
                     crate::diagnostic::DiagnosticCode::E4004,
                     format!(
-                        "Cannot borrow '{}' because it is already borrowed as mutable.",
-                        name
+                        "Cannot borrow '{}' because it is already borrowed as mutable.{}",
+                        name,
+                        crate::hir::check::tasks::held_by_task_note(b)
                     ),
                     Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
                 );
@@ -1629,8 +1783,9 @@ impl<'a> TypeChecker<'a> {
                 self.errors.error_with_code(
                     crate::diagnostic::DiagnosticCode::E4003,
                     format!(
-                        "Cannot borrow '{}' as mutable because it is also borrowed as immutable.",
-                        name
+                        "Cannot borrow '{}' as mutable because it is also borrowed as immutable.{}",
+                        name,
+                        crate::hir::check::tasks::held_by_task_note(b)
                     ),
                     Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
                 );
@@ -1644,7 +1799,7 @@ impl<'a> TypeChecker<'a> {
     /// A place reached through a reference variable, `*m`, `(*m).f` or `(*m)[i]`, rooted at that
     /// variable: `&mut *m` borrows `m`, so `m` cannot be used while the reborrow is. A raw
     /// pointer has no borrows to track.
-    fn reborrow_base_and_path(&self, e: &Expr) -> Option<(String, Vec<String>)> {
+    pub(crate) fn reborrow_base_and_path(&self, e: &Expr) -> Option<(String, Vec<String>)> {
         match e {
             Expr::Dereference(d) => match &*d.expr {
                 Expr::Identifier(id)
@@ -1840,6 +1995,13 @@ impl<'a> TypeChecker<'a> {
                     .collect(),
             ),
             Expr::UnsafeBlock(u) => {
+                let mut parts = self.block_value_provenance(&u.stmts);
+                if let Some(r) = &u.ret {
+                    parts.push(self.ref_provenance_of(r));
+                }
+                Self::join_provenances(parts)
+            }
+            Expr::TaskBlock(u) => {
                 let mut parts = self.block_value_provenance(&u.stmts);
                 if let Some(r) = &u.ret {
                     parts.push(self.ref_provenance_of(r));
@@ -2077,6 +2239,7 @@ impl<'a> TypeChecker<'a> {
     /// is checked: checking can rewrite `v[i]` into a call, which has no variable to record.
     pub(crate) fn record_change(&mut self, place: &Expr) {
         if let Some(root) = self.changed_root(place) {
+            self.warn_write_to_closure_copy(&root, &place.span());
             self.changed_vars.insert(root);
         }
     }
@@ -2150,8 +2313,9 @@ impl<'a> TypeChecker<'a> {
                 self.errors.error_with_code(
                     crate::diagnostic::DiagnosticCode::E4004,
                     format!(
-                        "Cannot borrow '{}' because it is already borrowed as mutable.",
-                        base
+                        "Cannot borrow '{}' because it is already borrowed as mutable.{}",
+                        base,
+                        crate::hir::check::tasks::held_by_task_note(b)
                     ),
                     Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
                 );
@@ -2159,8 +2323,9 @@ impl<'a> TypeChecker<'a> {
                 self.errors.error_with_code(
                     crate::diagnostic::DiagnosticCode::E4003,
                     format!(
-                        "Cannot borrow '{}' as mutable because it is also borrowed as immutable.",
-                        base
+                        "Cannot borrow '{}' as mutable because it is also borrowed as immutable.{}",
+                        base,
+                        crate::hir::check::tasks::held_by_task_note(b)
                     ),
                     Some(crate::diagnostic::SourceSpan::from_ast_span(span)),
                 );
