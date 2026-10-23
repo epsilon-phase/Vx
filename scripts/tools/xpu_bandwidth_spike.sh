@@ -18,7 +18,7 @@
 #   ./scripts/tools/xpu_bandwidth_spike.sh [size in MiB, default 512]
 #
 # Memory: the program prints its footprint and its ceiling and refuses to
-# allocate past `VX_VRAM_CEILING` -- 2 GiB by default; the ceiling is the
+# allocate past `VX_VRAM_CEILING` -- 2 GiB by default. The ceiling is the
 # operator's, bounded by the upper limit in vram_ceiling.h. At the default size
 # the triad phase holds 1.5 GiB, the copy phase 1 GiB and the transfer phase
 # 256 MiB.
