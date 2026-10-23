@@ -7,17 +7,24 @@
 #
 #===----------------------------------------------------------------------===#
 #
-# Measure the memory bandwidth this machine really gets: a device-to-device
-# copy through Level Zero, and a triad kernel (x = a*y + b*z) launched the same
-# way the other spike launches a kernel. Both are timed best-of-several after a
-# warm-up, and both are checked against the CPU.
+# Measure the memory bandwidth this machine really gets from the Arc A770: a
+# device-to-device copy through Level Zero, a triad kernel (x = a*y + b*z), and
+# the two host-transfer directions through pinned host memory. The triad is
+# compiled to SPIR-V and launched with the call sequence a device image uses
+# (`zeModuleCreate`, `zeKernelCreate`, `zeCommandListAppendLaunchKernel`), so it
+# takes the path a Vx-compiled kernel takes. Every measurement is timed
+# best-of-several after a warm-up, and every one is checked against the CPU.
 #
 #   ./scripts/tools/xpu_bandwidth_spike.sh [size in MiB, default 512]
 #
-# Memory: at the default size the copy phase holds 1 GiB of VRAM and the triad
-# phase 1.5 GiB. The card is shared, so the program prints its footprint and
-# refuses to go past `VX_VRAM_CEILING` (2 GiB by default, and whatever the
-# operator sets above that; vram_ceiling.h).
+# Memory: the program prints its footprint and its ceiling and refuses to
+# allocate past `VX_VRAM_CEILING` -- 2 GiB by default. The ceiling is the
+# operator's, bounded by the upper limit in vram_ceiling.h. At the default size
+# the triad phase holds 1.5 GiB, the copy phase 1 GiB and the transfer phase
+# 256 MiB.
+#
+# Only one of these runs may touch the card at a time, so the whole script holds
+# a lock that every GPU helper in this directory takes.
 #
 #===----------------------------------------------------------------------===#
 
@@ -34,12 +41,18 @@ if [ -f "$ROOT/config.local" ]; then
   . "$ROOT/config.local"
 fi
 
-for tool in clang spirv-val; do
+for tool in clang spirv-val flock; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "error: $tool not on PATH (source config.local)" >&2
     exit 1
   }
 done
+
+# Serialise GPU access, for the whole run including the sabotage steps below.
+# The lock is held on file descriptor 9 until the script exits, so a second
+# helper waits rather than allocating beside this one.
+exec 9>"${TMPDIR:-/tmp}/vx-gpu.lock"
+flock 9
 
 echo "==> building the triad kernel"
 clang -target spirv64-unknown-unknown -x cl -cl-std=CL2.0 \
@@ -54,18 +67,42 @@ echo "==> building the measurement"
 echo "==> measuring ($SIZE_MIB MiB per buffer)"
 cd "$OUT"
 ./bandwidth triad.spv triad "$SIZE_MIB" 2>&1 | tee "$OUT/summary.txt"
-NUMBERS="$(grep -E 'copy:|triad:' "$OUT/summary.txt" || true)"
+NUMBERS="$(grep -E 'copy:|triad:|host to device:|device to host:' "$OUT/summary.txt" || true)"
 [ -n "$NUMBERS" ] || {
   echo "error: no bandwidth numbers came out" >&2
   exit 1
 }
-
-echo "==> sabotage: tell the triad only half the length"
-if ./bandwidth triad.spv triad "$SIZE_MIB" short-n >"$OUT/sabotage.txt" 2>&1; then
-  echo "error: the triad check passed with a short length; it cannot fail" >&2
+if grep -q WRONG "$OUT/summary.txt"; then
+  echo "error: the measured run reported WRONG" >&2
   exit 1
-else
-  echo "    the check failed as it should: $(grep -E 'triad:' "$OUT/sabotage.txt")"
 fi
+
+# Each sabotage turns on one deliberate fault and has to come back with the
+# WRONG line of the phase it broke. A non-zero exit alone is not proof: a run
+# that dies for an unrelated reason also exits non-zero, and then the check the
+# step exists to prove could not fail stays unproven.
+sabotage() {
+  local what="$1" arg="$2" phase="$3" out="$4"
+  echo "==> sabotage: $what"
+  if ./bandwidth triad.spv triad "$SIZE_MIB" "$arg" >"$out" 2>&1; then
+    echo "error: $what passed; the check cannot fail" >&2
+    exit 1
+  fi
+  if ! grep -q "$phase.*WRONG" "$out"; then
+    echo "error: $what exited non-zero but printed no $phase WRONG line" >&2
+    cat "$out" >&2
+    exit 1
+  fi
+  echo "    the check failed as it should: $(grep "$phase" "$out")"
+}
+
+sabotage "tell the triad only half the length" short-n "triad:" \
+  "$OUT/sabotage.txt"
+sabotage "skip the device copy" skip-copy "copy:" "$OUT/copy_sabotage.txt"
+sabotage "skip the readback" skip-readback "copy:" "$OUT/readback_sabotage.txt"
+sabotage "skip the upload" skip-upload "host to device:" \
+  "$OUT/upload_sabotage.txt"
+sabotage "skip the download" skip-download "device to host:" \
+  "$OUT/download_sabotage.txt"
 
 echo "==> done"
