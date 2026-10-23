@@ -517,8 +517,8 @@ impl<'a> TypeChecker<'a> {
             .map(|fields| (fields.generics.clone(), fields.fields.clone()))
     }
 
-    /// The element types a type names: its own when it is a scalar, its element when it is a
-    /// tensor or vector, the types its wrappers hold, the arguments of a generic instance, and
+    /// The data element types a type names: its own when it is a scalar, its element when it is
+    /// a tensor or vector, the types its wrappers hold, the arguments of a generic instance, and
     /// the fields of a struct. A struct built in a region is not placed, so no placement check
     /// sees its fields; the fields are followed here instead.
     pub(crate) fn element_types_of(&self, ty: &Type) -> Vec<ElementType> {
@@ -527,6 +527,11 @@ impl<'a> TypeChecker<'a> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(t) = stack.pop() {
             match t {
+                // `usize` is an index, not data. A region forms indices to address anything at
+                // all, and every target has them, so no `dtypes:` list answers whether a region
+                // may count or compare them. Its width is the target's, not the program's
+                // choice. A tensor or vector of `usize` is data, and stays checked below.
+                Type::Scalar(ElementType::USize) => {}
                 Type::Scalar(e) | Type::Simd(e, _) | Type::Tensor(e, _, None) => out.push(e),
                 // These name the device that holds the value, and the placement checks ask
                 // that device. Asking the region's device instead would report against a
