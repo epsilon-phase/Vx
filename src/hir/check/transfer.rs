@@ -437,7 +437,7 @@ impl<'a> TypeChecker<'a> {
     /// E6026 for an element type used *inside* the active region, asked of that region's device.
     ///
     /// The placement checks ask this of a space, so they only see values that were placed. A
-    /// value built inside a region reaches no space; this asks the region's device instead.
+    /// value built inside a region reaches no space. This check asks the region's device instead.
     pub(crate) fn check_element_type_in_active_region(
         &mut self,
         elem: &ElementType,
@@ -520,7 +520,7 @@ impl<'a> TypeChecker<'a> {
     /// The data element types a type names: its own when it is a scalar, its element when it is
     /// a tensor or vector, the types its wrappers hold, the arguments of a generic instance, and
     /// the fields of a struct. A struct built in a region is not placed, so no placement check
-    /// sees its fields; the fields are followed here instead.
+    /// sees its fields. The fields are followed here instead.
     pub(crate) fn element_types_of(&self, ty: &Type) -> Vec<ElementType> {
         let mut out = Vec::new();
         let mut stack = vec![ty.clone()];

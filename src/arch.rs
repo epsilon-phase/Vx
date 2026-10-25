@@ -537,7 +537,7 @@ pub fn builtin_memory_space_name(id: u64) -> Option<String> {
 
 /// A target-independent address space: what the memory *is*, not what number a particular GPU
 /// ISA gives it. Codegen maps this to a concrete annotation per target
-/// ([`DeviceTarget::address_space`]; the `#gpu.address_space<..>` attribute spelling when a GPU
+/// ([`DeviceTarget::address_space`], or the `#gpu.address_space<..>` attribute spelling when a GPU
 /// backend lands), so the numbering lives in exactly one place instead of being hardcoded at
 /// every use.
 ///
@@ -588,7 +588,7 @@ impl AddressSpace {
 /// address-space numbers sit behind one table instead of being hardcoded at every use.
 ///
 /// Every target here is one this compiler knows. Only NVPTX has a pipeline today, so only its
-/// arm carries that target's own numbers; the rest answer with the numbers the compiler has
+/// arm carries that target's own numbers. The rest answer with the numbers the compiler has
 /// always emitted, because a number guessed before the target's pipeline exists would land
 /// wrong code silently. A name no target has is not one of these arms --
 /// [`address_space_for_arch`] refuses it.
@@ -1762,7 +1762,7 @@ mod tests {
     }
 
     /// One table, one entry per target. What this checks: the NVPTX arm carries that target's
-    /// real numbering; a target whose pipeline does not exist yet, and no declared arch at all,
+    /// real numbering. A target whose pipeline does not exist yet, and no declared arch at all,
     /// answer with the numbers the compiler has always emitted, so the emit cannot change while
     /// those arms are still unwritten.
     #[test]

@@ -12,8 +12,8 @@
 // The first Intel GPU here, and the first SKU whose device has no f64: the
 // card's arithmetic is f32/f16 and integer, so `dtypes:` omits f64 and placing
 // an f64 tensor here is E6026. Device execution: none yet -- `arch: spirv64`
-// names the device-image target a backend would emit (docs/gpu_backends.md);
-// until one exists, a region spawned here takes the host fallback, or E6003
+// names the device-image target a backend would emit (docs/gpu_backends.md).
+// Until one exists, a region spawned here takes the host fallback, or E6003
 // when its operands are in a space the host cannot read.
 //
 // Figures measured on the card 2026-10-04 unless a `spec:` or `Measured:` line
@@ -42,10 +42,10 @@ Memory L2 {
 }
 
 // Measured: 65536 bytes (64 KiB) of workgroup shared local memory, the ceiling
-// one workgroup may request; 1024 invocations per workgroup, preferred multiple
-// of 64. No `replicas:` and no `clock:`: which unit a workgroup's scratchpad
-// belongs to on Xe is not settled by anything measured here, and `replicas:`
-// divides a derived bandwidth.
+// one workgroup may request. It may run 1024 invocations per workgroup, in a
+// preferred multiple of 64. No `replicas:` and no `clock:`: which unit a
+// workgroup's scratchpad belongs to on Xe is not settled by anything measured
+// here, and `replicas:` divides a derived bandwidth.
 Memory SMEM {
   within: Memory::L2, capacity: 64 KiB, managed: explicit, scope: sm
 }
@@ -63,7 +63,7 @@ Topology Device {
   // spec: Intel, "Introduction to the Xe-HPG Architecture" white paper,
   // document 758302 -- the XMX units "support FP16, BF16, INT8, INT4 and INT2
   // multiply, with either 16 or 32 bits accumulate". BF16 and INT4 are named in
-  // the same sentence by the same source, so both are declared; INT2 has no
+  // the same sentence by the same source, so both are declared. INT2 has no
   // `ElementType` and is not listed. The scalar path is f32/f16 and integer.
   dtypes: [f32, bf16, f16, i4, u4, i8, u8, i16, u16, i32, u32, i64, u64, bool],
   // spec: Intel, the same white paper -- the A770 is a PCI Express 4.0 x16

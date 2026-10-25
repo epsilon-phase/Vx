@@ -13,7 +13,7 @@
  * and packed as `_mlir_ciface_*`, but the half-precision printers ONLY packed
  * -- `nm` on MLIR 22 shows `_mlir_ciface_printMemrefBF16` and no plain
  * `printMemrefBF16`. Codegen emits the plain call, so a bf16 program could not
- * link, run, or emit an object; its RUN line only emits MLIR, so nothing
+ * link, run, or emit an object. Its RUN line only emits MLIR, so nothing
  * noticed.
  *
  * `llvm.emit_c_interface` on the declaration does not fix it: MLIR then gives
@@ -24,7 +24,7 @@
  * print a tensor.
  *
  * MLIR's unpacked convention for `memref<*xT>` passes (rank, pointer to the
- * ranked descriptor); the packed entry point takes a pointer to exactly that
+ * ranked descriptor). The packed entry point takes a pointer to exactly that
  * pair.
  */
 

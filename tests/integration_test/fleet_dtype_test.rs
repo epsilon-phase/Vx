@@ -62,7 +62,7 @@ const MATRIX: &[(&str, &str, bool)] = &[
     ("arc-a770", "f32", true),
     ("arc-a770", "f16", true),
     // Intel's XMX type list names BF16 in the same sentence as INT4, so the
-    // Arc declares both; the machine file's `dtypes:` comment quotes it.
+    // Arc declares both. The machine file's `dtypes:` comment quotes it.
     ("arc-a770", "bf16", true),
 ];
 

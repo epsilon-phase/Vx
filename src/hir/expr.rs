@@ -262,7 +262,7 @@ impl<'a> TypeChecker<'a> {
         let span = expr.span();
         // An untyped literal takes whatever type its context gives it, and `Tensor<..>::fill`
         // looks at one twice. Skipping it here avoids reporting a type it was only briefly
-        // given; the expression or binding that settles its type is checked instead.
+        // given. The expression or binding that settles its type is checked instead.
         let untyped_literal = is_untyped_numeric_literal(expr);
         let value_unused = std::mem::replace(&mut self.value_unused, false);
         let mut is_enum_variant = false;

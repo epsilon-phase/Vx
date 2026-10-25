@@ -4343,7 +4343,7 @@ struct LaunchOpLowering : public OpRewritePattern<vx::LaunchOp> {
     payload.push_back('\0');
     // The format version, first among the entries so a dispatch library reads
     // it before anything it might misread. `VX_PAYLOAD_ABI` lives in the header
-    // the dispatch libraries include, so the number has one source; a library
+    // the dispatch libraries include, so the number has one source. A library
     // that meets a version it does not know refuses rather than guessing, and
     // an older payload with no `abi=` at all stays readable.
     payload += "abi=";

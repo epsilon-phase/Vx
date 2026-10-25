@@ -49,7 +49,7 @@ fn emitted_ir(program: &str) -> String {
 /// image, with the version the header defines.
 ///
 /// The number is written literally here on purpose. `VX_PAYLOAD_ABI` is what the
-/// compiler emits and what every dispatch library reads; if it moves, this
+/// compiler emits and what every dispatch library reads. If it moves, this
 /// assertion is what fails, and the fix is to move both this line and the
 /// `VX_PAYLOAD_ABI` check in the C++ test together.
 #[test]

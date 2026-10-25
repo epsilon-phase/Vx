@@ -9,7 +9,7 @@
 //
 // The device-image step compiles a `gpu.module` with the pipeline of the kernels
 // beside it (their `gpu.func` twins). This module holds no kernel of Vx's, so
-// there is no pipeline to compile it with; hand-written IR given to
+// there is no pipeline to compile it with. Hand-written IR given to
 // `vx-opt --vx-to-llvm` reaches the step in exactly that state.
 //
 // RUN: not vx-opt %s --vx-to-llvm 2>&1 | FileCheck %s
