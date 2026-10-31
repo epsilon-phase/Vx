@@ -205,6 +205,63 @@ static inline int vx_remote_fetch(int fd, uint64_t handle, void *dst,
   return rc == VX_TRANSPORT_OK && got == nbytes;
 }
 
+/// A view in local memory that a dispatch copied to the worker for one call.
+typedef struct {
+  uint64_t handle; /* the worker's copy */
+  void *host;      /* the view's first element in local memory */
+  uint64_t bytes;  /* the bytes to copy back, 0 for an empty view */
+} vx_remote_staged;
+
+/// Fill `out` with the view `desc`, whose argument tag is `tag`. A view in
+/// local memory is first staged onto the worker, and is recorded in `staged`.
+/// Returns 0 on failure.
+static inline int vx_remote_stage_view(int fd, const void *desc, int32_t tag,
+                                       vx_wire_arg *out,
+                                       vx_remote_staged *staged,
+                                       int64_t *num_staged, uint8_t *scratch,
+                                       size_t scratch_len) {
+  static const uint8_t zero[VX_DTYPE_MAX_BYTES] = {0};
+  int32_t rank = (int32_t)VX_ABI_RANK(tag);
+  int32_t elem = (int32_t)VX_ABI_ELEM(tag);
+  const int64_t *sizes;
+  const int64_t *strides;
+  uint64_t handle;
+
+  if (!desc || rank < 0 || rank > VX_ABI_MAX_RANK) {
+    return 0;
+  }
+  sizes = vx_memref_sizes(desc);
+  strides = vx_memref_strides(desc, rank);
+  handle = (uint64_t)(uintptr_t)vx_memref_data(desc, elem);
+
+  if (!vx_remote_addr_is_handle(handle)) {
+    /* Stage every element from the first one the view reaches to the last one,
+       so its strides still mean what they said on the worker. A worker cannot
+       hold 0 bytes, so an empty view gets one zero element the kernel never
+       reads. */
+    vx_remote_staged *s = &staged[*num_staged];
+    s->host = (void *)(uintptr_t)handle;
+    s->bytes = vx_memref_view_bytes(sizes, strides, rank, elem);
+    s->handle = s->bytes ? vx_remote_transfer(fd, s->host, s->bytes, elem,
+                                              scratch, scratch_len)
+                         : vx_remote_transfer(fd, zero, vx_dtype_bytes(elem),
+                                              elem, scratch, scratch_len);
+    if (s->handle == 0) {
+      return 0;
+    }
+    handle = s->handle;
+    ++*num_staged;
+  }
+
+  out->handle = handle;
+  out->rank = rank;
+  for (int32_t d = 0; d < rank; ++d) {
+    out->sizes[d] = sizes[d];
+    out->strides[d] = strides[d];
+  }
+  return 1;
+}
+
 /// Turn a local argument list into wire arguments.
 ///
 /// The inverse of vx_agent.h's rebuild, and the reason a memref's *handle* is
@@ -235,8 +292,9 @@ static inline int vx_remote_free(int fd, uint64_t handle);
 static inline int vx_remote_encode_args(int fd, void **device_args,
                                         const int32_t *arg_tags,
                                         int64_t num_args, vx_wire_arg *out,
-                                        uint64_t *staged, int64_t *num_staged,
-                                        uint8_t *scratch, size_t scratch_len) {
+                                        vx_remote_staged *staged,
+                                        int64_t *num_staged, uint8_t *scratch,
+                                        size_t scratch_len) {
   *num_staged = 0;
   for (int64_t i = 0; i < num_args; ++i) {
     int32_t tag = arg_tags[i];
@@ -255,29 +313,9 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
       if (!held) {
         continue;
       }
-      {
-        int32_t rank = (int32_t)VX_ABI_RANK(tag);
-        int32_t elem = (int32_t)VX_ABI_ELEM(tag);
-        const int64_t *sizes = vx_memref_sizes(inner);
-        const int64_t *strides = vx_memref_strides(inner, rank);
-        uint64_t handle = (uint64_t)(uintptr_t)vx_memref_data(inner, elem);
-        if (!vx_remote_addr_is_handle(handle)) {
-          uint64_t span =
-              rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-          handle = vx_remote_transfer(fd, (const void *)(uintptr_t)handle,
-                                      span * (uint64_t)vx_dtype_bytes(elem),
-                                      elem, scratch, scratch_len);
-          if (handle == 0) {
-            return 0;
-          }
-          staged[(*num_staged)++] = handle;
-        }
-        out[i].handle = handle;
-        out[i].rank = rank;
-        for (int32_t d = 0; d < rank; ++d) {
-          out[i].sizes[d] = sizes[d];
-          out[i].strides[d] = strides[d];
-        }
+      if (!vx_remote_stage_view(fd, inner, tag, &out[i], staged, num_staged,
+                                scratch, scratch_len)) {
+        return 0;
       }
       continue;
     }
@@ -290,73 +328,31 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
       continue;
     }
 
-    {
-      const void *desc = *(const void **)device_args[i];
-      int32_t rank = (int32_t)VX_ABI_RANK(tag);
-      int32_t elem = (int32_t)VX_ABI_ELEM(tag);
-      const int64_t *sizes;
-      const int64_t *strides;
-      uint64_t handle;
-
-      if (!desc || rank < 0 || rank > VX_ABI_MAX_RANK) {
-        return 0;
-      }
-      sizes = vx_memref_sizes(desc);
-      strides = vx_memref_strides(desc, rank);
-      handle = (uint64_t)(uintptr_t)vx_memref_data(desc, elem);
-
-      if (!vx_remote_addr_is_handle(handle)) {
-        /* Local memory. Stage the whole extent the descriptor spans, so a
-           strided view arrives with the rows it refers to rather than only the
-           elements it touches, and its strides still mean what they said. */
-        uint64_t span =
-            rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-        uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
-        handle = vx_remote_transfer(fd, (const void *)(uintptr_t)handle, bytes,
-                                    elem, scratch, scratch_len);
-        if (handle == 0) {
-          return 0;
-        }
-        staged[(*num_staged)++] = handle;
-      }
-
-      out[i].handle = handle;
-      out[i].rank = rank;
-      for (int32_t d = 0; d < rank; ++d) {
-        out[i].sizes[d] = sizes[d];
-        out[i].strides[d] = strides[d];
-      }
+    if (!vx_remote_stage_view(fd, *(const void **)device_args[i], tag, &out[i],
+                              staged, num_staged, scratch, scratch_len)) {
+      return 0;
     }
   }
   return 1;
 }
 
-/// Copy argument `i` back from the worker copy `handle` into the host buffer
-/// that vx_remote_encode_args staged it from. Uses the same span as staging.
-static inline int vx_remote_fetch_staged(int fd, void **device_args,
-                                         const int32_t *arg_tags, int64_t i,
-                                         uint64_t handle) {
-  const void *desc = *(const void **)device_args[i];
-  if (VX_ABI_IS_SLOT(arg_tags[i])) {
-    desc = vx_memref_aligned(desc);
-  }
-  int32_t elem = (int32_t)VX_ABI_ELEM(arg_tags[i]);
-  int32_t rank = (int32_t)VX_ABI_RANK(arg_tags[i]);
-  const int64_t *sizes = vx_memref_sizes(desc);
-  const int64_t *strides = vx_memref_strides(desc, rank);
-  uint64_t span = rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-  uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
-  return vx_remote_fetch(fd, handle, vx_memref_data(desc, elem), bytes);
-}
-
-static inline int vx_remote_was_staged(const uint64_t *staged,
-                                       int64_t num_staged, uint64_t handle) {
+/// The record of the view this call staged as `handle`, or NULL when the
+/// handle names a buffer that the program placed on the worker.
+static inline const vx_remote_staged *
+vx_remote_find_staged(const vx_remote_staged *staged, int64_t num_staged,
+                      uint64_t handle) {
   for (int64_t s = 0; s < num_staged; ++s) {
-    if (staged[s] == handle) {
-      return 1;
+    if (staged[s].handle == handle) {
+      return &staged[s];
     }
   }
-  return 0;
+  return NULL;
+}
+
+/// Copy a staged view back into local memory. Copies the bytes that staging
+/// recorded. For an empty view that is 0 bytes, so nothing is copied.
+static inline int vx_remote_fetch_staged(int fd, const vx_remote_staged *s) {
+  return s->bytes == 0 || vx_remote_fetch(fd, s->handle, s->host, s->bytes);
 }
 
 /// Send a dispatch and apply whatever it published back into the caller's
@@ -375,7 +371,7 @@ static inline int vx_remote_dispatch(int fd, const void *payload,
   int32_t status = -1;
   int64_t count = 0;
 
-  uint64_t staged[64];
+  vx_remote_staged staged[64];
   int64_t num_staged = 0;
 
   if (!vx_remote_encode_args(fd, device_args, arg_tags, num_args, args, staged,
@@ -439,13 +435,13 @@ static inline int vx_remote_dispatch(int fd, const void *payload,
       const char *roles =
           vx_payload_field(payload, (size_t)payload_len, "roles=");
       int ai = -1, bi = -1, oi = -1;
+      const vx_remote_staged *s = NULL;
       if (roles && vx_parse_roles(roles, &ai, &bi, &oi) && oi >= 0 &&
-          oi < num_args && args[oi].handle != 0 &&
-          vx_remote_was_staged(staged, num_staged, args[oi].handle)) {
-        if (!vx_remote_fetch_staged(fd, device_args, arg_tags, oi,
-                                    args[oi].handle)) {
-          return 0;
-        }
+          oi < num_args && args[oi].handle != 0) {
+        s = vx_remote_find_staged(staged, num_staged, args[oi].handle);
+      }
+      if (s && !vx_remote_fetch_staged(fd, s)) {
+        return 0;
       }
     } else if (vx_payload_field(payload, (size_t)payload_len, "image=")) {
       /* A kernel the compiler generated. Its payload does not say which
@@ -453,10 +449,11 @@ static inline int vx_remote_dispatch(int fd, const void *payload,
          An input comes back unchanged, which costs one fetch. Routing sends
          this kind of dispatch only when it has no publication slot. */
       for (int64_t i = 0; i < num_args; ++i) {
-        if (args[i].handle != 0 &&
-            vx_remote_was_staged(staged, num_staged, args[i].handle) &&
-            !vx_remote_fetch_staged(fd, device_args, arg_tags, i,
-                                    args[i].handle)) {
+        const vx_remote_staged *s =
+            args[i].handle != 0
+                ? vx_remote_find_staged(staged, num_staged, args[i].handle)
+                : NULL;
+        if (s && !vx_remote_fetch_staged(fd, s)) {
           return 0;
         }
       }
@@ -464,7 +461,7 @@ static inline int vx_remote_dispatch(int fd, const void *payload,
   }
 
   for (int64_t i = 0; i < num_staged; ++i) {
-    vx_remote_free(fd, staged[i]);
+    vx_remote_free(fd, staged[i].handle);
   }
   return 1;
 }
