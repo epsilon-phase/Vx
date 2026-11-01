@@ -702,8 +702,7 @@ fn a_kernel_that_calls_the_runtime_says_it_runs_on_the_host() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("the call to 'print_f32'")
-            && stderr.contains("runs on the CPU"),
+        stderr.contains("the call to 'print_f32'") && stderr.contains("runs on the CPU"),
         "the compiler dropped this kernel's device twin without naming the \
          callee that kept it at home; stderr was:\n{stderr}"
     );
@@ -783,11 +782,8 @@ fn a_legacy_compiled_spirv_kernel_says_it_runs_on_the_host() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`index` value between blocks")
-            && stderr.contains("run on the host"),
+        stderr.contains("`index` value between blocks") && stderr.contains("run on the host"),
         "the compiler dropped this kernel's device twin without saying why, so \
          the author believes it runs on the card; stderr was:\n{stderr}"
     );
 }
-
-
