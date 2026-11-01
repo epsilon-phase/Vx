@@ -16,7 +16,7 @@ namespace vx {
 /// allocated pointer, aligned pointer, offset, one size and one stride per
 /// dimension -- and each memref access becomes address arithmetic on them. An
 /// architecture whose device image needs a memref value on the device side
-/// cannot use this; SPIR-V's typed pointers reject the descriptor struct the
+/// cannot use this. SPIR-V's typed pointers reject the descriptor struct the
 /// memref would become.
 ///
 /// Returns failure and sets `error` to a message naming the construct when a

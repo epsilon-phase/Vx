@@ -9,12 +9,12 @@
 // A `spirv64` region that yields a value hands it back through a host stack
 // slot, which a device cannot address, so the kernel gets no SPIR-V image and
 // the compiler says so. This is the sibling of the memref-cell warning the
-// legacy path already gets; device_image_test.rs asserts both the missing
+// legacy path already gets. device_image_test.rs asserts both the missing
 // `format=spirv` entry and the warning text, which names the host stack slot.
 //
 // This file pins the source-level half: the spawn carries the declared arch,
 // and the program still computes the right answer locally, where the region
-// runs on the host. device_image_test.rs is what asserts the warning text; the
+// runs on the host. device_image_test.rs is what asserts the warning text, and
 // warning goes to stderr, so a CHECK line for it here would be matched against
 // a stream whose two halves are not ordered.
 //
@@ -34,7 +34,7 @@ Topology Dev {
 }
 
 fn main() -> i32 {
-  let mut a = Tensor<i32, [2, 2]>::uninit();
+  let mut a = unsafe { Tensor<i32, [2, 2]>::uninit() };
   for i in 0..2 {
     for j in 0..2 {
       a[i][j] = i * 3 + j + 1;

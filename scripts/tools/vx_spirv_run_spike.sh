@@ -21,11 +21,11 @@
 #
 # What a passing run establishes, on real hardware:
 #
-#   - a compiler-emitted SPIR-V image loads through `zeModuleCreate`;
+#   - a compiler-emitted SPIR-V image loads through `zeModuleCreate`
 #   - the image's 28 arguments (four tensors of two pointers, an offset, two
 #     sizes and two strides) are exactly what a launch with the flattened ABI
-#     supplies;
-#   - the values the kernel computes agree with the host's;
+#     supplies.
+#   - the values the kernel computes agree with the host's.
 #   - and the check can fail: the same launch with one argument changed, and
 #     with one byte of the image flipped, both come back wrong.
 #
@@ -72,7 +72,7 @@ if [ ! -x "$VXC" ]; then
   VXC="$(command -v vxc || true)"
 fi
 [ -n "$VXC" ] && [ -x "$VXC" ] || {
-  echo "error: no vxc; build it with 'cargo build --release -j 6'" >&2
+  echo "error: there is no vxc, so build it with 'cargo build --release -j 6'" >&2
   exit 1
 }
 [ -d /usr/include/level_zero ] || {
@@ -109,7 +109,7 @@ cd "$OUT"
 
 echo "==> sabotage 1: change one argument (the first tensor's offset)"
 if ./spike loop.spv "$KERNEL" shift-offset; then
-  echo "error: the check passed with a changed argument; it cannot fail" >&2
+  echo "error: the check passed with a changed argument, so it cannot fail" >&2
   exit 1
 else
   echo "    the check failed as it should: the offset really reaches the kernel"
@@ -117,7 +117,7 @@ fi
 
 echo "==> sabotage 2: corrupt one byte of the image (the row-stride constant)"
 if ./spike loop.spv "$KERNEL" corrupt-image; then
-  echo "error: the check passed with a corrupted image; it cannot fail" >&2
+  echo "error: the check passed with a corrupted image, so it cannot fail" >&2
   exit 1
 else
   echo "    the check failed as it should: the image's bytes really run"

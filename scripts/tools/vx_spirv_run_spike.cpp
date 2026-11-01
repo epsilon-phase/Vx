@@ -1,6 +1,6 @@
 // Run a Vx-compiled SPIR-V kernel on an Intel GPU through Level Zero.
 //
-// `vxc prog.vx --emit-llvm` puts the device image in the dispatch payload; the
+// `vxc prog.vx --emit-llvm` puts the device image in the dispatch payload. The
 // shell driver beside this file extracts it and hands it here. This program
 // loads the image, allocates the tensors the kernel needs on the device,
 // copies them in, launches the kernel with the flattened argument list in ABI
@@ -67,7 +67,7 @@ constexpr uint64_t kFootprint = kOperands * kBytes;
 constexpr int kWarmup = 3, kReps = 20;
 
 // The sabotage that corrupts the image flips the low byte of the 64-bit
-// constant that holds the row stride (4 elements). The module still validates;
+// constant that holds the row stride (4 elements). The module still validates,
 // only the addresses change, so the result is the thing that catches it.
 static constexpr uint32_t kOpConstant = 43;
 

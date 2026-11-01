@@ -9,7 +9,7 @@
 // SPIR-V refuses a memref value on the device side. A memref argument arrives
 // at the gpu -> llvm-spv conversion as the five-field descriptor struct, and
 // the backend rebuilds the descriptor's pointer fields as `i8` while the
-// pointers stored in them are `float*` or `i32*`; SPIR-V's typed pointers
+// pointers stored in them are `float*` or `i32*`. SPIR-V's typed pointers
 // reject the composite that puts one into the other. Measured on this machine
 // with scripts/tools/spirv_module_check.sh, for every kernel that keeps a
 // memref value -- so the device twin has to take the flat list instead.
@@ -385,7 +385,7 @@ LogicalResult flattenKernel(gpu::GPUFuncOp func, std::string &error) {
                 "does not know";
         return failure();
       }
-      // Only the cast that follows reads the base buffer; anything else would
+      // Only the cast that follows reads the base buffer. Anything else would
       // be left pointing at a memref this rewrite has no value for.
       for (Operation *user : md.getBaseBuffer().getUsers())
         if (!isa<memref::ReinterpretCastOp>(user)) {

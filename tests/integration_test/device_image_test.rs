@@ -528,7 +528,7 @@ fn a_spirv_topology_gets_a_spirv_module_in_the_payload_section() {
         Some(Err(report)) => {
             panic!("spirv-val rejected the module the compiler emitted:\n{report}")
         }
-        None => println!("spirv-val is not installed; the module was not validated"),
+        None => println!("spirv-val is not installed, so the module was not validated"),
     }
 }
 
@@ -581,7 +581,7 @@ fn a_loop_and_views_kernel_gets_a_spirv_module_in_the_payload_section() {
         Some(Err(report)) => {
             panic!("spirv-val rejected the module the compiler emitted:\n{report}")
         }
-        None => println!("spirv-val is not installed; the module was not validated"),
+        None => println!("spirv-val is not installed, so the module was not validated"),
     }
 }
 
@@ -632,46 +632,45 @@ fn a_strided_and_dynamic_row_kernel_gets_a_spirv_module_in_the_payload_section()
         Some(Err(report)) => {
             panic!("spirv-val rejected the module the compiler emitted:\n{report}")
         }
-        None => println!("spirv-val is not installed; the module was not validated"),
+        None => println!("spirv-val is not installed, so the module was not validated"),
     }
 }
 
-/// A placed region whose body holds an `llvm.alloca` -- the slot the flat
-/// emitter gives a struct-valued local -- reaches no device image, and now says
-/// so out loud (#1137).
+/// A placed `spirv64` region whose body holds a struct-valued local still gets
+/// a SPIR-V image, and the validator accepts it (#1137).
 ///
-/// The device pipelines were measured on `arith`/`cf`/`gpu`/`math`/`memref`/
-/// `scf`/`vector`, so an `llvm` op in the body keeps the region on the host.
-/// The values are right -- the host clone computes them, one thread at a time
-/// -- which is exactly why silence is the wrong answer: nothing else tells the
-/// author the kernel never reached the card. Before this warning the payload
-/// simply carried no image and the output said nothing.
+/// The flat emitter gives such a local an `llvm.alloca` slot and reads it with
+/// `llvm.getelementptr`/`llvm.load`/`llvm.store`. The device pipeline takes
+/// those ops: a stack slot in address space 0 becomes SPIR-V `Function`
+/// storage, and the accesses around it lower through the flattening like any
+/// other address arithmetic. This test pins that, because the same fixture was
+/// written when the gate refused every `llvm` op and kept such a region at
+/// home.
 #[test]
-fn a_kernel_with_a_struct_local_says_it_runs_on_the_host() {
-    let path = corpus("spirv_device_image_struct_local.vx");
-    let out = Command::new(env!("CARGO_BIN_EXE_vxc"))
-        .arg(&path)
-        .arg("--emit-llvm")
-        .output()
-        .unwrap_or_else(|e| panic!("could not run vxc: {e}"));
-    assert!(
-        out.status.success(),
-        "the flat path failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let ir = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !ir.contains("format=spirv"),
-        "a kernel whose body holds an op the device pipeline does not lower \
-         must have no SPIR-V image rather than one that is wrong"
-    );
+fn a_kernel_with_a_struct_local_gets_a_spirv_module() {
+    let ir = emit_llvm("spirv_device_image_struct_local.vx");
+    let kernel = "vx_npu_kernel_0";
+    let payload = payload_bytes(&ir, kernel);
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let has = |needle: &[u8]| payload.windows(needle.len()).any(|w| w == needle);
     assert!(
-        stderr.contains("`llvm` dialect") && stderr.contains("run on the host"),
-        "the compiler dropped this kernel's device twin without saying why, so \
-         the author believes it runs on the card; stderr was:\n{stderr}"
+        has(b"format=spirv\0"),
+        "a struct-valued local no longer keeps the region at home, so the \
+         payload must say the image is SPIR-V"
     );
+    let section = payload_section(&payload);
+    assert_eq!(
+        &section[..4],
+        &[0x03, 0x02, 0x23, 0x07],
+        "the section does not start with SPIR-V's magic number 0x07230203"
+    );
+    match spirv_val(section) {
+        Some(Ok(())) => {}
+        Some(Err(report)) => {
+            panic!("spirv-val rejected the module the compiler emitted:\n{report}")
+        }
+        None => println!("spirv-val is not installed, so the module was not validated"),
+    }
 }
 
 /// A placed region that calls the runtime -- `print` inside the region -- also
@@ -703,7 +702,8 @@ fn a_kernel_that_calls_the_runtime_says_it_runs_on_the_host() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("cannot compile `print_f32`") && stderr.contains("run on the host"),
+        stderr.contains("the call to 'print_f32'")
+            && stderr.contains("runs on the CPU"),
         "the compiler dropped this kernel's device twin without naming the \
          callee that kept it at home; stderr was:\n{stderr}"
     );
@@ -713,9 +713,9 @@ fn a_kernel_that_calls_the_runtime_says_it_runs_on_the_host() {
 /// says why: the value is handed back through a host stack slot, which a device
 /// cannot address (#1137).
 ///
-/// The memref-cell warning the legacy path gets has a test of its own; this is
-/// its sibling on the flat path, and it is the one the compiler has to make for
-/// a value-yielding kernel rather than a memref-shaped one. The message names
+/// The legacy path's refusal has a test of its own. This is its sibling on the
+/// flat path, and it is the one the compiler has to make for a value-yielding
+/// kernel rather than a loop the AST code generator wrote. The message names
 /// the host stack slot so the author can tell this refusal from the others.
 #[test]
 fn a_yielding_spirv_region_says_it_runs_on_the_host() {
@@ -748,14 +748,18 @@ fn a_yielding_spirv_region_says_it_runs_on_the_host() {
 /// A `--legacy-codegen` compile of the same `spirv64` topology still gets no
 /// image, and now says so out loud.
 ///
-/// The AST code generator represents a kernel's tensors as memrefs of memrefs
-/// (`memref<memref<...>>`), and SPIR-V has no form for one, so the kernel keeps
-/// the host path -- which computes the right answer, one thread at a time, and
-/// never touches the card. That is a decision the program's author has to be
-/// able to see; before, the twin was simply absent and the output said nothing.
+/// The AST code generator counts its loops in `index` and hands the counter to
+/// the next block through a `cf` branch. The SPIR-V conversion turns `index`
+/// into a 64-bit integer in the operations it rewrites but not in a branch's
+/// block arguments, and refuses the module with "type mismatch for bb argument
+/// #0 of successor #0". So the kernel keeps the host path, which computes the
+/// right answer, one thread at a time, and never touches the card. That is a
+/// decision the program's author has to be able to see: before, the twin was
+/// simply absent and the output said nothing.
 ///
-/// NVPTX compiles the cell shape (it is the AST path's own PTX image), so the
-/// refusal this reports is the SPIR-V arm alone and nothing about NVPTX changes.
+/// The flat code generator, which is the default, counts in `i32` and does get
+/// a SPIR-V image for this same program. `spirv_device_image_loop_kernel.vx` is
+/// that fixture, and its image is pinned by the test above.
 #[test]
 fn a_legacy_compiled_spirv_kernel_says_it_runs_on_the_host() {
     let path = corpus("spirv_device_image_loop_kernel.vx");
@@ -773,14 +777,17 @@ fn a_legacy_compiled_spirv_kernel_says_it_runs_on_the_host() {
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(
         !ir.contains("format=spirv"),
-        "the AST path cannot express a memref of memrefs, so there must be no \
-         SPIR-V image rather than one that is wrong"
+        "the AST path's loop counters cannot reach a SPIR-V image, so there \
+         must be no image rather than one that is wrong"
     );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("memref of memrefs") && stderr.contains("run on the host"),
+        stderr.contains("`index` value between blocks")
+            && stderr.contains("run on the host"),
         "the compiler dropped this kernel's device twin without saying why, so \
          the author believes it runs on the card; stderr was:\n{stderr}"
     );
 }
+
+

@@ -11,7 +11,7 @@
 // Intel Arc's architecture (fleet/arc-a770.vx).
 //
 // The image is binary and holds NUL bytes in its first word, so it cannot ride
-// in a NUL-terminated `image=` entry; it rides in the payload's section, after
+// in a NUL-terminated `image=` entry. It rides in the payload's section, after
 // the entries, with the length that says where it ends. device_image_test.rs
 // decodes that section and asserts the SPIR-V magic, the kernel's name in the
 // module, and -- when spirv-val is installed -- that the module validates.
@@ -37,8 +37,8 @@ Topology Dev {
 }
 
 fn main() -> i32 {
-  let mut a = Tensor<f32, [2, 2]>::uninit();
-  let mut o = Tensor<f32, [2, 2]>::uninit();
+  let mut a = unsafe { Tensor<f32, [2, 2]>::uninit() };
+  let mut o = unsafe { Tensor<f32, [2, 2]>::uninit() };
   for i in 0..2 {
     for d in 0..2 {
       a[i][d] = ((i + d) as f32) * 0.5;

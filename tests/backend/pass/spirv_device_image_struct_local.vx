@@ -1,29 +1,22 @@
-//===- spirv_device_image_struct_local.vx - a struct local stays at home ---*- Vx -*-===//
+//===- spirv_device_image_struct_local.vx - a struct local on the device --*- Vx -*-===//
 //
 // Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 // See LICENSE for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-// A struct-valued local inside a placed region keeps the region on the host,
-// and the compiler says so.
+// A struct-valued local inside a placed region still compiles to a device
+// image.
 //
 // The flat emitter gives such a local an `llvm.alloca` slot and reads and
 // writes it with `llvm.getelementptr`/`llvm.store`/`llvm.load`. Those are
-// `llvm` ops, which is not a dialect the device pipelines were measured on, so
-// the body is classified not-device-ready and no device twin is built. The
-// alternative -- a twin that is built and then fails in the backend -- is
-// worse, and so is silence: the program computes the right values, one thread
-// at a time, and its author believes it ran on the card.
+// `llvm` ops, and the device pipeline takes them now: an `llvm.alloca` in
+// address space 0 becomes SPIR-V `Function` storage, and the accesses around it
+// lower through the flattening like any other address arithmetic. So this
+// region keeps its twin, the payload carries a SPIR-V module, and the values
+// are the ones the host path computes.
 //
-// The carried value is not the trivial one: an `llvm.alloca` in address space
-// 0 becomes SPIR-V `Function` storage, and `spirv-val` accepts it (measured on
-// a one-alloca module with `llc -mtriple=spirv64-unknown-unknown`). A stack
-// slot is not itself what SPIR-V cannot express -- the gate below is what keeps
-// this body at home, so the region is compiled for the host and the warning is
-// what makes that visible.
-//
-// device_image_test.rs asserts the warning and the absent image.
+// device_image_test.rs asserts the image and that `spirv-val` accepts it.
 //
 // RUN: vxc %s --action emit-mlir 2>&1 | FileCheck %s
 // CHECK: vx.spawn topology({{[0-9]+}}) {
@@ -47,7 +40,7 @@ struct Pair {
 }
 
 fn main() -> i32 {
-  let mut o = Tensor<f32, [4]>::uninit();
+  let mut o = unsafe { Tensor<f32, [4]>::uninit() };
   for i in 0..4 {
     o[i] = 0.0;
   }

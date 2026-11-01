@@ -1406,7 +1406,7 @@ impl CompilerDriver {
         let context = melior::Context::new();
         let emit_diagnostics = self.options.emit_backend_diagnostics;
         context.attach_diagnostic_handler(move |diagnostic| {
-            // Errors and warnings always; notes and remarks only when asked
+            // Errors and warnings always. Notes and remarks only when asked
             // for.
             //
             // This dropped everything unless `--emit-backend-diagnostics` was

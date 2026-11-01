@@ -2241,6 +2241,24 @@ static bool mentionsMemrefCell(Operation *op) {
          llvm::any_of(op->getResultTypes(), isCell);
 }
 
+/// Whether `op` is a branch that hands an `index` value to its destination
+/// block, which is how the AST code generator writes a loop counter.
+///
+/// The SPIR-V conversion turns `index` into a 64-bit integer in the operations
+/// it rewrites, but not in a branch's block arguments, and refuses the module
+/// with "type mismatch for bb argument #0 of successor #0". The flat code
+/// generator counts its loops in `i32` and is not affected.
+static bool carriesIndexBlockArgument(Operation *op) {
+  auto branch = dyn_cast<BranchOpInterface>(op);
+  if (!branch)
+    return false;
+  for (Block *successor : branch->getSuccessors())
+    for (BlockArgument arg : successor->getArguments())
+      if (isa<IndexType>(arg.getType()))
+        return true;
+  return false;
+}
+
 /// Whether `op`, in the body of a placed region, can run on the device.
 /// A call or a constant table is added to `callees` when it can come along.
 static bool runsOnDevice(Operation *op, ModuleOp module,
@@ -2257,6 +2275,10 @@ static bool runsOnDevice(Operation *op, ModuleOp module,
   // is the SPIR-V arm alone, and the region keeps the host path, which
   // computes the right answer.
   if (pipeline == DevicePipeline::Spirv && mentionsMemrefCell(op))
+    return false;
+  // A loop the AST code generator wrote as a branch with an `index` block
+  // argument cannot become a SPIR-V image (see `carriesIndexBlockArgument`).
+  if (pipeline == DevicePipeline::Spirv && carriesIndexBlockArgument(op))
     return false;
   // A DYNAMIC shared-memory tile cannot become a `.shared` global (those
   // need a static shape), and leaving the alloca as-is ships a kernel that
@@ -2283,8 +2305,7 @@ static bool runsOnDevice(Operation *op, ModuleOp module,
 /// rules `materializeGpuKernels` applies to it later.
 static bool spawnRunsOnDevice(vx::SpawnOp spawn) {
   // No pipeline compiles the region, so it gets no device twin.
-  const DevicePipeline pipeline =
-      pipelineOfKernel(spawn, spawn.getTopology());
+  const DevicePipeline pipeline = pipelineOfKernel(spawn, spawn.getTopology());
   if (pipeline == DevicePipeline::None)
     return false;
   auto module = spawn->getParentOfType<ModuleOp>();
@@ -3489,8 +3510,8 @@ struct ConvertVxToStandardPass
       if (k->hasAttr("vx.result_slot")) {
         k.emitWarning()
             << "this kernel hands a value back through a host stack slot, "
-               "which a device cannot address; the region will run on the "
-               "host instead";
+               "which a device cannot address, and the region will run on "
+               "the host instead";
         return;
       }
       // Only a body the device pipeline can actually compile.
@@ -3530,7 +3551,7 @@ struct ConvertVxToStandardPass
       // Outer ops first, so that a blocker is the op the program wrote, such
       // as a `linalg.matmul`, and not the `linalg.yield` inside it.
       k.getBody().walk<WalkOrder::PreOrder>([&](Operation *op) {
-        if (runsOnDevice(op, module, pipelineOfKernel(k), callees[k]))
+        if (runsOnDevice(op, module, pipelineOfKernel(k, topo), callees[k]))
           return WalkResult::advance();
         blocker = op;
         return WalkResult::interrupt();
@@ -3544,13 +3565,22 @@ struct ConvertVxToStandardPass
       // no form for. Say so rather than drop the twin in silence, because the
       // region keeps the host path and its author would otherwise believe it
       // runs on the card.
-      if (pipelineOfKernel(k) == DevicePipeline::Spirv &&
-          mentionsMemrefCell(blocker)) {
-        k.emitWarning()
-            << "this kernel cannot become a SPIR-V device image because its "
-               "body holds a memref of memrefs (`memref<memref<...>>`), and the "
-               "region will run on the host instead";
-        return;
+      if (pipelineOfKernel(k, topo) == DevicePipeline::Spirv && blocker) {
+        if (mentionsMemrefCell(blocker)) {
+          k.emitWarning()
+              << "this kernel cannot become a SPIR-V device image because its "
+                 "body holds a memref of memrefs (`memref<memref<...>>`), and "
+                 "the region will run on the host instead";
+          return;
+        }
+        if (carriesIndexBlockArgument(blocker)) {
+          k.emitWarning()
+              << "this kernel cannot become a SPIR-V device image because a "
+                 "branch in its body carries an `index` value between blocks, "
+                 "and the SPIR-V conversion cannot take that, so the region "
+                 "will run on the host instead";
+          return;
+        }
       }
       // Say so, or a program meant for the GPU runs on the CPU in silence. A
       // `linalg` op is the matmul that the plugin sends to cuBLAS, on purpose.
@@ -4576,7 +4606,7 @@ struct FreeOpLowering : public OpRewritePattern<vx::FreeOp> {
 ///
 /// `format` is what the payload's `format=` entry says: `ptx` for NVVM's text
 /// and `spirv` for the SPIR-V pipeline's binary. A text image rides in the
-/// payload's `image=` entry; a binary one cannot -- its first word holds NUL
+/// payload's `image=` entry. A binary one cannot -- its first word holds NUL
 /// bytes, which would end that entry early -- and rides in the section after
 /// the text part (`vx_payload_section` in include/vx_hardware_runtime.h).
 struct DeviceImage {
@@ -5370,7 +5400,7 @@ static DeviceImage deviceImageOf(gpu::GPUModuleOp gpuModule,
       if (failed(SymbolTable::replaceAllSymbolUses(
               f, StringAttr::get(context, fixed), copy))) {
         error = "renaming " + name.str() + " for PTX";
-        return "";
+        return {};
       }
       table.setSymbolName(f, fixed);
     }

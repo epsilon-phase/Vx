@@ -50,10 +50,10 @@ Topology Dev {
 
 fn main() -> i32 {
   // A run-time-shaped tensor: a row of it has a run-time extent.
-  let mut d = Tensor<f32, [?, ?]>::uninit([2, 3]);
+  let mut d = unsafe { Tensor<f32, [?, ?]>::uninit([2, 3]) };
   // A rank-3 tensor: its middle row is a strided view.
-  let mut a = Tensor<f32, [2, 3, 3]>::uninit();
-  let mut o = Tensor<f32, [2, 3]>::uninit();
+  let mut a = unsafe { Tensor<f32, [2, 3, 3]>::uninit() };
+  let mut o = unsafe { Tensor<f32, [2, 3]>::uninit() };
   for i in 0..2 {
     for j in 0..3 {
       d[i][j] = ((i * 3 + j) as f32);
@@ -72,7 +72,7 @@ fn main() -> i32 {
       let arow = ad[i];
       let mut orow = od[i];
       for j in 0..3 {
-        // drow[j] is the memref.dim path; arow[j][0] is the strided-row path.
+        // drow[j] is the memref.dim path. arow[j][0] is the strided-row path.
         orow[j] = drow[j] + arow[j][0];
       }
     }
