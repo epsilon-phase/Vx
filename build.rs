@@ -692,6 +692,17 @@ fn main() {
         .expect("Failed to execute cxx for VxDialect");
     assert!(status.success(), "clang++ compilation failed for VxDialect");
 
+    // The SPIR-V device image is written by LLVM's SPIR-V code generator, and the functions
+    // that register it exist only in an LLVM built with that target. CI's LLVM builds the host
+    // target and NVPTX, not SPIRV, so the calls need to be behind this define or the file does
+    // not compile there. `llvm-config` is how the build script already asks LLVM about itself.
+    let llvm_targets_built = Command::new("llvm-config")
+        .arg("--targets-built")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let llvm_has_spirv_target = llvm_targets_built.split_whitespace().any(|t| t == "SPIRV");
+
     let mut lowering_cmd = Command::new(&cxx);
     lowering_cmd.args([
         "-c",
@@ -702,6 +713,9 @@ fn main() {
         &format!("-I{}", out_dir), // to find the generated .inc files
         "-Iinclude",               // to find VxDialect.h
     ]);
+    if llvm_has_spirv_target {
+        lowering_cmd.arg("-DVX_LLVM_HAS_SPIRV_TARGET");
+    }
     lowering_cmd.args(&llvm_cxxflags_vec);
     let status = lowering_cmd
         .status()

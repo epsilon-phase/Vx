@@ -5546,10 +5546,14 @@ static DeviceImage deviceImageOf(gpu::GPUModuleOp gpuModule,
 
 /// The SPIR-V target, registered once per process.
 ///
-/// The LLVM this compiler links carries the SPIR-V backend like any other
-/// target, but nothing registers it: `llc` does that for itself, and these are
-/// the calls it makes.
+/// Nothing registers a target for us: `llc` makes these same calls for itself.
+/// They exist only when the linked LLVM was built with the SPIR-V target, which
+/// is not every LLVM -- CI's builds the host target and NVPTX only, for
+/// `--emit-ptx` -- so `build.rs` defines `VX_LLVM_HAS_SPIRV_TARGET` only when
+/// `llvm-config --targets-built` lists it. Without the target there is nothing
+/// to register, and `serializeSpirv` says so instead of writing an image.
 static void registerSpirvTarget() {
+#ifdef VX_LLVM_HAS_SPIRV_TARGET
   static const bool registered = [] {
     LLVMInitializeSPIRVTargetInfo();
     LLVMInitializeSPIRVTarget();
@@ -5558,6 +5562,7 @@ static void registerSpirvTarget() {
     return true;
   }();
   (void)registered;
+#endif
 }
 
 /// Write an LLVM module out as a SPIR-V object, in this process.
@@ -5575,7 +5580,13 @@ static LogicalResult serializeSpirv(std::unique_ptr<llvm::Module> module,
   const llvm::Target *target =
       llvm::TargetRegistry::lookupTarget(triple, lookupError);
   if (!target) {
+#ifdef VX_LLVM_HAS_SPIRV_TARGET
     error = "the linked LLVM has no SPIR-V target: " + lookupError;
+#else
+    error =
+        "this LLVM was built without the SPIR-V target, so it cannot make a "
+        "device image";
+#endif
     return failure();
   }
 
